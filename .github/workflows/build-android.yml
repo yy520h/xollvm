@@ -71,12 +71,26 @@ jobs:
           TC=$(ls -d "$NDK"/toolchains/llvm/prebuilt/*/ | head -n1)
           echo "NDK: $NDK"
           echo "工具链目录: $TC"
+
+          # 自动寻找 sysroot（社区 NDK 布局不统一，逐个候选试）
+          SYSROOT=""
+          for CAND in "$TC/sysroot" "$NDK/sysroot" "$TC"; do
+            if [ -f "$CAND/usr/include/android/api-level.h" ]; then
+              SYSROOT="$CAND"; break
+            fi
+          done
+          [ -n "$SYSROOT" ] || { echo "找不到 sysroot，当前目录结构:"; ls -R "$NDK" | head -50; exit 1; }
+          echo "sysroot: $SYSROOT"
+
           mkdir build && cd build
           cmake -G Ninja \
+            -DCMAKE_MAKE_PROGRAM="$(command -v ninja)" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=Android \
+            -DCMAKE_SYSTEM_VERSION=24 \
+            -DCMAKE_ANDROID_ARCH_ABI=arm64-v8a \
             -DLLVM_HOST_TRIPLE=aarch64-linux-android \
-            -DCMAKE_SYSROOT="$TC/sysroot" \
+            -DCMAKE_SYSROOT="$SYSROOT" \
             -DCMAKE_C_COMPILER="$TC/bin/clang" \
             -DCMAKE_CXX_COMPILER="$TC/bin/clang++" \
             -DCMAKE_C_FLAGS="--target=aarch64-linux-android24" \
@@ -103,7 +117,7 @@ jobs:
             -DLLVM_OBFUSCATOR_LINK_INTO_TOOLS=ON \
             -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
             ../llvm-src/llvm
-
+            
       - name: 编译
         run: cmake --build build --parallel 4 --target install-distribution
 
