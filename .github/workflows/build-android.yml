@@ -114,7 +114,12 @@ jobs:
             ../llvm-src/llvm
             
       - name: 编译
-        run: cmake --build build --parallel 4 --target install-distribution
+        shell: bash
+        run: |
+          # 先编运行时（它们不在 install-distribution 的闭包里，必须点名）
+          cmake --build build --parallel 4 --target compiler-rt runtimes
+          # 再正常出发行产物
+          cmake --build build --parallel 4 --target install-distribution
 
       - name: 兜底：运行时库 + 头文件一并放进安装树
         shell: bash
