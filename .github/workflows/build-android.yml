@@ -73,8 +73,7 @@ jobs:
           echo "NDK: $NDK"
           echo "真实工具链目录: $REAL"
 
-          # 关键：给 x86 宿主名建软链，指向真实 arm64 目录
-          # （CMake / NDK 工具链文件按 x86 电脑假设找编译器，骗过它）
+          # 给 x86 宿主名建软链，指向真实 arm64 目录
           cd "$PB"
           ln -sfn "${REAL%/}" linux-x86_64
           ln -sfn "${REAL%/}" linux-x86
@@ -90,7 +89,9 @@ jobs:
             -DANDROID_USE_LEGACY_TOOLCHAIN_FILE=OFF \
             -DLLVM_HOST_TRIPLE=aarch64-linux-android \
             -DCMAKE_CXX_FLAGS="-static-libstdc++" \
-            -DLLVM_ENABLE_PROJECTS="llvm;clang;lld;lldb" \
+            -DLLVM_ENABLE_PROJECTS="llvm;clang;lld;lldb;compiler-rt;clang-tools-extra" \
+            -DLLVM_ENABLE_RUNTIMES="libunwind" \
+            -DLLVM_BUILD_RUNTIME=ON \
             -DLLVM_ENABLE_RTTI=ON \
             -DLLVM_ENABLE_EH=ON \
             -DLLVM_TARGETS_TO_BUILD="AArch64;ARM;X86" \
@@ -100,9 +101,7 @@ jobs:
             -DCLANG_INCLUDE_TESTS=OFF \
             -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
             -DCLANG_ENABLE_ARCMT=OFF \
-            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt;lld;lldb" \
-            -DLLVM_ENABLE_PROJECTS="llvm;clang;lld;lldb;compiler-rt;libunwind" \
-            -DLLVM_BUILD_RUNTIME=ON \
+            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt;lld;lldb;clang-format" \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
