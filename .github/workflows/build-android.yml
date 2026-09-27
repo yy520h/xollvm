@@ -100,8 +100,9 @@ jobs:
             -DCLANG_INCLUDE_TESTS=OFF \
             -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
             -DCLANG_ENABLE_ARCMT=OFF \
-            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt" \
             -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt;lld;lldb" \
+            -DLLVM_ENABLE_PROJECTS="llvm;clang;lld;lldb;compiler-rt;libunwind" \
+            -DLLVM_BUILD_RUNTIME=ON \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
@@ -115,6 +116,28 @@ jobs:
             
       - name: 编译
         run: cmake --build build --parallel 4 --target install-distribution
+
+      - name: 兜底：运行时库 + 头文件一并放进安装树
+        shell: bash
+        run: |
+          # 1. 库文件（aarch64 + 传统布局双份）
+          RTDIR=install/lib/clang/23/lib/aarch64-unknown-linux-android24
+          mkdir -p "$RTDIR"
+          find build -name "libclang_rt.builtins*.a" | head -n1 | xargs -I{} cp {} "$RTDIR/libclang_rt.builtins.a"
+          find build -name "libunwind*.a" | head -n1 | xargs -I{} cp {} "$RTDIR/libunwind.a"
+          mkdir -p install/lib/clang/23/lib/linux/aarch64
+          cp "$RTDIR"/* install/lib/clang/23/lib/linux/aarch64/
+
+          # 2. 头文件（libunwind 公开头，放进 clang 资源 include——驱动自动搜索，
+          #    且与同构建的 .a 严格同版本，优先于 sysroot 里借来的旧头）
+          for h in unwind.h libunwind.h __libunwind_config.h; do
+            find build llvm-src/libunwind/include -name "$h" 2>/dev/null | head -n1 \
+              | xargs -I{} cp {} install/lib/clang/23/include/
+          done
+
+          # 3. 对账
+          ls -lh "$RTDIR"
+          ls install/lib/clang/23/include/ | grep -E "unwind" || true
 
       - name: 验证产物（交叉编译无法本机执行，只验 ELF 身份）
         run: |
