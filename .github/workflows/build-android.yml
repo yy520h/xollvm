@@ -1,0 +1,108 @@
+name: Build Android (reusable)
+
+# 交叉编译 host=aarch64-linux-android 的 bionic 编译器
+# 产物在 Android 手机 Termux 里裸跑（libc++ 静态链接，无外部依赖）
+on:
+  workflow_call:
+    inputs:
+      llvm_major:
+        required: true
+        type: string
+      llvm_ref:
+        required: true
+        type: string
+
+jobs:
+  toolchain-android:
+    name: android-aarch64 / llvm${{ inputs.llvm_major }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    env:
+      NDK_URL: 'https://github.com/HomuHomu833/android-ndk-custom/releases/download/r30-beta3/android-ndk-r30-beta3-aarch64-linux-musl.tar.xz'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: xollvm
+          fetch-depth: 1
+
+      - name: Fetch stock LLVM
+        run: git clone --depth 1 --branch "${{ inputs.llvm_ref }}" https://github.com/llvm/llvm-project llvm-src
+        shell: bash
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean && df -h
+
+      - name: Install deps + linux-arm64 NDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache python3 zstd wget file
+          mkdir -p "$HOME/ndk"
+          wget -q "$NDK_URL" -O "$HOME/ndk/ndk.archive"
+          cd "$HOME/ndk"
+          # 自动识别压缩格式
+          case "$(file -b ndk.archive | cut -d, -f1)" in
+            *Zip*) unzip -q ndk.archive ;;
+            *XZ*|*"gzip"*) tar -xf ndk.archive ;;
+            *) echo "未知压缩格式，手动调整此步骤"; exit 1 ;;
+          esac
+          ls "$HOME/ndk"
+
+      - name: Configure (host=aarch64-linux-android)
+        shell: bash
+        run: |
+          NDK=$(ls -d "$HOME/ndk"/android-ndk-* | head -n1)
+          TC=$NDK/toolchains/llvm/prebuilt/linux-aarch64
+          [ -d "$TC" ] || { echo "NDK 内未找到 linux-aarch64 工具链，检查 NDK_URL"; exit 1; }
+          mkdir build && cd build
+          cmake -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_USE_LEGACY_TOOLCHAIN_FILE=OFF \
+            -DLLVM_ENABLE_PROJECTS="llvm;clang" \
+            -DLLVM_ENABLE_RTTI=ON \
+            -DLLVM_ENABLE_EH=ON \
+            -DLLVM_TARGETS_TO_BUILD="AArch64;ARM" \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_BUILD_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_BUILD_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF \
+            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_FLAGS="-static-libstdc++" \
+            -DLLVM_PARALLEL_LINK_JOBS=2 \
+            -DLLVM_EXTERNAL_PROJECTS=Obfuscator \
+            -DLLVM_EXTERNAL_OBFUSCATOR_SOURCE_DIR="$GITHUB_WORKSPACE/xollvm" \
+            -DLLVM_OBFUSCATOR_LINK_INTO_TOOLS=ON \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
+            ../llvm-src/llvm
+
+      - name: Build
+        run: cmake --build build --parallel 4 --target install-distribution
+
+      - name: Verify (交叉产物无法在本机执行，只验 ELF 身份)
+        run: |
+          file install/bin/clang
+          readelf -h install/bin/clang | grep -E "Class|Machine|interpreter" || true
+          # 必须是: ELF 64-bit / ARM aarch64 / interpreter /system/bin/linker64
+
+      - name: Package
+        run: |
+          cd install
+          tar --zstd -cf ../xollvm-android-aarch64-llvm${{ inputs.llvm_major }}-Release.tar.zst .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xollvm-android-aarch64-llvm${{ inputs.llvm_major }}
+          path: xollvm-android-aarch64-llvm${{ inputs.llvm_major }}-Release.tar.zst
+          retention-days: 14
+          if-no-files-found: error
