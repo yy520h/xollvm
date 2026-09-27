@@ -116,8 +116,12 @@ jobs:
       - name: 编译
         shell: bash
         run: |
-          # 先编运行时（它们不在 install-distribution 的闭包里，必须点名）
-          cmake --build build --parallel 4 --target compiler-rt runtimes
+          # 只编 builtins（三架构）+ libunwind；sanitizer 不碰（鸡生蛋 + 用不上）
+          cmake --build build --parallel 4 --target \
+            clang_rt.builtins-aarch64-android \
+            clang_rt.builtins-x86_64-android \
+            clang_rt.builtins-arm-android \
+            runtimes
           # 再正常出发行产物
           cmake --build build --parallel 4 --target install-distribution
 
