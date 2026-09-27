@@ -119,28 +119,40 @@ jobs:
       - name: 兜底：运行时库 + 头文件一并放进安装树
         shell: bash
         run: |
-          RTDIR=install/lib/clang/23/lib/aarch64-unknown-linux-android24
-          mkdir -p "$RTDIR"
+          # 1. 按架构分类拷贝 builtins（aarch64 / x86_64 / arm）
+          for f in $(find build -name "libclang_rt.builtins*.a"); do
+            case "$f" in
+              *aarch64*) D=aarch64-unknown-linux-android24 ;;
+              *x86_64*)  D=x86_64-unknown-linux-android24 ;;
+              *arm*android*) D=armv7-unknown-linux-androideabi24 ;;
+              *) echo "跳过未知架构: $f"; continue ;;
+            esac
+            mkdir -p "install/lib/clang/23/lib/$D"
+            cp "$f" "install/lib/clang/23/lib/$D/libclang_rt.builtins.a"
+            echo "builtins($D) <- $f"
+          done
 
-          BUILTINS=$(find build -name "libclang_rt.builtins*.a" | head -n1)
-          UNWIND=$(find build -name "libunwind*.a" | head -n1)
-          echo "找到 builtins: $BUILTINS"
-          echo "找到 unwind:   $UNWIND"
+          # 2. libunwind 同样按架构
+          for f in $(find build -name "libunwind*.a"); do
+            case "$f" in
+              *aarch64*) D=aarch64-unknown-linux-android24 ;;
+              *x86_64*)  D=x86_64-unknown-linux-android24 ;;
+              *arm*)     D=armv7-unknown-linux-androideabi24 ;;
+              *) D=aarch64-unknown-linux-android24 ;;
+            esac
+            mkdir -p "install/lib/clang/23/lib/$D"
+            cp "$f" "install/lib/clang/23/lib/$D/libunwind.a"
+            echo "unwind($D) <- $f"
+          done
 
-          if [ -n "$BUILTINS" ]; then cp "$BUILTINS" "$RTDIR/libclang_rt.builtins.a"; fi
-          if [ -n "$UNWIND" ]; then cp "$UNWIND" "$RTDIR/libunwind.a"; fi
-
-          mkdir -p install/lib/clang/23/lib/linux/aarch64
-          cp "$RTDIR"/* install/lib/clang/23/lib/linux/aarch64/ 2>/dev/null || true
-
+          # 3. 头文件
           for h in unwind.h libunwind.h __libunwind_config.h; do
             SRC=$(find build llvm-src/libunwind/include -name "$h" 2>/dev/null | head -n1)
-            if [ -n "$SRC" ]; then cp "$SRC" install/lib/clang/23/include/; echo "头文件 $h <- $SRC"; fi
+            if [ -n "$SRC" ]; then cp "$SRC" install/lib/clang/23/include/; echo "头 $h <- $SRC"; fi
           done
 
           echo "=== 对账 ==="
-          ls -lh "$RTDIR" || echo "RTDIR 为空！"
-          ls install/lib/clang/23/include/ | grep -E "unwind" || echo "无 unwind 头"
+          find install/lib/clang/23/lib -type f
 
       - name: 验证产物（交叉编译无法本机执行，只验 ELF 身份）
         run: |
