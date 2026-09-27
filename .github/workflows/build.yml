@@ -1,27 +1,33 @@
 name: Build (reusable)
 
-# Reusable build for ONE stock-LLVM version. Called by release.yml once per
-# supported LLVM major (22, 23). Produces, for that version:
-#   * toolchain  — stock LLVM + clang/opt with the obfuscator linked in
-#                  statically (LLVM_EXTERNAL_PROJECTS extension), Linux + Windows.
-#   * plugin       — loadable Obfuscator.so (-fpass-plugin), Linux.
-#   * plugin-macos — loadable Obfuscator.dylib (-fpass-plugin), macOS arm64.
-# Artifacts are suffixed with `llvm<major>` so both versions coexist in one run.
+# 可复用构建流程：每次只编一个 LLVM 大版本，由 release.yml 按版本各调一次。
+# 产出三类东西：
+#   * toolchain  —— 完整工具链（LLVM + clang/opt，混淆器静态链接进去），平台由调用方传入
+#   * plugin       —— 可加载插件 Obfuscator.so（-fpass-plugin 方式用），Linux
+#   * plugin-macos —— 可加载插件 Obfuscator.dylib，macOS arm64
+# 产物文件名里都带 llvm<版本号>，两个版本可以同时存在互不覆盖。
 on:
   workflow_call:
     inputs:
       llvm_major:
-        description: 'Stock LLVM major version (e.g. 22)'
+        description: 'LLVM 大版本号（如 22）'
         required: true
         type: string
       llvm_ref:
-        description: 'Stock LLVM branch or tag to build against (e.g. release/22.x)'
+        description: '要编译的 LLVM 分支或 tag（如 release/22.x）'
         required: true
         type: string
+      matrix_include:
+        # 平台列表（JSON）：由 release.yml 的弹窗传入，决定这次编哪些宿主平台
+        description: '平台列表 JSON：[{"os":"名字","runner":"GitHub机器"}]'
+        required: false
+        type: string
+        # 默认全平台；想省事就把默认值改成只留 linux-aarch64 那一项
+        default: '[{"os":"windows","runner":"windows-2022"},{"os":"linux-x64","runner":"ubuntu-24.04"},{"os":"linux-aarch64","runner":"ubuntu-24.04-arm"}]'
 
 jobs:
   # ==========================================================================
-  # Full toolchain: stock LLVM + obfuscator as a static in-tree extension.
+  # 完整工具链：原版 LLVM + 混淆器（以静态扩展方式链接进 clang/opt）
   # ==========================================================================
   toolchain:
     name: toolchain / llvm${{ inputs.llvm_major }} / ${{ matrix.os }}
@@ -30,35 +36,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows
-            runner: windows-2022
-          - os: linux
-            runner: ubuntu-24.04
+        # 平台矩阵：不写死，从弹窗传入的 JSON 动态生成
+        include: ${{ fromJSON(inputs.matrix_include) }}
     env:
       SCCACHE_IDLE_TIMEOUT: 0
-      # Local-disk sccache backend. We deliberately do NOT use SCCACHE_GHA_ENABLED:
-      # sccache 0.16's GHA backend still calls GitHub's retired v1 cache API
-      # (_apis/artifactcache) and, worse, a cache read failure is FATAL at server
-      # startup -> every cl.exe dies and the whole build fails on one API hiccup.
-      # Instead sccache writes to a local dir which actions/cache persists across
-      # runs. A cache-service outage then only degrades to a cold build, never
-      # breaks it.
+      # sccache 用本地磁盘目录，不用 GitHub 缓存接口（那个接口挂了会直接导致编译失败）
       SCCACHE_DIR: ${{ github.workspace }}/sccache
       SCCACHE_CACHE_SIZE: 5G
     steps:
-      - name: Checkout xollvm
+      - name: 拉取 xollvm 源码
         uses: actions/checkout@v4
         with:
           path: xollvm
           fetch-depth: 1
 
-      - name: Fetch stock LLVM (${{ inputs.llvm_ref }})
+      - name: 拉取 LLVM 官方源码
         run: git clone --depth 1 --branch "${{ inputs.llvm_ref }}" https://github.com/llvm/llvm-project llvm-src
         shell: bash
 
-      # ---------- Linux prep ----------
-      - name: Free disk space (Linux)
+      # ---------- Linux 准备工作 ----------
+      - name: 清理磁盘空间（Linux）
         if: runner.os == 'Linux'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -66,37 +63,35 @@ jobs:
           sudo apt-get clean
           df -h
 
-      - name: Install deps (Linux)
+      - name: 安装依赖（Linux）
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # `clang` here is the EXTERNAL clang used to compile the AES stub to
-          # bitcode -- the in-tree clang can't be used under LINK_INTO_TOOLS
-          # (it would form a dependency cycle).
+          # 这里的 clang 是“外部 clang”，只用来把 AES 桩编成 bitcode，
+          # 不能用在建中的 clang（会形成循环依赖）
           sudo apt-get install -y ninja-build ccache python3 zstd clang
 
-      # ---------- Windows prep ----------
-      - name: Setup MSVC (Windows)
+      # ---------- Windows 准备工作 ----------
+      - name: 配置 MSVC 环境（Windows）
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Setup sccache (Windows)
+      - name: 配置 sccache（Windows）
         if: runner.os == 'Windows'
         uses: mozilla-actions/sccache-action@v0.0.6
 
-      - name: Install Ninja + external clang (Windows)
+      - name: 安装 Ninja 和外部 clang（Windows）
         if: runner.os == 'Windows'
         run: |
           choco install ninja -y
-          choco install llvm -y   # external clang.exe for the AES stub
+          choco install llvm -y   # 外部 clang.exe，给 AES 桩用
         shell: pwsh
 
-      # ---------- Cache ----------
-      # Cache keys are namespaced per LLVM major so 22 and 23 builds never share
-      # (and thrash) each other's compiler cache.
-      - name: ccache (Linux)
+      # ---------- 编译缓存 ----------
+      # 缓存 key 按 LLVM 版本分开，22 和 23 互不抢缓存
+      - name: ccache（Linux）
         if: runner.os == 'Linux'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
@@ -104,10 +99,7 @@ jobs:
           max-size: 2G
           variant: ccache
 
-      # Restore the sccache dir from a previous run. Immutable per-sha key with a
-      # prefix restore-key: an exact miss still restores the most recent cache.
-      # A restore failure (cache-service outage) is non-fatal -> cold build.
-      - name: Restore sccache (Windows)
+      - name: 恢复 sccache（Windows）
         if: runner.os == 'Windows'
         uses: actions/cache/restore@v4
         with:
@@ -115,8 +107,8 @@ jobs:
           key: sccache-windows-release-llvm${{ inputs.llvm_major }}-${{ github.sha }}
           restore-keys: sccache-windows-release-llvm${{ inputs.llvm_major }}-
 
-      # ---------- Configure (Windows) ----------
-      - name: Configure (Windows)
+      # ---------- 配置（Windows） ----------
+      - name: 配置（Windows）
         if: runner.os == 'Windows'
         shell: cmd
         run: |
@@ -137,7 +129,6 @@ jobs:
             -DCLANG_ENABLE_STATIC_ANALYZER=OFF ^
             -DCLANG_ENABLE_ARCMT=OFF ^
             -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt" ^
-            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL ^
             -DLLVM_ENABLE_ASSERTIONS=OFF ^
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ^
             -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
@@ -149,8 +140,8 @@ jobs:
             -DCMAKE_INSTALL_PREFIX=%GITHUB_WORKSPACE%\install ^
             ..\llvm-src\llvm
 
-      # ---------- Configure (Linux) ----------
-      - name: Configure (Linux)
+      # ---------- 配置（Linux） ----------
+      - name: 配置（Linux）
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -180,31 +171,27 @@ jobs:
             -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/install \
             ../llvm-src/llvm
 
-      # ---------- Build ----------
-      # install-distribution builds ONLY the shipped components (clang, opt +
-      # their libs), not the ~40 other standalone llvm-* tools. Big time cut and
-      # it means llvm-lto2 & friends are never built.
-      - name: Build
+      # ---------- 编译 ----------
+      # 只编要发布的组件（clang、opt 及其依赖库），不编其余几十个 llvm-* 工具，省大量时间
+      - name: 编译
         shell: bash
         run: cmake --build build --parallel --target install-distribution
 
-      # Save even when the build failed (always()): a partial build still warmed
-      # the sccache dir, so the next run resumes warm instead of cold. Immutable
-      # per-sha key -> never clashes with the restored cache.
-      - name: Save sccache (Windows)
+      # 即使编译失败也保存 sccache：半成品编译也暖了缓存，下次接着用
+      - name: 保存 sccache（Windows）
         if: always() && runner.os == 'Windows'
         uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/sccache
           key: sccache-windows-release-llvm${{ inputs.llvm_major }}-${{ github.sha }}
 
-      - name: sccache stats (Windows)
+      - name: sccache 统计（Windows）
         if: runner.os == 'Windows'
         shell: pwsh
         run: sccache --show-stats
 
-      # ---------- Smoke test: obfuscation runs from the built toolchain ----------
-      - name: Smoke test
+      # ---------- 冒烟测试：确认混淆真的生效 ----------
+      - name: 冒烟测试
         shell: bash
         run: |
           BIN=install/bin
@@ -219,38 +206,37 @@ jobs:
           "$OPT" -passes=obfuscation ann.ll -S -o ann_obf.ll
           before=$(awk '/define .*@secret\(/,/^}/' ann.ll | wc -l)
           after=$(awk '/define .*@secret\(/,/^}/' ann_obf.ll | wc -l)
-          echo "secret: $before -> $after"
-          [ "$after" -gt "$before" ] || { echo "obfuscation did not transform"; exit 1; }
+          echo "secret 函数行数: $before -> $after"
+          [ "$after" -gt "$before" ] || { echo "混淆没有生效"; exit 1; }
           "$OPT" -passes=verify ann_obf.ll -disable-output
-          # --- EP hook: obfuscation runs inside a normal clang compile ---
+          # 入口开关：普通编译命令里加 -mllvm -enable-obfuscation 也要生效
           "$CLANG" -O2 -mllvm -enable-obfuscation -emit-llvm -S ann.c -o ann_ep.ll
           ep=$(awk '/define .*@secret\(/,/^}/' ann_ep.ll | wc -l)
-          echo "secret (EP): $before -> $ep"
-          [ "$ep" -gt "$before" ] || { echo "EP hook did not obfuscate"; exit 1; }
+          echo "secret 函数行数(入口开关): $before -> $ep"
+          [ "$ep" -gt "$before" ] || { echo "入口开关方式混淆没生效"; exit 1; }
           "$OPT" -passes=verify ann_ep.ll -disable-output
-          # EP flag on un-annotated code must be a no-op (still valid IR)
+          # 没加注解的代码开了入口开关也必须是无害的（生成合法 IR）
           cat > plain.c <<'EOF'
           int plain(int x){ return x + 1; }
           EOF
           "$CLANG" -O2 -mllvm -enable-obfuscation -emit-llvm -S plain.c -o plain_ep.ll
           "$OPT" -passes=verify plain_ep.ll -disable-output
 
-      # ---------- Package ----------
-      - name: Package (Linux)
+      # ---------- 打包 ----------
+      - name: 打包（Linux）
+        # 文件名带平台名（matrix.os），不同平台的包不会互相覆盖
         if: runner.os == 'Linux'
         run: |
           cd install
-          tar --zstd -cf ../xollvm-linux-llvm${{ inputs.llvm_major }}-Release.tar.zst .
+          tar --zstd -cf ../xollvm-${{ matrix.os }}-llvm${{ inputs.llvm_major }}-Release.tar.zst .
 
-      - name: Package (Windows)
+      - name: 打包（Windows）
         if: runner.os == 'Windows'
         shell: pwsh
-        # -mx=3 (fast) not -mx=7: the ~1GB+ install bundle at mx=7 lzma2 runs long
-        # enough to hit the job timeout. mx=3 keeps decent ratio at a fraction of
-        # the CPU cost.
-        run: 7z a -t7z -m0=lzma2 -mx=3 -mmt=on xollvm-windows-llvm${{ inputs.llvm_major }}-Release.7z .\install\*
+        # 压缩等级用 -mx=3（快）：包太大，用最高压缩会拖到超时
+        run: 7z a -t7z -m0=lzma2 -mx=3 -mmt=on xollvm-${{ matrix.os }}-llvm${{ inputs.llvm_major }}-Release.7z .\install\*
 
-      - name: Upload artifact
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: xollvm-${{ matrix.os }}-llvm${{ inputs.llvm_major }}
@@ -261,19 +247,18 @@ jobs:
           if-no-files-found: error
 
   # ==========================================================================
-  # Loadable plugin: Obfuscator.so (-fpass-plugin), Linux.
+  # 可加载插件：Obfuscator.so（-fpass-plugin 方式），Linux x86_64
   # ==========================================================================
   plugin:
     name: plugin / llvm${{ inputs.llvm_major }} / linux
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout xollvm
+      - name: 拉取 xollvm 源码
         uses: actions/checkout@v4
 
-      - name: Install LLVM ${{ inputs.llvm_major }} dev + clang
+      - name: 安装 LLVM ${{ inputs.llvm_major }} 开发包 + clang
         run: |
-          # Ubuntu 24.04 (noble) does not ship recent llvm/clang in its default
-          # repos; add the official apt.llvm.org repo for the requested version.
+          # Ubuntu 24.04 官方源里没有新版 LLVM，加 apt.llvm.org 官方源
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh ${{ inputs.llvm_major }}
@@ -282,7 +267,7 @@ jobs:
             llvm-${{ inputs.llvm_major }} \
             llvm-${{ inputs.llvm_major }}-dev
 
-      - name: Build Obfuscator.so
+      - name: 编译 Obfuscator.so
         run: |
           cmake -S . -B build -G Ninja \
             -DLLVM_DIR=/usr/lib/llvm-${{ inputs.llvm_major }}/lib/cmake/llvm \
@@ -292,7 +277,7 @@ jobs:
           ninja -C build Obfuscator
           cp build/Obfuscator.so Obfuscator-linux-x64-llvm${{ inputs.llvm_major }}.so
 
-      - name: Smoke test plugin
+      - name: 插件冒烟测试
         run: |
           cat > ann.c <<'EOF'
           #define OBF(spec) __attribute__((annotate("obf: " spec)))
@@ -303,7 +288,7 @@ jobs:
           opt-${{ inputs.llvm_major }} -load-pass-plugin=./Obfuscator-linux-x64-llvm${{ inputs.llvm_major }}.so -passes=obfuscation ann.ll -S -o ann_obf.ll
           opt-${{ inputs.llvm_major }} -passes=verify ann_obf.ll -disable-output
 
-      - name: Upload artifact
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: xollvm-plugin-linux-llvm${{ inputs.llvm_major }}
@@ -312,37 +297,34 @@ jobs:
           if-no-files-found: error
 
   # ==========================================================================
-  # Loadable plugin: Obfuscator.dylib (-fpass-plugin), macOS arm64.
+  # 可加载插件：Obfuscator.dylib（-fpass-plugin 方式），macOS arm64
   # ==========================================================================
   plugin-macos:
     name: plugin / llvm${{ inputs.llvm_major }} / macos
     runs-on: macos-14
     steps:
-      - name: Checkout xollvm
+      - name: 拉取 xollvm 源码
         uses: actions/checkout@v4
 
-      - name: Install LLVM ${{ inputs.llvm_major }} + ninja
+      - name: 安装 LLVM ${{ inputs.llvm_major }} + ninja
         run: |
-          # Homebrew keeps the NEWEST LLVM as the unversioned `llvm` formula and
-          # only cuts a versioned `llvm@N` once N+1 ships. So the formula name for
-          # a given major shifts over time (today: llvm@22 = 22.x, llvm = 23.x).
-          # Resolve it: prefer llvm@<major>, else fall back to the unversioned
-          # `llvm`, then assert the installed clang is actually that major.
+          # Homebrew 的策略：最新版叫 llvm，旧版才叫 llvm@N，而且会随时间变化。
+          # 所以先查有没有 llvm@<版本>，没有再退回裸 llvm，最后校验版本号对不对
           MAJ='${{ inputs.llvm_major }}'
           if brew info "llvm@${MAJ}" >/dev/null 2>&1; then
             FORMULA="llvm@${MAJ}"
           else
             FORMULA="llvm"
           fi
-          echo "Using brew formula: $FORMULA"
+          echo "使用 Homebrew 包: $FORMULA"
           brew install "$FORMULA" ninja
           PREFIX=$(brew --prefix "$FORMULA")
           "$PREFIX/bin/clang" --version
           "$PREFIX/bin/clang" --version | grep -q "clang version ${MAJ}\." || {
-            echo "ERROR: brew formula '$FORMULA' is not LLVM ${MAJ}"; exit 1; }
+            echo "错误: '$FORMULA' 不是 LLVM ${MAJ}"; exit 1; }
           echo "LLVM_PREFIX=$PREFIX" >> "$GITHUB_ENV"
 
-      - name: Build Obfuscator plugin
+      - name: 编译 Obfuscator 插件
         run: |
           cmake -S . -B build -G Ninja \
             -DLLVM_DIR="$LLVM_PREFIX/lib/cmake/llvm" \
@@ -350,12 +332,11 @@ jobs:
             -DCMAKE_CXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
             -DCMAKE_BUILD_TYPE=Release
           ninja -C build Obfuscator
-          # add_llvm_pass_plugin emits a MODULE lib; suffix is .so or .dylib
-          # depending on toolchain, so locate it instead of hardcoding.
+          # 插件后缀可能是 .so 或 .dylib（取决于工具链），所以用 ls 找而不是写死
           PLUGIN=$(ls build/Obfuscator.dylib build/Obfuscator.so 2>/dev/null | head -n1)
           cp "$PLUGIN" Obfuscator-macos-arm64-llvm${{ inputs.llvm_major }}.dylib
 
-      - name: Smoke test plugin
+      - name: 插件冒烟测试
         run: |
           cat > ann.c <<'EOF'
           #define OBF(spec) __attribute__((annotate("obf: " spec)))
@@ -366,7 +347,7 @@ jobs:
           "$LLVM_PREFIX/bin/opt" -load-pass-plugin=./Obfuscator-macos-arm64-llvm${{ inputs.llvm_major }}.dylib -passes=obfuscation ann.ll -S -o ann_obf.ll
           "$LLVM_PREFIX/bin/opt" -passes=verify ann_obf.ll -disable-output
 
-      - name: Upload artifact
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: xollvm-plugin-macos-llvm${{ inputs.llvm_major }}
