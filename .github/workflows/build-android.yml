@@ -116,13 +116,15 @@ jobs:
       - name: 编译
         shell: bash
         run: |
-          # 侦察：只抓 libclang_rt.builtins 归档目标，避开同目录的无关目标（如 package.util）
+          # 侦察：只抓 libclang_rt.builtins 归档目标
           ninja -C build -t targets all | grep "libclang_rt.builtins" | grep -v CMakeFiles | tee /tmp/bt.txt
           BT=$(awk -F: '{print $1}' /tmp/bt.txt | sort -u | tr '\n' ' ')
           echo "选用目标: $BT"
           if [ -z "$BT" ]; then echo "没找到 builtins 目标"; exit 1; fi
 
-          cmake --build build --parallel 4 --target $BT runtimes
+          # 顺序是关键：先 builtins（补全资源目录的库）→ 再 runtimes（检查时才能链上）
+          cmake --build build --parallel 4 --target $BT
+          cmake --build build --parallel 4 --target runtimes
           cmake --build build --parallel 4 --target install-distribution
 
       - name: 兜底：运行时库 + 头文件一并放进安装树
