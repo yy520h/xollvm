@@ -68,34 +68,28 @@ jobs:
         shell: bash
         run: |
           NDK=$(ls -d "$HOME/ndk"/android-ndk-* | head -n1)
-          TC=$(ls -d "$NDK"/toolchains/llvm/prebuilt/*/ | head -n1)
+          PB="$NDK/toolchains/llvm/prebuilt"
+          REAL=$(ls -d "$PB"/*/ | head -n1)
           echo "NDK: $NDK"
-          echo "工具链目录: $TC"
+          echo "真实工具链目录: $REAL"
 
-          # 自动寻找 sysroot（社区 NDK 布局不统一，逐个候选试）
-          SYSROOT=""
-          for CAND in "$TC/sysroot" "$NDK/sysroot" "$TC"; do
-            if [ -f "$CAND/usr/include/android/api-level.h" ]; then
-              SYSROOT="$CAND"; break
-            fi
-          done
-          [ -n "$SYSROOT" ] || { echo "找不到 sysroot，当前目录结构:"; ls -R "$NDK" | head -50; exit 1; }
-          echo "sysroot: $SYSROOT"
+          # 关键：给 x86 宿主名建软链，指向真实 arm64 目录
+          # （CMake / NDK 工具链文件按 x86 电脑假设找编译器，骗过它）
+          cd "$PB"
+          ln -sfn "${REAL%/}" linux-x86_64
+          ln -sfn "${REAL%/}" linux-x86
+          ls -la
 
-          mkdir build && cd build
+          mkdir -p "$GITHUB_WORKSPACE/build" && cd "$GITHUB_WORKSPACE/build"
           cmake -G Ninja \
             -DCMAKE_MAKE_PROGRAM="$(command -v ninja)" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SYSTEM_NAME=Android \
-            -DCMAKE_SYSTEM_VERSION=24 \
-            -DCMAKE_ANDROID_ARCH_ABI=arm64-v8a \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_USE_LEGACY_TOOLCHAIN_FILE=OFF \
             -DLLVM_HOST_TRIPLE=aarch64-linux-android \
-            -DCMAKE_SYSROOT="$SYSROOT" \
-            -DCMAKE_C_COMPILER="$TC/bin/clang" \
-            -DCMAKE_CXX_COMPILER="$TC/bin/clang++" \
-            -DCMAKE_C_FLAGS="--target=aarch64-linux-android24" \
-            -DCMAKE_CXX_FLAGS="--target=aarch64-linux-android24 -static-libstdc++" \
-            -DCMAKE_EXE_LINKER_FLAGS="-pie" \
+            -DCMAKE_CXX_FLAGS="-static-libstdc++" \
             -DLLVM_ENABLE_PROJECTS="llvm;clang" \
             -DLLVM_ENABLE_RTTI=ON \
             -DLLVM_ENABLE_EH=ON \
