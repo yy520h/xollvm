@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 360
     env:
       # linux-arm64 NDK（musl 静态版，社区构建，永久链接）
-      NDK_URL: 'https://github.com/HomuHomu833/android-ndk-custom/releases/download/r30-beta3/android-ndk-r30-beta3-aarch64-linux-musl.tar.xz'
+            NDK_URL: 'https://github.com/HomuHomu833/android-ndk-custom/releases/download/r29/android-ndk-r29-aarch64-linux-musl.tar.xz'
     steps:
       - name: 拉取 xollvm 源码
         uses: actions/checkout@v4
