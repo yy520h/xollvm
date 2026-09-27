@@ -116,12 +116,14 @@ jobs:
       - name: 编译
         shell: bash
         run: |
-          # 只编 builtins（三架构）+ libunwind；sanitizer 不碰（鸡生蛋 + 用不上）
-          cmake --build build --parallel 4 --target \
-            clang_rt.builtins-aarch64-android \
-            clang_rt.builtins-x86_64-android \
-            clang_rt.builtins-arm-android \
-            runtimes
+          # 侦察：列出所有 builtins 相关目标（命名各版本不同，不猜）
+          ninja -C build -t targets all | grep -i builtins | tee /tmp/bt.txt
+          BT=$(awk -F: '{print $1}' /tmp/bt.txt | grep -v '\.o$' | sort -u | tr '\n' ' ')
+          echo "选用目标: $BT"
+          if [ -z "$BT" ]; then echo "没找到 builtins 目标"; exit 1; fi
+
+          # 只编 builtins（不编 sanitizer，避开 outline-atomics 鸡生蛋）+ libunwind
+          cmake --build build --parallel 4 --target $BT runtimes
           # 再正常出发行产物
           cmake --build build --parallel 4 --target install-distribution
 
