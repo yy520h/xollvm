@@ -50,15 +50,17 @@ jobs:
       - name: 安装依赖并下载 NDK
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ccache python3 zstd wget file
+          sudo apt-get install -y ninja-build ccache python3 zstd file curl
           mkdir -p "$HOME/ndk"
-          wget -q "$NDK_URL" -O "$HOME/ndk/ndk.archive"
+          echo "下载地址: $NDK_URL"
+          curl -fL --retry 3 --connect-timeout 30 \
+            -o "$HOME/ndk/ndk.archive" "$NDK_URL"
+          ls -lh "$HOME/ndk/ndk.archive"
           cd "$HOME/ndk"
-          # 自动识别压缩格式解压
           case "$(file -b ndk.archive | cut -d, -f1)" in
             *Zip*) unzip -q ndk.archive ;;
             *XZ*|*"gzip"*) tar -xf ndk.archive ;;
-            *) echo "未知压缩格式，需要手动调整"; exit 1 ;;
+            *) echo "无法识别的压缩格式:"; file ndk.archive; exit 1 ;;
           esac
           ls "$HOME/ndk"
 
