@@ -1,48 +1,76 @@
 name: Release (manual)
 
-# Manual only. On launch, builds every artifact for BOTH supported stock-LLVM
-# majors (22 and 23) and attaches them to a single DRAFT release:
-#   * build22 / build23 — reusable build.yml, once per LLVM major. Each produces
-#                         the full toolchain (Linux + Windows) and the loadable
-#                         plugins (Linux .so + macOS arm64 .dylib) for that major.
-#   * release           — gathers all artifacts from both build passes and drafts
-#                         one release for manual review.
-# All jobs share a single workflow run, so the release job downloads the build
-# artifacts directly (no cross-run hand-off).
+# Manual only. Run window offers:
+#   * build_llvm22 / build_llvm23 — 复选框，选要编哪些 LLVM 大版本
+#   * platforms — 平台 JSON（每次运行可改）：
+#       仅手机arm64 : [{"os":"linux-aarch64","runner":"ubuntu-24.04-arm"}]
+#       arm64+电脑 : 再加 {"os":"linux-x64","runner":"ubuntu-24.04"}
+#       全平台     : 再加 {"os":"windows","runner":"windows-2022"}
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.1.0)'
+        description: 'Release tag (例如 v0.1.0)'
         required: true
       llvm22_ref:
-        description: 'Stock LLVM 22 branch or tag to build against'
+        description: 'LLVM 22 分支或 tag'
         required: true
         default: 'release/22.x'
       llvm23_ref:
-        description: 'Stock LLVM 23 branch or tag to build against'
+        description: 'LLVM 23 分支或 tag'
         required: true
         default: 'release/23.x'
+      build_llvm22:
+        description: '编译 LLVM 22'
+        type: boolean
+        default: false
+      build_llvm23:
+        description: '编译 LLVM 23'
+        type: boolean
+        default: true
+      build_android:
+        description: '编译 Termux 安卓原生版（aarch64）'
+        type: boolean
+        default: true
+      platforms:
+        description: '平台列表 JSON（必须英文半角引号）'
+        required: true
+        default: '[{"os":"linux-aarch64","runner":"ubuntu-24.04-arm"}]'
 
 jobs:
   build22:
+    if: ${{ inputs.build_llvm22 }}
     uses: ./.github/workflows/build.yml
     with:
       llvm_major: '22'
       llvm_ref: ${{ inputs.llvm22_ref }}
+      matrix_include: ${{ inputs.platforms }}
 
   build23:
+    if: ${{ inputs.build_llvm23 }}
     uses: ./.github/workflows/build.yml
     with:
       llvm_major: '23'
       llvm_ref: ${{ inputs.llvm23_ref }}
+      matrix_include: ${{ inputs.platforms }}
 
-  # ==========================================================================
-  # Draft release with all artifacts from both LLVM builds (manual review).
-  # ==========================================================================
+  build-android22:
+    if: ${{ inputs.build_android && inputs.build_llvm22 }}
+    uses: ./.github/workflows/build-android.yml
+    with:
+      llvm_major: '22'
+      llvm_ref: ${{ inputs.llvm22_ref }}
+
+  build-android23:
+    if: ${{ inputs.build_android && inputs.build_llvm23 }}
+    uses: ./.github/workflows/build-android.yml
+    with:
+      llvm_major: '23'
+      llvm_ref: ${{ inputs.llvm23_ref }}
+
   release:
     name: Draft release
-    needs: [build22, build23]
+    needs: [build22, build23, build-android22, build-android23]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -65,23 +93,15 @@ jobs:
           body: |
             ## xollvm — ${{ inputs.tag }}
 
-            Built against stock LLVM `${{ inputs.llvm22_ref }}` (LLVM 22) and
-            `${{ inputs.llvm23_ref }}` (LLVM 23). Pick the artifact matching the
-            LLVM version you deploy against.
-
             ### Artifacts
-            | File | What | OS | LLVM |
+            | File | What | Host | LLVM |
             |---|---|---|---|
-            | `xollvm-linux-llvm22-Release.tar.zst` | clang/opt with obfuscator built in | Linux x86_64 | 22 |
-            | `xollvm-windows-llvm22-Release.7z` | clang/opt with obfuscator built in | Windows x64 | 22 |
-            | `xollvm-linux-llvm23-Release.tar.zst` | clang/opt with obfuscator built in | Linux x86_64 | 23 |
-            | `xollvm-windows-llvm23-Release.7z` | clang/opt with obfuscator built in | Windows x64 | 23 |
-            | `Obfuscator-linux-x64-llvm22.so` | loadable `-fpass-plugin` | Linux x86_64 | 22 |
-            | `Obfuscator-linux-x64-llvm23.so` | loadable `-fpass-plugin` | Linux x86_64 | 23 |
-            | `Obfuscator-macos-arm64-llvm22.dylib` | loadable `-fpass-plugin` | macOS arm64 | 22 |
-            | `Obfuscator-macos-arm64-llvm23.dylib` | loadable `-fpass-plugin` | macOS arm64 | 23 |
+            | `xollvm-linux-aarch64-llvm*-Release.tar.zst` | 混淆版 clang/opt | Linux aarch64（手机 proot 用） | * |
+            | `xollvm-android-aarch64-llvm*-Release.tar.zst` | 混淆版 clang/opt | **Android bionic（Termux 裸跑）** | * |
+            | `xollvm-linux-x64-llvm*-Release.tar.zst` | 混淆版 clang/opt | Linux x86_64（电脑） | * |
+            | `xollvm-windows-llvm*-Release.7z` | 混淆版 clang/opt | Windows x64 | * |
 
-            ### Cross-compilation backends
-            `-DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM;RISCV"` — X86, AArch64, ARM, RISC-V.
+            ### Cross-compilation targets
+            Linux 版: X86;AArch64;ARM;RISCV。Android 版: AArch64;ARM。
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
