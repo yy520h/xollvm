@@ -90,10 +90,10 @@ jobs:
             -DANDROID_USE_LEGACY_TOOLCHAIN_FILE=OFF \
             -DLLVM_HOST_TRIPLE=aarch64-linux-android \
             -DCMAKE_CXX_FLAGS="-static-libstdc++" \
-            -DLLVM_ENABLE_PROJECTS="llvm;clang" \
+            -DLLVM_ENABLE_PROJECTS="llvm;clang;lld;lldb" \
             -DLLVM_ENABLE_RTTI=ON \
             -DLLVM_ENABLE_EH=ON \
-            -DLLVM_TARGETS_TO_BUILD="AArch64;ARM" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64;ARM;X86" \
             -DLLVM_INCLUDE_TESTS=OFF -DLLVM_BUILD_TESTS=OFF \
             -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_BUILD_BENCHMARKS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
@@ -101,6 +101,7 @@ jobs:
             -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
             -DCLANG_ENABLE_ARCMT=OFF \
             -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt" \
+            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt;lld;lldb" \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
