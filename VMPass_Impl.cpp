@@ -19,6 +19,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
@@ -36,6 +37,22 @@ STATISTIC(VMFunctions, "Functions virtualised by VMPass");
 
 
 bool VMImpl::run() {
+	return prepare() && commit();
+}
+
+bool VMImpl::prepare() {
+	if (Prepared) return true;
+	if (Committed) return false;
+	ValueToValueMapTy Map;
+	PreparedModule = CloneModule(M, Map);
+	PreparedFunction = cast<Function>(Map.lookup(&this->F));
+	if (!PreparedFunction) {
+		FailReason = "failed to clone function for VM preparation";
+		return false;
+	}
+	Function &F = *PreparedFunction;
+	FailReason.clear();
+
 	// Demote PHI nodes to memory
 	SmallVector<PHINode*, 32> Phis;
 	for (BasicBlock& BB : F)
@@ -186,6 +203,18 @@ bool VMImpl::run() {
 				continue;
 			}
 
+			// llvm.is.fpclass(x, 3) is the canonical isnan lowering.
+			// FCmp UNO has the same NaN semantics and is VM-supported.
+			if (IID == Intrinsic::is_fpclass) {
+				auto* Mask = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+				if (Mask && Mask->getZExtValue() == 3) {
+					Value* X = CI->getArgOperand(0);
+					CI->replaceAllUsesWith(B.CreateFCmpUNO(X, X, "isnan.vm"));
+					CI->eraseFromParent();
+					continue;
+				}
+			}
+
 			// Anything else: leave in place, isize() will markUnsupported.
 		}
 	}
@@ -254,7 +283,8 @@ bool VMImpl::run() {
 	if (ObfVerify) {
 		std::string VErr;
 		uint32_t BadIP = 0;
-		if (!verifyBytecode(E, CTSalt, OpMap, VErr, BadIP, SaltConst, BlindTargets, KeyedDispatch)) {
+		if (!verifyBytecode(E, CTSalt, OpMap, VErr, BadIP, SaltConst,
+			BlindTargets, KeyedDispatch, &E.getRequirements())) {
 			FailReason = ("bytecode verify failed at ip " + std::to_string(BadIP) + ": " + VErr);
 			return false;
 		}
@@ -313,7 +343,29 @@ bool VMImpl::run() {
 
 
 	// Record return slot before stripping body
-	computeReturnInfo();
+	computeReturnInfo(F);
+
+	// wrapper 使用原函数的参数；局部值仍由暂存副本持有，递归调用保持原符号。
+	for (Argument &A : this->F.args()) {
+		Argument *Old = F.getArg(A.getArgNo());
+		auto Remap = [&](auto &Slots) {
+			auto It = Slots.find(Old);
+			if (It == Slots.end()) return;
+			auto Slot = It->second;
+			Slots.erase(It);
+			Slots[&A] = Slot;
+		};
+		Remap(E.VR);
+		Remap(E.VR64);
+		Remap(E.PR);
+		Remap(E.FR);
+	}
+	Prepared = true;
+	return true;
+}
+
+bool VMImpl::commit() {
+	if (!Prepared || Committed) return false;
 
 
 	// Erase original body
@@ -378,5 +430,84 @@ bool VMImpl::run() {
 	buildCalleeXorCtor();
 
 	++VMFunctions;
+	Committed = true;
 	return true;
+}
+
+bool VMImpl::needsOpcode(VMOp Op) const {
+	return (HasHandlerRequirements ? HandlerRequirements : E.getRequirements()).contains(Op);
+}
+
+bool VMImpl::needsBinSubop(VMOp Op, uint8_t Logical) const {
+	const auto& R = HasHandlerRequirements ? HandlerRequirements : E.getRequirements();
+	return R.allowsBinSubop(Op, Logical);
+}
+
+bool VMImpl::needsIcmpPredicate(VMOp Op, uint8_t Logical) const {
+	const auto& R = HasHandlerRequirements ? HandlerRequirements : E.getRequirements();
+	return R.allowsIcmpPredicate(Op, Logical);
+}
+
+bool VMImpl::needsCastKind(VMOp Op, uint8_t Logical) const {
+	const auto& R = HasHandlerRequirements ? HandlerRequirements : E.getRequirements();
+	return R.allowsCastKind(Op, Logical);
+}
+
+bool VMImpl::needsFcmpPredicate(uint8_t Logical) const {
+	const auto& R = HasHandlerRequirements ? HandlerRequirements : E.getRequirements();
+	return R.FcmpPredicates.test(Logical);
+}
+
+bool VMImpl::needsFBinSubop(uint8_t Logical, bool IsF32) const {
+	const auto& R = HasHandlerRequirements ? HandlerRequirements : E.getRequirements();
+	return R.allowsFBinSubop(Logical, IsF32);
+}
+
+bool VMImpl::needsSelectKind(uint8_t Logical) const {
+	const auto& R = HasHandlerRequirements ? HandlerRequirements : E.getRequirements();
+	return Logical < R.SelectKinds.size() && R.SelectKinds.test(Logical);
+}
+
+void VMImpl::setHandlerRequirements(const VMRequirementSet& Requirements) {
+	HandlerRequirements = Requirements;
+	HasHandlerRequirements = true;
+}
+
+void VMImpl::setFullHandlerRequirements() {
+	HandlerRequirements = VMRequirementSet();
+	for (unsigned I = 0; I < OP_COUNT; ++I)
+		HandlerRequirements.requireOpcode(static_cast<VMOp>(I));
+	for (unsigned F = 0; F < 2; ++F)
+		for (unsigned S = 0; S < ISAEnc::kNumBinSubop; ++S)
+			HandlerRequirements.requireBinSubop(F ? OP_BINOP64 : OP_BINOP, S);
+	for (unsigned P = ISAEnc::kIcmpPredBase;
+		P < ISAEnc::kIcmpPredBase + ISAEnc::kNumIcmpPred; ++P) {
+		HandlerRequirements.requireIcmpPredicate(OP_ICMP, P);
+		HandlerRequirements.requireIcmpPredicate(OP_ICMP64, P);
+	}
+	for (unsigned K = 0; K < 8; ++K) {
+		HandlerRequirements.requireCastKind(OP_CAST, K);
+		HandlerRequirements.requireCastKind(OP_CAST64, K);
+	}
+	for (unsigned S = 0; S < 3; ++S) HandlerRequirements.requireSelectKind(S);
+	for (unsigned S = 0; S < ISAEnc::kNumFBinSubop; ++S) {
+		HandlerRequirements.requireFBinSubop(S, false);
+		HandlerRequirements.requireFBinSubop(S, true);
+	}
+	for (unsigned P = 0; P < 16; ++P) HandlerRequirements.requireFcmpPredicate(P);
+	HasHandlerRequirements = true;
+}
+
+void VMImpl::remapPreparedExternalValues() {
+	if (!PreparedModule) return;
+	for (Value*& V : E.CalleeTab) {
+		if (auto* PreparedFn = dyn_cast<Function>(V)) {
+			if (Function* OriginalFn = M.getFunction(PreparedFn->getName()))
+				V = OriginalFn;
+		}
+		else if (auto* PreparedGV = dyn_cast<GlobalVariable>(V)) {
+			if (GlobalVariable* OriginalGV = M.getGlobalVariable(PreparedGV->getName(), true))
+				V = OriginalGV;
+		}
+	}
 }

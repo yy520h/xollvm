@@ -351,6 +351,7 @@ namespace llvm {
 	// ============================================================================
 
 	struct ISAEnc {
+		static constexpr unsigned kEncodingVersion = 1;
 		static constexpr unsigned kNumBinSubop  = 13;  // BS_ADD .. BS_UREM
 		static constexpr unsigned kNumCastKind  = 8;   // CK_ZEXT1 .. CK_TRUNC16
 		static constexpr unsigned kNumFBinSubop = 5;   // FBS_FADD .. FBS_FREM
@@ -424,6 +425,33 @@ namespace llvm {
 		uint8_t encFcmpPred(uint8_t Pred) const {
 			unsigned idx = (unsigned)Pred - kFcmpPredBase;
 			return (idx < kNumFcmpPred) ? FcmpPredL2P[idx] : Pred;
+		}
+
+		uint8_t decBinSubop(uint8_t Physical) const {
+			for (unsigned I = 0; I < kNumBinSubop; ++I)
+				if (BinSubopL2P[I] == Physical) return (uint8_t)I;
+			return 0xFF;
+		}
+		uint8_t decCastKind(uint8_t Physical) const {
+			for (unsigned I = 0; I < kNumCastKind; ++I)
+				if (CastKindL2P[I] == Physical) return (uint8_t)I;
+			return 0xFF;
+		}
+		uint8_t decFBinSubop(uint8_t Physical) const {
+			for (unsigned I = 0; I < kNumFBinSubop; ++I)
+				if (FBinSubopL2P[I] == Physical) return (uint8_t)I;
+			return 0xFF;
+		}
+		uint8_t decIcmpPred(uint8_t Physical) const {
+			for (unsigned I = 0; I < kNumIcmpPred; ++I)
+				if (IcmpPredL2P[I] == Physical) return (uint8_t)(kIcmpPredBase + I);
+			return 0xFF;
+		}
+		uint8_t decFcmpPred(uint8_t Physical) const {
+			if (Physical == 0 || Physical == 15) return Physical;
+			for (unsigned I = 0; I < kNumFcmpPred; ++I)
+				if (FcmpPredL2P[I] == Physical) return (uint8_t)(kFcmpPredBase + I);
+			return 0xFF;
 		}
 	};
 

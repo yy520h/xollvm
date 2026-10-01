@@ -1,0 +1,786 @@
+#include "llvm/Transforms/Obfuscator/ObfuscationConfig.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Verifier.h"
+#include "gtest/gtest.h"
+#include "llvm/AsmParser/Parser.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Support/SourceMgr.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Requirements.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
+#include "llvm/Transforms/Obfuscator/ZoneAuth.h"
+#include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
+#ifdef OBF_TEST_VM_IMPL
+#include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
+#include "llvm/Support/raw_ostream.h"
+#endif
+
+using namespace llvm;
+
+TEST(ZoneAuthConfig, ParsesCapabilityAndPolicy) {
+	ObfuscationConfig C = AnnotationParser::parseAnnotationString(
+		"obf: zoneauth(capability=main, policy=fail_closed)");
+	auto P = C.getPassConfig("zoneauth");
+	ASSERT_TRUE(P.has_value());
+	ZoneAuthConfig Z = ZoneAuthConfig::fromPassConfig(*P);
+	EXPECT_TRUE(Z.enabled);
+	EXPECT_EQ(Z.capability, "main");
+	EXPECT_EQ(Z.policy, "fail_closed");
+	EXPECT_TRUE(Z.validate());
+}
+
+TEST(ZoneAuthConfig, RejectsMissingCapability) {
+	ObfuscationConfig C = AnnotationParser::parseAnnotationString(
+		"obf: zoneauth(policy=fail_closed)");
+	auto P = C.getPassConfig("zoneauth");
+	ASSERT_TRUE(P.has_value());
+	EXPECT_FALSE(ZoneAuthConfig::fromPassConfig(*P).validate());
+}
+
+TEST(ZoneAuthConfig, RejectsUnknownPolicy) {
+	ObfuscationConfig C = AnnotationParser::parseAnnotationString(
+		"obf: zoneauth(capability=main, policy=continue)");
+	auto P = C.getPassConfig("zoneauth");
+	ASSERT_TRUE(P.has_value());
+	EXPECT_FALSE(ZoneAuthConfig::fromPassConfig(*P).validate());
+}
+
+TEST(ZoneAuthIR, InjectsRequireCallForAnnotatedIntegerFunction) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(
+		"@.str = private unnamed_addr constant [51 x i8] c\"obf: zoneauth(capability=main, policy=fail_closed)\\00\"\n"
+		"@llvm.global.annotations = appending global [1 x { ptr, ptr, ptr, i32, ptr }] [{ ptr, ptr, ptr, i32, ptr } { ptr @entry, ptr @.str, ptr null, i32 0, ptr null }]\n"
+		"define i32 @entry(i32 %x) { ret i32 %x }\n", D, C);
+	ASSERT_NE(M, nullptr);
+	ModuleAnalysisManager MAM;
+	ObfZoneEnable = true;
+	ObfZoneSoftwareId = "software";
+	ObfZoneVersion = "1.0";
+	ObfZoneEncryptKey = "key";
+	ObfZoneEncryptIv = "iv";
+	ObfZoneAlgorithm = "attest";
+	EXPECT_FALSE(ZoneAuthModulePass().run(*M, MAM).areAllPreserved());
+	ObfZoneEnable = false;
+	ObfZoneSoftwareId = "";
+	ObfZoneVersion = "";
+	ObfZoneEncryptKey = "";
+	ObfZoneEncryptIv = "";
+	ObfZoneAlgorithm = "";
+	EXPECT_NE(M->getFunction("xollvm_zone_require"), nullptr);
+	EXPECT_NE(M->getFunction("entry")->getEntryBlock().getTerminator(), nullptr);
+	EXPECT_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST(ZoneAuthIR, DisabledLeavesRuntimeUnlinked) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString("define i32 @plain(i32 %x) { ret i32 %x }\n", D, C);
+	ASSERT_NE(M, nullptr);
+	ModuleAnalysisManager MAM;
+	ObfZoneEnable = false;
+	ZoneAuthModulePass().run(*M, MAM);
+	EXPECT_EQ(M->getFunction("xollvm_zone_require"), nullptr);
+}
+
+TEST(VMPlan, EmptyCoordinatorFreezesWithoutCandidates) {
+	VMPlanCoordinator Coordinator;
+	EXPECT_TRUE(Coordinator.freeze());
+	EXPECT_EQ(Coordinator.candidateCount(), 0u);
+}
+
+TEST(VMPlan, FreezesCompatibleCandidatesIntoOneDemandUnion) {
+	LLVMContext C;
+	Module M("plan", C);
+	FunctionType* FT = FunctionType::get(Type::getVoidTy(C), false);
+	Function* A = Function::Create(FT, GlobalValue::ExternalLinkage, "a", M);
+	Function* B = Function::Create(FT, GlobalValue::ExternalLinkage, "b", M);
+	VMPassConfig Config;
+	EngineConfigKey Key = EngineConfigKey::fromConfig(Config, 0, 0);
+	BytecodeEmitter EA;
+	BytecodeEmitter EB;
+	VMRequirementSet RA;
+	VMRequirementSet RB;
+	RA.requireBinSubop(OP_BINOP, BS_ADD);
+	RB.requireBinSubop(OP_BINOP, BS_MUL);
+	VMPlanCoordinator Coordinator;
+	ASSERT_NE(Coordinator.addCandidate(*A, Config, Key, std::move(EA), RA), nullptr);
+	ASSERT_NE(Coordinator.addCandidate(*B, Config, Key, std::move(EB), RB), nullptr);
+	ASSERT_TRUE(Coordinator.freeze());
+	ASSERT_EQ(Coordinator.groupCount(), 1u);
+	const VMEnginePlan* Plan = Coordinator.groupPlan(0);
+	ASSERT_NE(Plan, nullptr);
+	EXPECT_TRUE(Plan->Requirements.allowsBinSubop(OP_BINOP, BS_ADD));
+	EXPECT_TRUE(Plan->Requirements.allowsBinSubop(OP_BINOP, BS_MUL));
+}
+
+TEST(VMPlan, SeparatesIncompatibleEngineKeys) {
+	LLVMContext C;
+	Module M("plan", C);
+	FunctionType* FT = FunctionType::get(Type::getVoidTy(C), false);
+	Function* A = Function::Create(FT, GlobalValue::ExternalLinkage, "a", M);
+	Function* B = Function::Create(FT, GlobalValue::ExternalLinkage, "b", M);
+	VMPassConfig AConfig;
+	VMPassConfig BConfig = AConfig;
+	BConfig.lazyDecrypt = true;
+	VMPlanCoordinator Coordinator;
+	EXPECT_NE(Coordinator.addCandidate(*A, AConfig,
+		EngineConfigKey::fromConfig(AConfig, 0, 0), BytecodeEmitter{}, {}), nullptr);
+	EXPECT_NE(Coordinator.addCandidate(*B, BConfig,
+		EngineConfigKey::fromConfig(BConfig, 0, 0), BytecodeEmitter{}, {}), nullptr);
+	ASSERT_TRUE(Coordinator.freeze());
+	EXPECT_EQ(Coordinator.groupCount(), 2u);
+}
+
+TEST(VMPlan, AntiDebugConfigurationSeparatesEngineKeys) {
+	VMPassConfig A, B;
+	A.antiDebugConfig.enabled = true;
+	A.antiDebugConfig.tracerPid = true;
+	B.antiDebugConfig.enabled = true;
+	B.antiDebugConfig.timing = true;
+	EXPECT_FALSE(EngineConfigKey::fromConfig(A, 0, 0) ==
+		EngineConfigKey::fromConfig(B, 0, 0));
+}
+
+TEST(VMPlan, NestedHelperRequirementsAreMergedIntoGroup) {
+	LLVMContext C;
+	Module M("plan", C);
+	FunctionType* FT = FunctionType::get(Type::getVoidTy(C), false);
+	Function* A = Function::Create(FT, GlobalValue::ExternalLinkage, "outer", M);
+	VMPassConfig Config;
+	EngineConfigKey Key = EngineConfigKey::fromConfig(Config, 0, 0);
+	VMRequirementSet Outer;
+	Outer.requireOpcode(OP_BINOP);
+	Outer.NestedHelpers.push_back(OP_BINOP);
+	VMRequirementSet Helper;
+	Helper.requireBinSubop(OP_BINOP, BS_MUL);
+	VMPlanCoordinator Coordinator;
+	Coordinator.addCandidate(*A, Config, Key, BytecodeEmitter{}, Outer);
+	ASSERT_TRUE(Coordinator.addHelperRequirements(Key, OP_BINOP, Helper));
+	ASSERT_TRUE(Coordinator.freeze());
+	const VMEnginePlan* Plan = Coordinator.groupPlan(0);
+	ASSERT_NE(Plan, nullptr);
+	EXPECT_TRUE(Plan->Requirements.allowsBinSubop(OP_BINOP, BS_MUL));
+}
+
+TEST(AntiDebugIR, ConfiguredTracerPidUsesOnlyTracerSymbols) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+define i32 @target(i32 %x) {
+entry:
+  %r = add i32 %x, 1
+  ret i32 %r
+}
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	AntiDebugConfig AD;
+	AD.enabled = true;
+	AD.tracerPid = true;
+	EXPECT_TRUE(AD.validate());
+}
+
+TEST(AntiDebugConfig, DefaultsAreDisabled) {
+	auto C = AnnotationParser::parseAnnotationString("obf: antidebug");
+	auto PC = C.getPassConfig("antidebug");
+	ASSERT_TRUE(PC.has_value());
+	auto AD = AntiDebugConfig::fromPassConfig(*PC);
+	EXPECT_FALSE(AD.enabled);
+	EXPECT_FALSE(AD.tracerPid);
+	EXPECT_FALSE(AD.ptrace);
+	EXPECT_FALSE(AD.timing);
+	EXPECT_FALSE(AD.maps);
+	EXPECT_FALSE(AD.integrity);
+	EXPECT_FALSE(AD.dynamic);
+}
+
+TEST(AntiDebugConfig, ExplicitZeroWins) {
+	auto C = AnnotationParser::parseAnnotationString(
+		"obf: antidebug(tracerPid=1,ptrace=0,timing=1,dynamic=0,interval=250,threshold=900000)");
+	auto PC = C.getPassConfig("antidebug");
+	ASSERT_TRUE(PC.has_value());
+	auto AD = AntiDebugConfig::fromPassConfig(*PC);
+	EXPECT_TRUE(AD.tracerPid);
+	EXPECT_FALSE(AD.ptrace);
+	EXPECT_TRUE(AD.timing);
+	EXPECT_FALSE(AD.dynamic);
+	EXPECT_EQ(AD.intervalMs, 250u);
+	EXPECT_EQ(AD.thresholdNs, 900000u);
+}
+
+TEST(AntiDebugConfig, DynamicRequiresDetector) {
+	auto C = AnnotationParser::parseAnnotationString("obf: antidebug(dynamic=1)");
+	auto PC = C.getPassConfig("antidebug");
+	ASSERT_TRUE(PC.has_value());
+	auto AD = AntiDebugConfig::fromPassConfig(*PC);
+	std::string Reason;
+	EXPECT_FALSE(AD.validate(&Reason));
+	EXPECT_EQ(Reason, "dynamic monitor requires at least one detector");
+}
+
+#if __has_include("llvm/Transforms/Obfuscator/VMPass_Requirements.h")
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/LLVMContext.h"
+
+TEST(VMRequirements, IntegerFamiliesRemainIndependent) {
+	VMRequirementSet R;
+	R.requireBinSubop(OP_BINOP, BS_ADD);
+	R.requireBinSubop(OP_BINOP64, BS_MUL);
+	EXPECT_TRUE(R.contains(OP_BINOP64));
+	EXPECT_TRUE(R.allowsBinSubop(OP_BINOP64, BS_MUL));
+	EXPECT_FALSE(R.allowsBinSubop(OP_BINOP, BS_MUL));
+	EXPECT_FALSE(R.allowsBinSubop(OP_BINOP64, BS_ADD));
+}
+
+TEST(VMRequirements, PrecisionStaysAssociatedWithOperation) {
+	VMRequirementSet R;
+	R.requireFBinSubop(FBS_FADD, true);
+	R.requireFBinSubop(FBS_FMUL, false);
+	EXPECT_EQ(R.FBinSubops.count(), 2u);
+	EXPECT_EQ(R.FBinSubops.size(), ISAEnc::kNumFBinSubop);
+	EXPECT_TRUE(R.allowsFBinSubop(FBS_FADD, true));
+	EXPECT_FALSE(R.allowsFBinSubop(FBS_FADD, false));
+	EXPECT_TRUE(R.allowsFBinSubop(FBS_FMUL, false));
+	EXPECT_FALSE(R.allowsFBinSubop(FBS_FMUL, true));
+}
+
+TEST(VMRequirements, MergeUnionsDomainsWithoutCrossProduct) {
+	VMRequirementSet A, B;
+	A.requireFBinSubop(FBS_FADD, true);
+	B.requireFBinSubop(FBS_FMUL, false);
+	B.requireBinSubop(OP_BINOP64, BS_UREM);
+	A.merge(B);
+	A.merge(B);
+	EXPECT_EQ(A.Opcodes.count(), 2u);
+	EXPECT_TRUE(A.allowsBinSubop(OP_BINOP64, BS_UREM));
+	EXPECT_FALSE(A.allowsBinSubop(OP_BINOP, BS_UREM));
+	EXPECT_FALSE(A.allowsFBinSubop(FBS_FADD, false));
+}
+
+TEST(VMRequirements, SuperopClosureDoesNotCreateBinopFallbacks) {
+	VMRequirementSet R;
+	R.requireOpcode(OP_MULADD);
+	R.requireIcmpPredicate(OP_ANDCMPZ, ISAEnc::kIcmpPredBase);
+	VMPassConfig C;
+	R.closeDependencies(C);
+	EXPECT_TRUE(R.NeedsSuperOps);
+	EXPECT_TRUE(R.NeedsRegFile[0]);
+	EXPECT_FALSE(R.contains(OP_BINOP));
+	EXPECT_FALSE(R.contains(OP_ICMP));
+	EXPECT_TRUE(R.BinSubops[0].none());
+}
+
+TEST(VMRequirements, NestedClosureSelectsOnlyUsedEligibleFamilies) {
+	VMRequirementSet R;
+	R.requireBinSubop(OP_BINOP64, BS_MUL);
+	R.requireOpcode(OP_LOAD32);
+	VMPassConfig C;
+	C.nestedVM = true;
+	R.closeDependencies(C);
+	R.closeDependencies(C);
+	ASSERT_EQ(R.NestedHelpers.size(), 1u);
+	EXPECT_EQ(R.NestedHelpers[0], OP_BINOP64);
+	EXPECT_FALSE(R.contains(OP_BINOP));
+}
+
+TEST(VMRequirements, CallTypesDeduplicateByStructure) {
+	LLVMContext C1, C2;
+	auto *T1 = FunctionType::get(Type::getInt32Ty(C1), {Type::getInt64Ty(C1)}, false);
+	auto *T2 = FunctionType::get(Type::getInt32Ty(C2), {Type::getInt64Ty(C2)}, false);
+	auto *T3 = FunctionType::get(Type::getInt32Ty(C1), {Type::getInt64Ty(C1)}, true);
+	VMRequirementSet A, B;
+	A.requireCallType(T1);
+	B.requireCallType(T2);
+	B.requireCallType(T3);
+	A.merge(B);
+	EXPECT_EQ(A.CallTypes.size(), 2u);
+	EXPECT_TRUE(A.NeedsRegFile[0]);
+	EXPECT_TRUE(A.NeedsRegFile[1]);
+}
+
+TEST(VMRequirements, CastKindsAndPredicatesStayInTheirOwnFamily) {
+	VMRequirementSet R;
+	R.requireCastKind(OP_CAST64, C64_TRUNC32);
+	R.requireFCastKind(OP_FCAST_VF, FK_SITOFP, true);
+	R.requireIcmpPredicate(OP_CMPSEL, ISAEnc::kIcmpPredBase);
+	EXPECT_FALSE(R.allowsCastKind(OP_CAST, C64_TRUNC32));
+	EXPECT_TRUE(R.allowsCastKind(OP_CAST64, C64_TRUNC32));
+	EXPECT_FALSE(R.allowsFCastKind(OP_FCAST_VF, FK_SITOFP, false));
+	EXPECT_FALSE(R.allowsFCastKind(OP_FCAST_V64F, FK_SI64TOFP, true));
+	EXPECT_FALSE(R.allowsIcmpPredicate(OP_ICMP, ISAEnc::kIcmpPredBase));
+}
+
+TEST(VMRequirements, KeySeparatesConfigurationAndOwner) {
+	VMPassConfig A, B;
+	A.randISA = false;
+	B.randISA = true;
+	EXPECT_FALSE(EngineConfigKey::fromConfig(A, 0, 0) == EngineConfigKey::fromConfig(B, 0, 0));
+	B = A;
+	B.lazyDecrypt = !A.lazyDecrypt;
+	EXPECT_FALSE(EngineConfigKey::fromConfig(A, 0, 0) == EngineConfigKey::fromConfig(B, 0, 0));
+	B = A;
+	B.adHandlerThreshold++;
+	EXPECT_FALSE(EngineConfigKey::fromConfig(A, 0, 0) == EngineConfigKey::fromConfig(B, 0, 0));
+	EXPECT_FALSE(EngineConfigKey::fromConfig(A, 0, 0) == EngineConfigKey::fromConfig(A, 1, 0));
+	A.perFnEngine = true;
+	EXPECT_FALSE(EngineConfigKey::fromConfig(A, 0, 1) == EngineConfigKey::fromConfig(A, 0, 2));
+}
+
+TEST(VMRequirements, KeyIgnoresEligibilityButHashesAllEffectiveFields) {
+	VMPassConfig A, B;
+	B.minBlocks = 7;
+	B.maxBlocks = 20;
+	auto KA = EngineConfigKey::fromConfig(A, 0, 0);
+	auto KB = EngineConfigKey::fromConfig(B, 0, 0);
+	EXPECT_TRUE(KA == KB);
+	EXPECT_EQ(KA.stableHash(), KB.stableHash());
+	B.regEncrypt = true;
+	KB = EngineConfigKey::fromConfig(B, 0, 0);
+	EXPECT_FALSE(KA == KB);
+	EXPECT_NE(KA.stableHash(), KB.stableHash());
+	EXPECT_TRUE(KA.toJson().getBoolean("randISA").value_or(false));
+}
+
+TEST(VMRequirements, TableDomainDoesNotShrinkWithDemand) {
+	VMEnginePlan P;
+	P.Config.handlerVariants = 3;
+	P.Config.encDispatch = true;
+	P.Requirements.requireBinSubop(OP_BINOP, BS_MUL);
+	EXPECT_EQ(P.handlerTableEntries(), 225u);
+	P.Decoys = 7;
+	EXPECT_EQ(P.handlerTableEntries(), 232u);
+}
+
+TEST(VMRequirements, WitnessRecordsLogicalPrecisionAndFullKey) {
+	VMEngineWitness W;
+	W.EngineId = 4;
+	W.ConfigKey = EngineConfigKey::fromConfig(VMPassConfig{}, 2, 0);
+	W.Requirements.requireFBinSubop(FBS_FADD, true);
+	W.RealHandlers.push_back(OP_BINOP_F);
+	W.HandlerVariants = 3;
+	W.HandlerTableEntries = 225;
+	auto J = W.toJson();
+	EXPECT_EQ(J.getInteger("engine_id"), 4);
+	EXPECT_EQ(J.getInteger("handler_table_entries"), 225);
+	ASSERT_NE(J.getObject("config_key"), nullptr);
+	ASSERT_NE(J.getObject("requirements"), nullptr);
+	EXPECT_NE(J.getObject("isa_maps"), nullptr);
+	ASSERT_NE(J.getArray("real_handlers"), nullptr);
+	EXPECT_EQ(J.getArray("real_handlers")->size(), 1u);
+}
+
+#else
+TEST(VMRequirements, ModelIsAvailable) {
+	FAIL() << "VM requirement model is not implemented";
+}
+#endif
+
+TEST(VMDefaults, OperandRandomizationIsEnabled) {
+	EXPECT_TRUE(llvm::VMPassConfig{}.randISA);
+}
+
+TEST(VMEmitter, RecordsDemandAtTheActualIntegerEmissionSite) {
+	LLVMContext C;
+	SMDiagnostic Diag;
+	auto M = parseAssemblyString(R"IR(
+define i32 @add(i32 %x, i32 %y) {
+entry:
+  %sum = add i32 %x, %y
+  ret i32 %sum
+}
+)IR", Diag, C);
+	ASSERT_NE(M, nullptr);
+	BytecodeEmitter E;
+	ASSERT_TRUE(E.run(*M->getFunction("add"), 0, M->getDataLayout()));
+	EXPECT_TRUE(E.getRequirements().contains(OP_BINOP));
+	EXPECT_TRUE(E.getRequirements().allowsBinSubop(OP_BINOP, BS_ADD));
+	EXPECT_FALSE(E.getRequirements().allowsBinSubop(OP_BINOP, BS_MUL));
+}
+
+TEST(VMEmitter, CopyAndExternalSinkDoNotAliasOwnedDemand) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+define i32 @add(i32 %x, i32 %y) { %r = add i32 %x, %y ret i32 %r }
+define i64 @mul(i64 %x, i64 %y) { %r = mul i64 %x, %y ret i64 %r }
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	BytecodeEmitter A;
+	ASSERT_TRUE(A.run(*M->getFunction("add"), 0, M->getDataLayout()));
+	BytecodeEmitter B = A;
+	ASSERT_TRUE(B.run(*M->getFunction("mul"), 0, M->getDataLayout()));
+	EXPECT_TRUE(A.getRequirements().allowsBinSubop(OP_BINOP, BS_ADD));
+	EXPECT_TRUE(B.getRequirements().allowsBinSubop(OP_BINOP64, BS_MUL));
+	EXPECT_FALSE(B.getRequirements().contains(OP_BINOP));
+	VMRequirementSet Sink;
+	B.setRequirements(&Sink);
+	ASSERT_TRUE(B.run(*M->getFunction("add"), 0, M->getDataLayout()));
+	EXPECT_TRUE(B.getRequirements().allowsBinSubop(OP_BINOP, BS_ADD));
+	EXPECT_TRUE(Sink.allowsBinSubop(OP_BINOP, BS_ADD));
+	B.setRequirements(nullptr);
+}
+
+TEST(VMEmitter, FreezeAliasesSupportedScalarOperand) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+define i32 @rejected(i32 %x, i32 %y) {
+  %a = add i32 %x, %y
+  %f = freeze i32 %a
+  ret i32 %f
+}
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	BytecodeEmitter E;
+	VMRequirementSet Sink;
+	E.setRequirements(&Sink);
+  EXPECT_TRUE(E.run(*M->getFunction("rejected"), 0, M->getDataLayout()));
+  EXPECT_TRUE(E.getRequirements().contains(OP_BINOP));
+  EXPECT_TRUE(Sink.contains(OP_BINOP));
+}
+
+TEST(VMEmitter, FmodLoweringUsesRandomizedOperandEncoding) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+declare float @fmodf(float, float)
+define float @target(float %x, float %y) {
+  %r = call float @fmodf(float %x, float %y)
+  ret float %r
+}
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	ISAEnc Map;
+	std::swap(Map.FBinSubopL2P[FBS_FREM], Map.FBinSubopL2P[FBS_FSUB]);
+	BytecodeEmitter E;
+	E.setISAEnc(&Map);
+	ASSERT_TRUE(E.run(*M->getFunction("target"), 0, M->getDataLayout()));
+	ASSERT_GE(E.BC.size(), 5u);
+	EXPECT_EQ(E.BC[4], Map.encFBinSubop(FBS_FREM) | FBS_F32_FLAG);
+	EXPECT_TRUE(E.getRequirements().allowsFBinSubop(FBS_FREM, true));
+	EXPECT_TRUE(E.getRequirements().CallTypes.empty());
+	EXPECT_FALSE(E.getRequirements().contains(OP_CALL_F));
+}
+
+TEST(VMEmitter, FusionAndConstantPrologueRecordOnlyEmittedOpcodes) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+define i32 @target(i32 %x, i32 %y) {
+  %m = mul i32 %x, %y
+  %r = add i32 %m, 11
+  ret i32 %r
+}
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	BytecodeEmitter E;
+	E.setSuperOps(true);
+	E.setConstInStream(true);
+	E.setKeyedDispatch(42, true);
+	ASSERT_TRUE(E.run(*M->getFunction("target"), 0, M->getDataLayout()));
+	auto Bytes = E.BC;
+	EXPECT_TRUE(E.getRequirements().contains(OP_MULADD));
+	EXPECT_TRUE(E.getRequirements().contains(OP_LOADI));
+	EXPECT_FALSE(E.getRequirements().contains(OP_BINOP));
+	EXPECT_TRUE(E.getRequirements().NeedsSuperOps);
+	EXPECT_TRUE(E.getRequirements().NeedsConstStream);
+	ASSERT_TRUE(E.run(*M->getFunction("target"), 0, M->getDataLayout()));
+	EXPECT_EQ(E.BC, Bytes);
+}
+
+TEST(VMEmitter, RecordsCastsSelectsAndConcreteVarargs) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+declare i32 @callee(ptr, ...)
+define i32 @target(i32 %x, i64 %y, float %f, ptr %p) {
+  %b = icmp eq i32 %x, 7
+  %z = zext i1 %b to i32
+  %t = trunc i64 %y to i32
+  %s = select i1 %b, i64 %y, i64 9
+  %fp = sitofp i32 %x to float
+  %n = fadd float %fp, %f
+  %d = fpext float %n to double
+  %r = call i32 (ptr, ...) @callee(ptr %p, i32 %z, i32 %t, i64 %s, double %d)
+  ret i32 %r
+}
+
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	BytecodeEmitter E;
+	ASSERT_TRUE(E.run(*M->getFunction("target"), 0, M->getDataLayout()));
+	const auto &R = E.getRequirements();
+	EXPECT_TRUE(R.allowsIcmpPredicate(OP_ICMP, ISAEnc::kIcmpPredBase));
+	EXPECT_TRUE(R.allowsCastKind(OP_CAST, CK_ZEXT1));
+	EXPECT_TRUE(R.allowsCastKind(OP_CAST64, C64_TRUNC32));
+	EXPECT_TRUE(R.SelectKinds.test(2));
+	EXPECT_TRUE(R.allowsFCastKind(OP_FCAST_VF, FK_SITOFP, true));
+	EXPECT_TRUE(R.allowsFCastKind(OP_FCAST_FF, FK_FPEXT, false));
+	EXPECT_TRUE(R.allowsFBinSubop(FBS_FADD, true));
+	ASSERT_EQ(R.CallTypes.size(), 1u);
+	EXPECT_TRUE(R.CallTypes[0]->isVarArg());
+	EXPECT_EQ(R.CallTypes[0]->getNumParams(), 5u);
+}
+
+TEST(VMEmitter, RecordsVarargCallerSubopsForSharedEngineDemand) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+declare i32 @vadd(i32, ...)
+define i32 @target(i32 %x, i32 %y) {
+  %mul = mul i32 %x, %y
+  %sum = add i32 %x, %y
+  %r = call i32 (i32, ...) @vadd(i32 2, i32 %mul, i32 %sum)
+  ret i32 %r
+}
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	BytecodeEmitter E;
+	ASSERT_TRUE(E.run(*M->getFunction("target"), 0, M->getDataLayout()));
+	EXPECT_TRUE(E.getRequirements().allowsBinSubop(OP_BINOP, BS_MUL));
+	EXPECT_TRUE(E.getRequirements().allowsBinSubop(OP_BINOP, BS_ADD));
+	ASSERT_EQ(E.getRequirements().CallTypes.size(), 1u);
+	EXPECT_TRUE(E.getRequirements().CallTypes[0]->isVarArg());
+}
+
+TEST(VMVerifier, RejectsInvalidAndUnrequiredSemanticBytesAtCorrectIP) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+define i32 @target(i32 %x, i32 %y) { %r = add i32 %x, %y ret i32 %r }
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	BytecodeEmitter E;
+	VMOpcodeMap Map;
+	ASSERT_TRUE(E.run(*M->getFunction("target"), 0, M->getDataLayout()));
+	std::string Error;
+	uint32_t BadIP = 99;
+	auto Verify = [&] {
+		return verifyBytecode(E, 0, Map, Error, BadIP, 0, false, false, &E.getRequirements());
+	};
+	ASSERT_TRUE(Verify()) << Error;
+	E.BC[4] = 255;
+	EXPECT_FALSE(Verify());
+	EXPECT_EQ(BadIP, 0u);
+	EXPECT_NE(Error.find("subop"), std::string::npos);
+	E.BC[4] = BS_MUL;
+	EXPECT_FALSE(Verify());
+	E.BC[4] = BS_ADD;
+	E.BC[0] = OP_ICMP;
+	EXPECT_FALSE(Verify());
+	EXPECT_NE(Error.find("requirement"), std::string::npos);
+	E.BC[0] = 255;
+	EXPECT_FALSE(Verify());
+	EXPECT_NE(Error.find("invalid opcode"), std::string::npos);
+}
+
+TEST(VMVerifier, IndependentlyChecksInstructionBoundaries) {
+	BytecodeEmitter E;
+	E.NVR = 1;
+	E.BC = {OP_JMP, 6, 0, 0, 0, OP_LOADI, 0, 7, 0, 0, 0, OP_RET_INT, 0};
+	E.BlockIP[nullptr] = 0;
+	LLVMContext C;
+	auto BB = std::unique_ptr<BasicBlock>(BasicBlock::Create(C));
+	E.BlockIP[BB.get()] = 6; // 故意伪造落在 LOADI 操作数内部的块起点。
+	std::string Error;
+	uint32_t IP = 99;
+	EXPECT_FALSE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP));
+	EXPECT_NE(Error.find("instruction boundary"), std::string::npos);
+}
+
+TEST(VMVerifier, UsesCallTypeToValidateArgumentFileAndArity) {
+	LLVMContext C;
+	auto F = std::unique_ptr<Function>(Function::Create(
+		FunctionType::get(Type::getVoidTy(C), {PointerType::getUnqual(C)}, false),
+		GlobalValue::ExternalLinkage, "callee"));
+	BytecodeEmitter E;
+	E.CalleeTab.push_back(F.get());
+	E.CalleeFTyTab.push_back(F->getFunctionType());
+	E.NPR = 1;
+	E.NVR = 10;
+	E.BlockIP[nullptr] = 0;
+	E.BC = {OP_CALL_VOID, 0, 1, 9, OP_RET_VOID};
+	std::string Error;
+	uint32_t IP = 99;
+	EXPECT_FALSE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP));
+	EXPECT_EQ(IP, 0u);
+	E.BC = {OP_CALL_VOID, 0, 0, OP_RET_VOID};
+	EXPECT_FALSE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP));
+	EXPECT_NE(Error.find("arity"), std::string::npos);
+}
+
+TEST(VMVerifier, RejectsUnusedFloatingPrecisionCombination) {
+	BytecodeEmitter E;
+	E.NFR = 3;
+	E.BlockIP[nullptr] = 0;
+	E.BC = {OP_BINOP_F, 2, 0, 1, FBS_FADD, OP_RET_F, 2};
+	VMRequirementSet Allowed;
+	Allowed.requireFBinSubop(FBS_FADD, true);
+	Allowed.requireOpcode(OP_RET_F);
+	std::string Error;
+	uint32_t IP = 99;
+	EXPECT_FALSE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP, 0, false, false, &Allowed));
+	E.BC[4] |= FBS_F32_FLAG;
+	EXPECT_TRUE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP, 0, false, false, &Allowed)) << Error;
+}
+
+TEST(VMVerifier, RejectsUnrequiredCastKindsInEveryRegisterFamily) {
+	struct Case { VMOp Op; uint8_t AllowedKind, OtherKind; bool F32; };
+	const Case Cases[] = {
+		{OP_CAST64, C64_ZEXT32, C64_SEXT32, false},
+		{OP_FCAST_FF, FK_FPEXT, FK_FPTRUNC, false},
+		{OP_FCAST_FV, FK_FPTOSI, FK_FPTOUI, false},
+		{OP_FCAST_FV64, FK_FPTOSI64, FK_FPTOUI64, false},
+		{OP_FCAST_VF, FK_SITOFP, FK_UITOFP, true},
+		{OP_FCAST_V64F, FK_SI64TOFP, FK_UI64TOFP, true},
+	};
+	for (const auto &T : Cases) {
+		SCOPED_TRACE(vmOpcodeName(T.Op).str());
+		BytecodeEmitter E;
+		E.NVR = E.NVR64 = E.NFR = 1;
+		E.BlockIP[nullptr] = 0;
+		E.BC = {T.Op, 0, 0, uint8_t(T.AllowedKind | (T.F32 ? 128 : 0)), OP_RET_VOID};
+		VMRequirementSet Allowed;
+		if (T.Op == OP_CAST64) Allowed.requireCastKind(T.Op, T.AllowedKind);
+		else Allowed.requireFCastKind(T.Op, T.AllowedKind, T.F32);
+		Allowed.requireOpcode(OP_RET_VOID);
+		std::string Error;
+		uint32_t IP = 99;
+		auto Verify = [&] {
+			return verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP, 0, false, false, &Allowed);
+		};
+		ASSERT_TRUE(Verify()) << Error;
+		E.BC[3] = T.OtherKind | (T.F32 ? 128 : 0);
+		EXPECT_FALSE(Verify());
+		EXPECT_EQ(IP, 0u);
+		if (T.F32) {
+			E.BC[3] = T.AllowedKind;
+			EXPECT_FALSE(Verify());
+		}
+	}
+}
+
+TEST(VMVerifier, RejectsUnrequiredOrInvalidFusedPredicates) {
+	for (VMOp Op : {OP_CMPSEL, OP_ANDCMPZ}) {
+		SCOPED_TRACE(vmOpcodeName(Op).str());
+		BytecodeEmitter E;
+		E.NVR = 1;
+		E.BlockIP[nullptr] = 0;
+		E.BC = {Op, 0, 0, 0, 32};
+		if (Op == OP_CMPSEL) E.BC.append({0, 0});
+		E.BC.push_back(OP_RET_VOID);
+		VMRequirementSet Allowed;
+		Allowed.requireIcmpPredicate(Op, 32);
+		Allowed.requireOpcode(OP_RET_VOID);
+		std::string Error;
+		uint32_t IP = 99;
+		ASSERT_TRUE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP, 0, false, false, &Allowed));
+		E.BC[4] = 33;
+		EXPECT_FALSE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP, 0, false, false, &Allowed));
+		EXPECT_EQ(IP, 0u);
+		E.BC[4] = Op == OP_ANDCMPZ ? 34 : 255;
+		EXPECT_FALSE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP));
+	}
+}
+
+TEST(VMVerifier, AcceptsConstantFcmpPredicatesAndRejectsInvalidOnes) {
+	BytecodeEmitter E;
+	E.NVR = E.NFR = 1;
+	E.BlockIP[nullptr] = 0;
+	E.BC = {OP_FCMP, 0, 0, 0, 0, OP_RET_INT, 0};
+	VMRequirementSet Allowed;
+	Allowed.requireFcmpPredicate(0);
+	Allowed.requireFcmpPredicate(15);
+	Allowed.requireOpcode(OP_RET_INT);
+	std::string Error;
+	uint32_t IP = 99;
+	for (uint8_t Pred : {0, 15}) {
+		E.BC[4] = Pred;
+		EXPECT_TRUE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP, 0, false, false, &Allowed)) << Error;
+	}
+	E.BC[4] = 16;
+	EXPECT_FALSE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP));
+}
+
+TEST(VMVerifier, ChecksCallReturnKindAndAllowedSignature) {
+	LLVMContext C;
+	auto F = std::unique_ptr<Function>(Function::Create(
+		FunctionType::get(Type::getInt32Ty(C), false), GlobalValue::ExternalLinkage, "callee"));
+	BytecodeEmitter E;
+	E.CalleeTab.push_back(F.get());
+	E.CalleeFTyTab.push_back(F->getFunctionType());
+	E.NVR = E.NPR = 1;
+	E.BlockIP[nullptr] = 0;
+	E.BC = {OP_CALL_INT, 0, 0, 0, OP_RET_VOID};
+	VMRequirementSet Allowed;
+	Allowed.requireOpcode(OP_CALL_INT);
+	Allowed.requireOpcode(OP_RET_VOID);
+	std::string Error;
+	uint32_t IP = 99;
+	EXPECT_FALSE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP, 0, false, false, &Allowed));
+	Allowed.requireCallType(F->getFunctionType());
+	ASSERT_TRUE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP, 0, false, false, &Allowed)) << Error;
+	E.BC[0] = OP_CALL_PTR;
+	EXPECT_FALSE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP));
+	EXPECT_EQ(IP, 0u);
+}
+
+TEST(VMVerifier, ValidatesConcreteVariadicArguments) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+declare i32 @callee(ptr, ...)
+define i32 @target(ptr %p, double %d, i64 %n) {
+  %r = call i32 (ptr, ...) @callee(ptr %p, double %d, i64 %n)
+  ret i32 %r
+}
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	BytecodeEmitter E;
+	ASSERT_TRUE(E.run(*M->getFunction("target"), 0, M->getDataLayout()));
+	std::string Error;
+	uint32_t IP = 99;
+	ASSERT_TRUE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP, 0, false, false, &E.getRequirements())) << Error;
+	E.BC[5] = 1;
+	EXPECT_FALSE(verifyBytecode(E, 0, VMOpcodeMap{}, Error, IP));
+	EXPECT_EQ(IP, 0u);
+}
+
+#ifdef OBF_TEST_VM_IMPL
+TEST(VMPreparation, RejectionLeavesOriginalFunctionAndModuleUntouched) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+define i32 @target(i1 %c, i32 %x) {
+entry:
+  br i1 %c, label %a, label %b
+a:
+  br label %end
+b:
+  br label %end
+end:
+  %p = phi i32 [ %x, %a ], [ 0, %b ]
+  %r = freeze i32 %p
+  ret i32 %r
+}
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	auto Print = [&] {
+		std::string S;
+		raw_string_ostream OS(S);
+		M->print(OS, nullptr);
+		return S;
+	};
+	std::string Before = Print();
+	VMPassConfig Config;
+	obf::Rng R(42);
+	{
+		VMImpl Impl(*M->getFunction("target"), Config, R, 42);
+		EXPECT_FALSE(Impl.run());
+		EXPECT_FALSE(Impl.FailReason.empty());
+		EXPECT_EQ(Print(), Before);
+	}
+	EXPECT_EQ(Print(), Before);
+}
+#endif

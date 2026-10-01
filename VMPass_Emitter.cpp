@@ -7,6 +7,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/ScopeExit.h"
 
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -42,6 +43,15 @@ STATISTIC(VMVirtRegs, "Virtual register slots allocated (v7)");
 
 uint32_t BytecodeEmitter::isize(Instruction* I) {
 	if (isa<AllocaInst>(I) || isa<UnreachableInst>(I)) return 0;
+	if (isa<FreezeInst>(I)) {
+		Type *Ty = I->getType();
+		if (Ty->isIntegerTy(1) || Ty->isIntegerTy(8) || Ty->isIntegerTy(16) ||
+			Ty->isIntegerTy(32) || Ty->isIntegerTy(64) || Ty->isFloatTy() ||
+			Ty->isDoubleTy() || Ty->isPointerTy())
+			return 0;
+		markUnsupported(I);
+		return 0;
+	}
 	unsigned Op = I->getOpcode(); Type* Ty = I->getType();
 	// i32/i64 binops (separate opcodes for i32 vs i64)
 	if (Op == Instruction::Add || Op == Instruction::Sub || Op == Instruction::Mul ||
@@ -426,6 +436,8 @@ void BytecodeEmitter::scanSuperOps(Function& F) {
 void BytecodeEmitter::emit(Instruction* I) {
 	if (isa<AllocaInst>(I) || isa<UnreachableInst>(I))
 		return;
+	if (isa<FreezeInst>(I))
+		return;
 
 	// superOps: this mul's result is computed inline by its fused add's
 	// OP_MULADD (below) instead of its own OP_BINOP.
@@ -505,6 +517,8 @@ void BytecodeEmitter::emit(Instruction* I) {
 			}
 		}
 
+		Requirements.requireBinSubop(Is64 ? OP_BINOP64 : OP_BINOP,
+			(uint8_t)Sub);
 		bop(Is64 ? OP_BINOP64 : OP_BINOP);
 		b8(xorSalt(Is64 ? newVR64(I) : newVR(I)));
 		b8(xorSalt(Is64 ? vr64(I->getOperand(0)) : vr(I->getOperand(0))));
@@ -541,6 +555,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		// randISA permutes the op part only; the flag bit is OR'd back after.
 		uint8_t FSubByte = encFBinSubop((uint8_t)FSub);
 		if (Ty->isFloatTy()) FSubByte |= (uint8_t)FBS_F32_FLAG;
+		Requirements.requireFBinSubop((uint8_t)FSub, Ty->isFloatTy());
 		bop(OP_BINOP_F);
 		b8(xorSalt(newFR(I))); b8(xorSalt(fr(I->getOperand(0)))); b8(xorSalt(fr(I->getOperand(1)))); b8(FSubByte); return;
 	}
@@ -552,6 +567,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		auto* FCI = cast<FCmpInst>(I);
 		Type* T0 = FCI->getOperand(0)->getType();
 		if (!(T0->isFloatTy() || T0->isDoubleTy())) { markUnsupported(I); return; }
+		Requirements.requireFcmpPredicate((uint8_t)FCI->getPredicate());
 		bop(OP_FCMP);
 		b8(xorSalt(newVR(I))); b8(xorSalt(fr(FCI->getOperand(0)))); b8(xorSalt(fr(FCI->getOperand(1)))); b8(encFcmpPred((uint8_t)FCI->getPredicate())); return;
 	}
@@ -561,39 +577,41 @@ void BytecodeEmitter::emit(Instruction* I) {
 	if (Op == Instruction::FPExt) {
 		Type* ST = I->getOperand(0)->getType();
 		if (!((ST->isFloatTy() || ST->isDoubleTy()) && (Ty->isFloatTy() || Ty->isDoubleTy()))) { markUnsupported(I); return; }
+		Requirements.requireFCastKind(OP_FCAST_FF, FK_FPEXT, false);
 		bop(OP_FCAST_FF); b8(xorSalt(newFR(I))); b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPEXT); return;
 	}
 	if (Op == Instruction::FPTrunc) {
 		Type* ST = I->getOperand(0)->getType();
 		if (!((ST->isFloatTy() || ST->isDoubleTy()) && (Ty->isFloatTy() || Ty->isDoubleTy()))) { markUnsupported(I); return; }
+		Requirements.requireFCastKind(OP_FCAST_FF, FK_FPTRUNC, false);
 		bop(OP_FCAST_FF); b8(xorSalt(newFR(I))); b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTRUNC); return;
 	}
 	if (Op == Instruction::FPToSI) {
 		Type* ST = I->getOperand(0)->getType();
 		if (!(ST->isFloatTy() || ST->isDoubleTy())) { markUnsupported(I); return; }
-		if (Ty->isIntegerTy(32)) { bop(OP_FCAST_FV);   b8(xorSalt(newVR(I)));   b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOSI);   return; }
-		if (Ty->isIntegerTy(64)) { bop(OP_FCAST_FV64); b8(xorSalt(newVR64(I))); b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOSI64); return; }
+		if (Ty->isIntegerTy(32)) { Requirements.requireFCastKind(OP_FCAST_FV, FK_FPTOSI, false); bop(OP_FCAST_FV);   b8(xorSalt(newVR(I)));   b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOSI);   return; }
+		if (Ty->isIntegerTy(64)) { Requirements.requireFCastKind(OP_FCAST_FV64, FK_FPTOSI64, false); bop(OP_FCAST_FV64); b8(xorSalt(newVR64(I))); b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOSI64); return; }
 		markUnsupported(I); return;
 	}
 	if (Op == Instruction::FPToUI) {
 		Type* ST = I->getOperand(0)->getType();
 		if (!(ST->isFloatTy() || ST->isDoubleTy())) { markUnsupported(I); return; }
-		if (Ty->isIntegerTy(32)) { bop(OP_FCAST_FV);   b8(xorSalt(newVR(I)));   b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOUI);   return; }
-		if (Ty->isIntegerTy(64)) { bop(OP_FCAST_FV64); b8(xorSalt(newVR64(I))); b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOUI64); return; }
+		if (Ty->isIntegerTy(32)) { Requirements.requireFCastKind(OP_FCAST_FV, FK_FPTOUI, false); bop(OP_FCAST_FV);   b8(xorSalt(newVR(I)));   b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOUI);   return; }
+		if (Ty->isIntegerTy(64)) { Requirements.requireFCastKind(OP_FCAST_FV64, FK_FPTOUI64, false); bop(OP_FCAST_FV64); b8(xorSalt(newVR64(I))); b8(xorSalt(fr(I->getOperand(0)))); b8(FK_FPTOUI64); return; }
 		markUnsupported(I); return;
 	}
 	if (Op == Instruction::SIToFP) {
 		if (!(Ty->isFloatTy() || Ty->isDoubleTy())) { markUnsupported(I); return; }
 		Type* ST = I->getOperand(0)->getType();
-		if (ST->isIntegerTy(32)) { uint8_t K = FK_SITOFP;   if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_VF);   b8(xorSalt(newFR(I))); b8(xorSalt(vr(I->getOperand(0))));   b8(K); return; }
-		if (ST->isIntegerTy(64)) { uint8_t K = FK_SI64TOFP; if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_V64F); b8(xorSalt(newFR(I))); b8(xorSalt(vr64(I->getOperand(0)))); b8(K); return; }
+		if (ST->isIntegerTy(32)) { uint8_t K = FK_SITOFP; Requirements.requireFCastKind(OP_FCAST_VF, K, Ty->isFloatTy()); if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_VF); b8(xorSalt(newFR(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(K); return; }
+		if (ST->isIntegerTy(64)) { uint8_t K = FK_SI64TOFP; Requirements.requireFCastKind(OP_FCAST_V64F, K, Ty->isFloatTy()); if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_V64F); b8(xorSalt(newFR(I))); b8(xorSalt(vr64(I->getOperand(0)))); b8(K); return; }
 		markUnsupported(I); return;
 	}
 	if (Op == Instruction::UIToFP) {
 		if (!(Ty->isFloatTy() || Ty->isDoubleTy())) { markUnsupported(I); return; }
 		Type* ST = I->getOperand(0)->getType();
-		if (ST->isIntegerTy(32)) { uint8_t K = FK_UITOFP;   if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_VF);   b8(xorSalt(newFR(I))); b8(xorSalt(vr(I->getOperand(0))));   b8(K); return; }
-		if (ST->isIntegerTy(64)) { uint8_t K = FK_UI64TOFP; if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_V64F); b8(xorSalt(newFR(I))); b8(xorSalt(vr64(I->getOperand(0)))); b8(K); return; }
+		if (ST->isIntegerTy(32)) { uint8_t K = FK_UITOFP; Requirements.requireFCastKind(OP_FCAST_VF, K, Ty->isFloatTy()); if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_VF); b8(xorSalt(newFR(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(K); return; }
+		if (ST->isIntegerTy(64)) { uint8_t K = FK_UI64TOFP; Requirements.requireFCastKind(OP_FCAST_V64F, K, Ty->isFloatTy()); if (Ty->isFloatTy()) K |= FCAST_F32_FLAG; bop(OP_FCAST_V64F); b8(xorSalt(newFR(I))); b8(xorSalt(vr64(I->getOperand(0)))); b8(K); return; }
 		markUnsupported(I); return;
 	}
 
@@ -607,6 +625,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 			auto* Cmp = cast<ICmpInst>(I);
 			Instruction* And = AIt->second;
 			CmpInst::Predicate P = Cmp->getPredicate();  // ICMP_EQ or ICMP_NE (scan-guaranteed)
+			Requirements.requireIcmpPredicate(OP_ANDCMPZ, (uint8_t)P);
 			bop(OP_ANDCMPZ);
 			b8(xorSalt(newVR(I)));                 // dst = this compare's own i32 result
 			b8(xorSalt(vr(And->getOperand(0))));   // a
@@ -622,6 +641,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		Type* T1 = CI->getOperand(1)->getType();
 
 		if (T0->isIntegerTy(32) && T1->isIntegerTy(32)) {
+			Requirements.requireIcmpPredicate(OP_ICMP, (uint8_t)CI->getPredicate());
 			bop(OP_ICMP);
 			b8(xorSalt(newVR(I)));
 			b8(xorSalt(vr(CI->getOperand(0))));
@@ -630,6 +650,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 			return;
 		}
 		if (T0->isIntegerTy(64) && T1->isIntegerTy(64)) {
+			Requirements.requireIcmpPredicate(OP_ICMP64, (uint8_t)CI->getPredicate());
 			bop(OP_ICMP64);
 			b8(xorSalt(newVR(I)));
 			b8(xorSalt(vr64(CI->getOperand(0))));
@@ -649,6 +670,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		if (Ty->isIntegerTy(32)) {
 			if (W != 1 && W != 8 && W != 16) { markUnsupported(I); return; }
 			CastKind K = (W == 1) ? CK_ZEXT1 : (W == 8) ? CK_ZEXT8 : CK_ZEXT16;
+			Requirements.requireCastKind(OP_CAST, (uint8_t)K);
 			bop(OP_CAST); b8(xorSalt(newVR(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(encCastKind((uint8_t)K)); return;
 		}
 		if (Ty->isIntegerTy(64)) {
@@ -658,6 +680,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 				(W == 16) ? C64_ZEXT16 :
 				(W == 32) ? C64_ZEXT32 : (Cast64Kind)0xFF;
 			if ((uint8_t)K == 0xFF) { markUnsupported(I); return; }
+			Requirements.requireCastKind(OP_CAST64, (uint8_t)K);
 			bop(OP_CAST64); b8(xorSalt(newVR64(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(K); return;
 		}
 		markUnsupported(I); return;
@@ -667,6 +690,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		if (Ty->isIntegerTy(32)) {
 			if (W != 8 && W != 16) { markUnsupported(I); return; }
 			CastKind K = (W == 8) ? CK_SEXT8 : CK_SEXT16;
+			Requirements.requireCastKind(OP_CAST, (uint8_t)K);
 			bop(OP_CAST); b8(xorSalt(newVR(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(encCastKind((uint8_t)K)); return;
 		}
 		if (Ty->isIntegerTy(64)) {
@@ -675,6 +699,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 				(W == 16) ? C64_SEXT16 :
 				(W == 32) ? C64_SEXT32 : (Cast64Kind)0xFF;
 			if ((uint8_t)K == 0xFF) { markUnsupported(I); return; }
+			Requirements.requireCastKind(OP_CAST64, (uint8_t)K);
 			bop(OP_CAST64); b8(xorSalt(newVR64(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(K); return;
 		}
 		markUnsupported(I); return;
@@ -685,6 +710,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		if (STy->isIntegerTy(32)) {
 			if (W != 1 && W != 8 && W != 16) { markUnsupported(I); return; }
 			CastKind K = (W == 1) ? CK_TRUNC1 : (W == 8) ? CK_TRUNC8 : CK_TRUNC16;
+			Requirements.requireCastKind(OP_CAST, (uint8_t)K);
 			bop(OP_CAST); b8(xorSalt(newVR(I))); b8(xorSalt(vr(I->getOperand(0)))); b8(encCastKind((uint8_t)K)); return;
 		}
 		if (STy->isIntegerTy(64)) {
@@ -694,6 +720,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 				(W == 16) ? C64_TRUNC16 :
 				(W == 32) ? C64_TRUNC32 : (Cast64Kind)0xFF;
 			if ((uint8_t)K == 0xFF) { markUnsupported(I); return; }
+			Requirements.requireCastKind(OP_CAST64, (uint8_t)K);
 			bop(OP_CAST64); b8(xorSalt(newVR(I))); b8(xorSalt(vr64(I->getOperand(0)))); b8(K); return;
 		}
 		markUnsupported(I); return;
@@ -708,6 +735,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		if (CIt != FusedSelToCmp.end()) {
 			auto* SI = cast<SelectInst>(I);
 			auto* Cmp = cast<ICmpInst>(CIt->second);
+			Requirements.requireIcmpPredicate(OP_CMPSEL, (uint8_t)Cmp->getPredicate());
 			bop(OP_CMPSEL);
 			b8(xorSalt(newVR(I)));                          // dst = select result
 			b8(xorSalt(vr(Cmp->getOperand(0))));           // a
@@ -736,6 +764,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 			}
 
 			bop(OP_SELECT);
+			Requirements.requireSelectKind(0);
 			b8(0); // kind 0 = int (vreg file)
 			b8(xorSalt(newVR(I)));
 			b8(xorSalt(vr(SI->getCondition())));
@@ -751,6 +780,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 			}
 
 			bop(OP_SELECT);
+			Requirements.requireSelectKind(1);
 			b8(1); // kind 1 = ptr (preg file)
 			b8(xorSalt(newPR(I)));
 			b8(xorSalt(vr(SI->getCondition())));
@@ -765,6 +795,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 				markUnsupported(I); return;
 			}
 			bop(OP_SELECT);
+			Requirements.requireSelectKind(2);
 			b8(2); // kind 2 = i64 (vreg64 file)
 			b8(xorSalt(newVR64(I)));
 			b8(xorSalt(vr(SI->getCondition())));
@@ -912,8 +943,9 @@ void BytecodeEmitter::emit(Instruction* I) {
 			if (CI->arg_size() == 2 &&
 				(FName == "fmodf" || FName == "fmod") &&
 				(RT->isFloatTy() || RT->isDoubleTy())) {
-				uint8_t FSubByte = (uint8_t)FBS_FREM;
+				uint8_t FSubByte = encFBinSubop(FBS_FREM);
 				if (RT->isFloatTy()) FSubByte |= (uint8_t)FBS_F32_FLAG;
+				Requirements.requireFBinSubop(FBS_FREM, RT->isFloatTy());
 				bop(OP_BINOP_F);
 				b8(xorSalt(newFR(CI)));
 				b8(xorSalt(fr(CI->getArgOperand(0))));
@@ -972,6 +1004,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		}
 		else { markUnsupported(I); return; }
 		// Common header: fn, nargs  (flags/argtypes removed -- now in GVFTyIndices)
+		Requirements.requireCallType(ConcreteFTy);
 		b8(FI); b8(NA);
 
 		// Per-arg register indices
@@ -1051,6 +1084,12 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 
 	// Reset per-run state
 	BC.clear();
+	Requirements = VMRequirementSet();
+	if (RequirementSink) *RequirementSink = VMRequirementSet();
+	bool Emitted = false;
+	auto RollbackRequirements = make_scope_exit([&] {
+		if (!Emitted) Requirements = VMRequirementSet();
+	});
 	BlockIP.clear();
 	VR.clear();
 	VR64.clear();
@@ -1064,6 +1103,7 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	FR.clear();
 	ImmLoadsF.clear();
 	Fixups.clear();
+	KeyedOpIPs.clear();
 	NVR = NVR64 = NPR = NFR = 0;
 	FusedAddToMul.clear();
 	SkippedMuls.clear();
@@ -1149,6 +1189,21 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	for (BasicBlock& BB : F) {
 		for (Instruction& I : BB) {
 			if (isa<AllocaInst>(&I) || isa<UnreachableInst>(&I)) continue;
+			if (auto *Freeze = dyn_cast<FreezeInst>(&I)) {
+				Value *Operand = Freeze->getOperand(0);
+				Type *Ty = I.getType();
+				if (Ty->isIntegerTy(64))
+					VR64[&I] = vr64(Operand);
+				else if (Ty->isIntegerTy())
+					VR[&I] = vr(Operand);
+				else if (Ty->isFloatTy() || Ty->isDoubleTy())
+					FR[&I] = fr(Operand);
+				else if (Ty->isPointerTy())
+					PR[&I] = pr(Operand);
+				else
+					markUnsupported(&I);
+				continue;
+			}
 
 			// superOps: a fused-away mul's own SSA value never gets a slot --
 			// its result is computed inline by its fused add's OP_MULADD. The
@@ -1291,5 +1346,17 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	}
 	VMBytecodeBytes += BC.size(); VMVirtRegs += NVR; VMVirtRegs += NVR64; VMVirtRegs += NPR; VMVirtRegs += NFR;
 
+	Requirements.NeedsRegFile[0] = NVR != 0;
+	Requirements.NeedsRegFile[1] = NVR64 != 0;
+	Requirements.NeedsRegFile[2] = NFR != 0;
+	Requirements.NeedsRegFile[3] = NPR != 0;
+	Requirements.NeedsSuperOps = Requirements.contains(OP_MULADD) ||
+		Requirements.contains(OP_SHLADD) || Requirements.contains(OP_CMPSEL) ||
+		Requirements.contains(OP_ANDCMPZ);
+	Requirements.NeedsConstStream = ConstInStream &&
+		(Requirements.contains(OP_LOADI) || Requirements.contains(OP_LOADI64) ||
+		 Requirements.contains(OP_LOADI_F));
+	if (RequirementSink) *RequirementSink = Requirements;
+	Emitted = true;
 	return true;
 }

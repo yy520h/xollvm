@@ -12,7 +12,7 @@ namespace llvm::obf {
 		static constexpr llvm::StringRef Ids[] = {
 			"flattening", "bcf", "split", "substitution", "mba", "vcall",
 			"strenc", "aes_stub", "sdiff", "adec", "shield", "vm", "constenc",
-			"fmerge"
+			"fmerge", "antidebug", "zoneauth"
 		};
 		return Ids;
 	}
@@ -47,6 +47,10 @@ namespace llvm::obf {
 			return "constenc";
 		if (S == "fmerge" || S == "funcmerge" || S == "merge")
 			return "fmerge";
+		if (S == "antidebug" || S == "anti-debug")
+			return "antidebug";
+		if (S == "zoneauth" || S == "zone-auth")
+			return "zoneauth";
 		// Unknown stays unknown (validator will reject)
 		return S;
 	}

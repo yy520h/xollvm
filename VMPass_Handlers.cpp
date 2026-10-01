@@ -65,8 +65,11 @@ void VMImpl::buildOpcodeHandlers() {
 }
 
 void VMImpl::buildHandlersIntArith() {
+	if (!needsOpcode(OP_LOADI) && !needsOpcode(OP_LOADI64) && !needsOpcode(OP_MOVR) &&
+		!needsOpcode(OP_BINOP) && !needsOpcode(OP_BINOP64) && !needsOpcode(OP_MULADD) &&
+		!needsOpcode(OP_SHLADD) && !needsOpcode(OP_CMPSEL) && !needsOpcode(OP_ANDCMPZ)) return;
 	//  OP_LOADI  [dst:u8 imm:u32le] -- vreg[dst] = imm 
-	{
+	if (needsOpcode(OP_BINOP)) {
 		auto B = mkOpc(OP_LOADI, "loadi");
 		Value* IP = advIP(B, 5);
 		stVR(B, rdVR(B, IP, 0, "vm.li.d"), rdU32(B, IP, 1, "vm.li.i"));
@@ -74,7 +77,7 @@ void VMImpl::buildHandlersIntArith() {
 	}
 
 	//  OP_LOADI64  [dst64:u8 imm:i64le] -- vreg64[dst] = imm
-	{
+	if (needsOpcode(OP_BINOP64)) {
 		auto B = mkOpc(OP_LOADI64, "loadi64");
 		Value* IP = advIP(B, 9);
 		Value* Dst = rdVR64(B, IP, 0, "vm.li64.d");
@@ -117,25 +120,22 @@ void VMImpl::buildHandlersIntArith() {
 			nextInsn(B);
 		} else {
 			BasicBlock* MergeBB = BasicBlock::Create(Ctx, "vm.bo.merge", HFn);
-			BasicBlock* DefBB = BasicBlock::Create(Ctx, "vm.bo.def", HFn);
+			BasicBlock* DefBB = BasicBlock::Create(Ctx, "vm.bo.invalid", HFn);
+			IRBuilder<>(DefBB).CreateUnreachable();
 
 
-			// Default implements BS_ADD (matches previous select-chain fallback)
-			SwitchInst* SW = B.CreateSwitch(Sub, DefBB, 12);
+			unsigned CaseCount = 0;
+			for (unsigned S = 0; S < ISAEnc::kNumBinSubop; ++S)
+				CaseCount += needsBinSubop(OP_BINOP, S);
+			SwitchInst* SW = B.CreateSwitch(Sub, DefBB, CaseCount);
 
 			IRBuilder<> BM(MergeBB);
 			auto* Phi = BM.CreatePHI(I32Ty, 13, "vm.bo.r");
 			stVR(BM, Dst, Phi);
 			nextInsn(BM);
 
-			{
-				IRBuilder<> BD(DefBB);
-				Value* R = BD.CreateAdd(AV, BV, "vm.add");
-				Phi->addIncoming(R, DefBB);
-				BD.CreateBr(MergeBB);
-			}
-
 			auto addCase = [&](uint32_t Case, const Twine& BBName, auto Emit) {
+				if (!needsBinSubop(OP_BINOP, Case)) return;
 				BasicBlock* CBB = BasicBlock::Create(Ctx, BBName, HFn);
 				IRBuilder<> BC(CBB);
 				Value* R = Emit(BC);
@@ -144,6 +144,7 @@ void VMImpl::buildHandlersIntArith() {
 				SW->addCase(B.getInt32(IsaEnc.encBinSubop((uint8_t)Case)), CBB);
 				};
 
+			addCase(BS_ADD, "vm.bo.add", [&](IRBuilder<>& BC) { return BC.CreateAdd(AV, BV, "vm.add"); });
 			addCase(BS_SUB, "vm.bo.sub", [&](IRBuilder<>& BC) { return BC.CreateSub(AV, BV, "vm.sub"); });
 			addCase(BS_MUL, "vm.bo.mul", [&](IRBuilder<>& BC) { return BC.CreateMul(AV, BV, "vm.mul"); });
 			addCase(BS_AND, "vm.bo.and", [&](IRBuilder<>& BC) { return BC.CreateAnd(AV, BV, "vm.and"); });
@@ -264,24 +265,21 @@ void VMImpl::buildHandlersIntArith() {
 			nextInsn(B);
 		} else {
 			BasicBlock* MergeBB = BasicBlock::Create(Ctx, "vm.bo64.merge", HFn);
-			BasicBlock* DefBB = BasicBlock::Create(Ctx, "vm.bo64.def", HFn);
+			BasicBlock* DefBB = BasicBlock::Create(Ctx, "vm.bo64.invalid", HFn);
+			IRBuilder<>(DefBB).CreateUnreachable();
 
-			// Default implements BS_ADD (matches previous select-chain fallback)
-			SwitchInst* SW = B.CreateSwitch(Sub, DefBB, 12);
+			unsigned CaseCount = 0;
+			for (unsigned S = 0; S < ISAEnc::kNumBinSubop; ++S)
+				CaseCount += needsBinSubop(OP_BINOP64, S);
+			SwitchInst* SW = B.CreateSwitch(Sub, DefBB, CaseCount);
 
 			IRBuilder<> BM(MergeBB);
 			auto* Phi = BM.CreatePHI(I64Ty, 13, "vm.bo64.r");
 			stVR64(BM, Dst, Phi);
 			nextInsn(BM);
 
-			{
-				IRBuilder<> BD(DefBB);
-				Value* R = BD.CreateAdd(AV, BV, "vm64.add");
-				Phi->addIncoming(R, DefBB);
-				BD.CreateBr(MergeBB);
-			}
-
 			auto addCase = [&](uint32_t Case, const Twine& BBName, auto Emit) {
+				if (!needsBinSubop(OP_BINOP64, Case)) return;
 				BasicBlock* CBB = BasicBlock::Create(Ctx, BBName, HFn);
 				IRBuilder<> BC(CBB);
 				Value* R = Emit(BC);
@@ -290,6 +288,7 @@ void VMImpl::buildHandlersIntArith() {
 				SW->addCase(B.getInt32(IsaEnc.encBinSubop((uint8_t)Case)), CBB);
 				};
 
+			addCase(BS_ADD, "vm.bo64.add", [&](IRBuilder<>& BC) { return BC.CreateAdd(AV, BV, "vm64.add"); });
 			addCase(BS_SUB, "vm.bo64.sub", [&](IRBuilder<>& BC) { return BC.CreateSub(AV, BV, "vm64.sub"); });
 			addCase(BS_MUL, "vm.bo64.mul", [&](IRBuilder<>& BC) { return BC.CreateMul(AV, BV, "vm64.mul"); });
 			addCase(BS_AND, "vm.bo64.and", [&](IRBuilder<>& BC) { return BC.CreateAnd(AV, BV, "vm64.and"); });
@@ -330,8 +329,10 @@ void VMImpl::buildHandlersIntArith() {
 			P Ps[] = { P::ICMP_EQ,P::ICMP_NE,P::ICMP_UGT,P::ICMP_UGE,P::ICMP_ULT,
 					P::ICMP_ULE,P::ICMP_SGT,P::ICMP_SGE,P::ICMP_SLT,P::ICMP_SLE };
 			Value* R = B.getInt1(false);
-			for (unsigned i = 0; i < 10; i++)
+			for (unsigned i = 0; i < 10; i++) {
+				if (!needsIcmpPredicate(OP_ICMP, (uint8_t)Ps[i])) continue;
 				R = B.CreateSelect(B.CreateICmpEQ(Pred, B.getInt32(IsaEnc.encIcmpPred((uint8_t)Ps[i]))), Cs[i], R);
+			}
 			stVR(B, Dst, B.CreateZExt(R, I32Ty, "vm.ic.r")); nextInsn(B);
 		}
 	}
@@ -370,8 +371,10 @@ void VMImpl::buildHandlersIntArith() {
 					   P::ICMP_ULE,P::ICMP_SGT,P::ICMP_SGE,P::ICMP_SLT,P::ICMP_SLE };
 
 			Value* R = B.getInt1(false);
-			for (unsigned i = 0; i < 10; i++)
+			for (unsigned i = 0; i < 10; i++) {
+				if (!needsIcmpPredicate(OP_ICMP64, (uint8_t)Ps[i])) continue;
 				R = B.CreateSelect(B.CreateICmpEQ(Pred, B.getInt32(IsaEnc.encIcmpPred((uint8_t)Ps[i]))), Cs[i], R);
+			}
 
 			stVR(B, Dst, B.CreateZExt(R, I32Ty, "vm.ic64.r"));
 			nextInsn(B);
@@ -398,14 +401,18 @@ void VMImpl::buildHandlersIntArith() {
 				return B.CreateAShr(B.CreateShl(SV, B.getInt32(32 - W), "vm.ssl"), B.getInt32(32 - W), "vm.ssr"); };
 			Value* Cvs[] = { ze(1),ze(0xFF),ze(0xFFFF),se(8),se(16),ze(1),ze(0xFF),ze(0xFFFF) };
 			Value* R = SV;
-			for (unsigned i = 0; i < 8; i++)
+			for (unsigned i = 0; i < 8; i++) {
+				if (!needsCastKind(OP_CAST, (uint8_t)i)) continue;
 				R = B.CreateSelect(B.CreateICmpEQ(Kind, B.getInt32(IsaEnc.encCastKind((uint8_t)i))), Cvs[i], R, "vm.ca.r");
+			}
 			stVR(B, Dst, R); nextInsn(B);
 		}
 	}
 }
 
 void VMImpl::buildHandlersConv() {
+	if (!needsOpcode(OP_SELECT) && !needsOpcode(OP_PTRTOINT) && !needsOpcode(OP_INTTOPTR) &&
+		!needsOpcode(OP_CAST) && !needsOpcode(OP_CAST64) && !needsOpcode(OP_PTRTOINT64)) return;
 	//  OP_SELECT -- [kind:u8 dst:u8 cond:u8 t:u8 f:u8] 
 	// kind 0: integer vregs (dst/t/f are VR) ; kind 1: pointer pregs (dst/t/f are PR) ; kind 2: i64 vregs (dst/t/f are VR64)
 	{
@@ -414,17 +421,28 @@ void VMImpl::buildHandlersConv() {
 		Value* Kind = rdByte(B, IP, 0, "vm.sl.k");
 		Value* IsPtr = B.CreateICmpEQ(Kind, B.getInt32(1), "vm.sl.isp");
 		Value* IsI64 = B.CreateICmpEQ(Kind, B.getInt32(2), "vm.sl.is64");
+		bool NeedInt = needsSelectKind(0);
+		bool NeedPtr = needsSelectKind(1);
+		bool NeedI64 = needsSelectKind(2);
 
 		BasicBlock* IntBB = BasicBlock::Create(Ctx, "vm.sl.int", HFn);
 		BasicBlock* PtrBB = BasicBlock::Create(Ctx, "vm.sl.ptr", HFn);
 		BasicBlock* I64BB = BasicBlock::Create(Ctx, "vm.sl.i64", HFn);
 		BasicBlock* K0BB = BasicBlock::Create(Ctx, "vm.sl.k0", HFn);
-		B.CreateCondBr(IsPtr, PtrBB, K0BB);
+		if (!NeedPtr) {
+			B.CreateBr(K0BB);
+		} else if (!NeedInt && !NeedI64) {
+			B.CreateBr(PtrBB);
+		} else {
+			B.CreateCondBr(IsPtr, PtrBB, K0BB);
+		}
 
 		// decode kind 0 vs kind 2
 		{
 			IRBuilder<> BK(K0BB);
-			BK.CreateCondBr(IsI64, I64BB, IntBB);
+			if (!NeedI64) BK.CreateBr(IntBB);
+			else if (!NeedInt) BK.CreateBr(I64BB);
+			else BK.CreateCondBr(IsI64, I64BB, IntBB);
 		}
 
 		//  ptr path 
@@ -565,6 +583,10 @@ void VMImpl::buildHandlersConv() {
 }
 
 void VMImpl::buildHandlersMem() {
+	if (!needsOpcode(OP_LOAD32) && !needsOpcode(OP_STORE32) && !needsOpcode(OP_LOAD64) &&
+		!needsOpcode(OP_STORE64) && !needsOpcode(OP_LOAD8) && !needsOpcode(OP_STORE8) &&
+		!needsOpcode(OP_LOAD16) && !needsOpcode(OP_STORE16) && !needsOpcode(OP_LOADPTR) &&
+		!needsOpcode(OP_STOREPTR) && !needsOpcode(OP_GEP) && !needsOpcode(OP_GEP64)) return;
 	//  OP_LOAD32 -- [dst:u8 ptrreg:u8] 
 	{
 		auto B = mkOpc(OP_LOAD32, "load32");
@@ -691,6 +713,8 @@ void VMImpl::buildHandlersMem() {
 }
 
 void VMImpl::buildHandlersControl() {
+	if (!needsOpcode(OP_JMP) && !needsOpcode(OP_JMPC) && !needsOpcode(OP_SWITCH) &&
+		!needsOpcode(OP_RET_VOID) && !needsOpcode(OP_RET_INT) && !needsOpcode(OP_RET_PTR)) return;
 	//  OP_JMP -- [target:u32le] 
 	{
 		auto B = mkOpc(OP_JMP, "jmp");
@@ -852,6 +876,10 @@ void VMImpl::buildHandlersControl() {
 }
 
 void VMImpl::buildHandlersFloat() {
+	if (!needsOpcode(OP_LOADI_F) && !needsOpcode(OP_MOVR_F) && !needsOpcode(OP_BINOP_F) &&
+		!needsOpcode(OP_FCMP) && !needsOpcode(OP_FCAST_FF) && !needsOpcode(OP_LOAD_F) &&
+		!needsOpcode(OP_STORE_F) && !needsOpcode(OP_RET_F) && !needsOpcode(OP_SELECT_F) &&
+		!needsOpcode(OP_FNEG) && !needsOpcode(OP_LOAD_F32) && !needsOpcode(OP_STORE_F32)) return;
 	// OP_LOADI_F -- [dst_fr:u8 imm:f64le]    freg[dst] = imm 
 	{
 		auto B = mkOpc(OP_LOADI_F, "loadi_f");
@@ -901,7 +929,6 @@ void VMImpl::buildHandlersFloat() {
 			stFR(B, Dst, Rv);
 			nextInsn(B);
 		} else {
-		Value* Sub = B.CreateAnd(Sub8, B.getInt32(0x7F), "vm.bof.sub"); // op only
 		Value* IsF32 = B.CreateICmpNE(
 			B.CreateAnd(Sub8, B.getInt32(0x80)), B.getInt32(0), "vm.bof.f32");
 
@@ -912,8 +939,12 @@ void VMImpl::buildHandlersFloat() {
 		B.CreateStore(IsF32, IsF32Slot);
 
 		BasicBlock* FMergeBB = BasicBlock::Create(Ctx, "vm.bof.merge", HFn);
-		BasicBlock* FDefBB = BasicBlock::Create(Ctx, "vm.bof.def", HFn);
-		SwitchInst* FSW = B.CreateSwitch(Sub, FDefBB, 5);
+		BasicBlock* FDefBB = BasicBlock::Create(Ctx, "vm.bof.invalid", HFn);
+		IRBuilder<>(FDefBB).CreateUnreachable();
+		unsigned FCaseCount = 0;
+		for (unsigned S = 0; S < ISAEnc::kNumFBinSubop; ++S)
+			FCaseCount += needsFBinSubop(S, false) + needsFBinSubop(S, true);
+		SwitchInst* FSW = B.CreateSwitch(Sub8, FDefBB, FCaseCount);
 
 		IRBuilder<> FBM(FMergeBB);
 		auto* FPhi = FBM.CreatePHI(DoubleTy, 6, "vm.bof.r");
@@ -926,21 +957,24 @@ void VMImpl::buildHandlersFloat() {
 		stFR(FBM, Dst, Final);
 		nextInsn(FBM);
 
-		{
-			IRBuilder<> BD(FDefBB); Value* R = BD.CreateFAdd(AV, BV, "vm.fadd");
-			FPhi->addIncoming(R, FDefBB); BD.CreateBr(FMergeBB);
-		}
-
-		auto addFCase = [&](uint32_t C, const Twine& N, auto Emit) {
+			auto addFCase = [&](uint32_t C, const Twine& N, auto Emit, bool IsF32) {
+			if (!needsFBinSubop(C, IsF32)) return;
 			BasicBlock* CB = BasicBlock::Create(Ctx, N, HFn);
 			IRBuilder<> BC(CB); Value* R = Emit(BC);
 			FPhi->addIncoming(R, CB); BC.CreateBr(FMergeBB);
-			FSW->addCase(B.getInt32(IsaEnc.encFBinSubop((uint8_t)C)), CB); };
+			uint32_t Enc = IsaEnc.encFBinSubop((uint8_t)C) | (IsF32 ? 0x80u : 0u);
+			FSW->addCase(B.getInt32(Enc), CB); };
 
-		addFCase(FBS_FSUB, "vm.bof.sub", [&](IRBuilder<>& BC) { return BC.CreateFSub(AV, BV, "vm.fsub"); });
-		addFCase(FBS_FMUL, "vm.bof.mul", [&](IRBuilder<>& BC) { return BC.CreateFMul(AV, BV, "vm.fmul"); });
-		addFCase(FBS_FDIV, "vm.bof.div", [&](IRBuilder<>& BC) { return BC.CreateFDiv(AV, BV, "vm.fdiv"); });
-		addFCase(FBS_FREM, "vm.bof.rem", [&](IRBuilder<>& BC) { return BC.CreateFRem(AV, BV, "vm.frem"); });
+		addFCase(FBS_FADD, "vm.bof.add", [&](IRBuilder<>& BC) { return BC.CreateFAdd(AV, BV, "vm.fadd"); }, false);
+		addFCase(FBS_FADD, "vm.bof.add32", [&](IRBuilder<>& BC) { return BC.CreateFAdd(AV, BV, "vm.fadd32"); }, true);
+		addFCase(FBS_FSUB, "vm.bof.sub", [&](IRBuilder<>& BC) { return BC.CreateFSub(AV, BV, "vm.fsub"); }, false);
+		addFCase(FBS_FSUB, "vm.bof.sub32", [&](IRBuilder<>& BC) { return BC.CreateFSub(AV, BV, "vm.fsub32"); }, true);
+		addFCase(FBS_FMUL, "vm.bof.mul", [&](IRBuilder<>& BC) { return BC.CreateFMul(AV, BV, "vm.fmul"); }, false);
+		addFCase(FBS_FMUL, "vm.bof.mul32", [&](IRBuilder<>& BC) { return BC.CreateFMul(AV, BV, "vm.fmul32"); }, true);
+		addFCase(FBS_FDIV, "vm.bof.div", [&](IRBuilder<>& BC) { return BC.CreateFDiv(AV, BV, "vm.fdiv"); }, false);
+		addFCase(FBS_FDIV, "vm.bof.div32", [&](IRBuilder<>& BC) { return BC.CreateFDiv(AV, BV, "vm.fdiv32"); }, true);
+		addFCase(FBS_FREM, "vm.bof.rem", [&](IRBuilder<>& BC) { return BC.CreateFRem(AV, BV, "vm.frem"); }, false);
+		addFCase(FBS_FREM, "vm.bof.rem32", [&](IRBuilder<>& BC) { return BC.CreateFRem(AV, BV, "vm.frem32"); }, true);
 		}
 	}
 
@@ -988,6 +1022,7 @@ void VMImpl::buildHandlersFloat() {
 			}
 
 			auto addCase = [&](FP pred, const Twine& BBName, auto Emit) {
+				if (!needsFcmpPredicate((uint8_t)pred)) return;
 				BasicBlock* CBB = BasicBlock::Create(Ctx, BBName, HFn);
 				IRBuilder<> BC(CBB);
 				Value* R = BC.CreateZExt(Emit(BC), I32Ty, "vm.fcp.z");
@@ -1209,6 +1244,8 @@ void VMImpl::buildHandlersFloat() {
 }
 
 void VMImpl::buildHandlersCall() {
+	if (!needsOpcode(OP_CALL_VOID) && !needsOpcode(OP_CALL_INT) && !needsOpcode(OP_CALL_PTR) &&
+		!needsOpcode(OP_CALL_INT64) && !needsOpcode(OP_CALL_F)) return;
 	buildCall2(OP_CALL_VOID, "call_void", RK2_VOID);
 	buildCall2(OP_CALL_INT, "call_int", RK2_I32);
 	buildCall2(OP_CALL_PTR, "call_ptr", RK2_PTR);

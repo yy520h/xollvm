@@ -63,6 +63,7 @@ namespace llvm {
 namespace llvm {
 	struct VMCtx : public obf::FuncPassCtx {
 		VMPassConfig              Cfg;
+		AntiDebugConfig           AntiDebug;
 		const FunctionObfContext& FOC;
 		explicit VMCtx(Function& F, FunctionAnalysisManager& AM)
 			: obf::FuncPassCtx(F, AM, "vm"),
@@ -71,11 +72,19 @@ namespace llvm {
 		if (!PC.has_value()) { VMPassConfig C; C.enable = false; return C; }
 		VMPassConfig C = VMPassConfig::fromPassConfig(*PC);
 		if (!C.validate()) C.enable = false; return C; }()),
+			AntiDebug([&] {
+				const ObfuscationConfig& OC = getObfConfig(F, AM);
+				AntiDebugConfig A;
+				auto PC = OC.getPassConfig("antidebug");
+				if (PC.has_value()) A = AntiDebugConfig::fromPassConfig(*PC);
+				A.mergeCompatibility(Cfg);
+				return A;
+			}()),
 			FOC(*AM.getResult<FunctionObfContextAnalysis>(F)) {
 		}
 	};
 
-	static bool isVMEligible(Function& F, const FunctionObfContext& FOC,
+	[[maybe_unused]] static bool isVMEligible(Function& F, const FunctionObfContext& FOC,
 		const VMPassConfig& Cfg, raw_ostream* R = nullptr) {
 		if (FOC.HasEHPad || FOC.HasInvoke) { if (R)*R << "EH/invoke"; return false; }
 		if (FOC.HasCallBr) { if (R)*R << "callbr";  return false; }
@@ -252,6 +261,7 @@ namespace llvm {
 			bool        EncDispatch = false;   // engine-wide: dispatch uses encrypted index map
 			bool        LazyMode = false;      // engine-wide: fetch removes AES per-block instead of ctor whole-buffer
 			BasicBlock* Dispatch = nullptr;
+			BasicBlock* Invalid = nullptr;
 			BasicBlock* ExitBB = nullptr;
 			BasicBlock* Entry = nullptr;
 			AllocaInst* EngineVMIP = nullptr;
@@ -338,7 +348,8 @@ namespace llvm {
 		// functions authored by the pass itself, e.g. nested-VM helpers, which
 		// have no FunctionObfContext / annotation of their own).
 		VMPassConfig Cfg;
-		obf::Rng&    R;
+		AntiDebugConfig AntiDebug;
+		obf::Rng     R;
 
 		const bool     ObfRegIdx;
 		const bool     EncBytecode;
@@ -382,12 +393,20 @@ namespace llvm {
 		VMOpcodeMap OpMap;
 		ISAEnc      IsaEnc;   // identity unless RandISA; module-uniform subop-byte permutation
 
+		// 暂存模块拥有规范化副本，保证 emitter 的 Value 指针跨阶段有效。
+		std::unique_ptr<Module> PreparedModule;
+		Function *PreparedFunction = nullptr;
+		bool Prepared = false;
+		bool Committed = false;
 		BytecodeEmitter E;
+		VMRequirementSet HandlerRequirements;
+		bool HasHandlerRequirements = false;
 		std::string FailReason;
 
 		AllocaInst* VMIP = nullptr, * VMSalt = nullptr, * VMRegs = nullptr, * VMRegs64 = nullptr, * VMPRegs = nullptr;
 		AllocaInst* VMFregs = nullptr;  // vm.fregs — f64 register file 
 		BasicBlock* Entry = nullptr, * Dispatch = nullptr, * ExitBB = nullptr;
+		BasicBlock* InvalidBB = nullptr;
 
 		GlobalVariable* GVBytecode = nullptr, * GVBytecodeRT = nullptr, * GVHandlers = nullptr, * GVCallees = nullptr;
 		// parallel [C x i8] table -- callee slot -> index into UniqueFTys.
@@ -608,6 +627,11 @@ namespace llvm {
 		}
 
 		bool run();
+		bool prepare();
+		bool commit();
+		void remapPreparedExternalValues();
+		void setHandlerRequirements(const VMRequirementSet& Requirements);
+		void setFullHandlerRequirements();
 
 	private:
 		//  IR helpers
@@ -952,6 +976,13 @@ namespace llvm {
 		// within the first NestedVMOpcodes entries of the fixed nesting order,
 		// or NestedVMOpcodes==0, meaning "all eligible opcodes nest").
 		bool opcodeNests(VMOp Op) const;
+		bool needsOpcode(VMOp Op) const;
+		bool needsBinSubop(VMOp Op, uint8_t Logical) const;
+		bool needsIcmpPredicate(VMOp Op, uint8_t Logical) const;
+		bool needsCastKind(VMOp Op, uint8_t Logical) const;
+		bool needsFcmpPredicate(uint8_t Logical) const;
+		bool needsFBinSubop(uint8_t Logical, bool IsF32) const;
+		bool needsSelectKind(uint8_t Logical) const;
 
 		void buildHandlerTable();   // must come AFTER buildOpcodeHandlers
 		void buildDispatch();       // must come AFTER buildHandlerTable
@@ -972,7 +1003,7 @@ namespace llvm {
 		void setupEffLocal();         // point Eff* at per-function state
 		void populateVMEngine();      // build handlers in shared vm_engine
 		void ensureCallFTyCases();    // extend CALL switches for new FTys
-		void computeReturnInfo();     // scan F for return slot before stripBody
+		void computeReturnInfo(Function &Body);
 		void buildWrapper();          // thin wrapper that tail-calls vm_engine
 		void hardenWrapper();         // split + junk + opaque preds
 		void mbaHardenWrapper();      // MBA on wrapper arithmetic

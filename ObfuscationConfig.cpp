@@ -11,8 +11,64 @@
 #include <regex>
 #include <stdexcept>
 #include <cctype>
+#include <limits>
 
 using namespace llvm;
+
+AntiDebugConfig AntiDebugConfig::fromPassConfig(const PassConfig& PC) {
+	AntiDebugConfig C;
+	auto getBool = [&](StringRef Name, bool& Value) {
+		auto It = PC.params.find(Name.str());
+		if (It != PC.params.end()) Value = It->second != "0" && It->second != "false";
+	};
+	auto getUInt = [&](StringRef Name, uint64_t& Value) {
+		auto It = PC.params.find(Name.str());
+		if (It == PC.params.end()) return;
+		try {
+			size_t Pos = 0;
+			uint64_t Parsed = std::stoull(It->second, &Pos, 10);
+			if (Pos == It->second.size()) Value = Parsed;
+		} catch (...) {
+			Value = std::numeric_limits<uint64_t>::max();
+		}
+	};
+	getBool("enabled", C.enabled);
+	getBool("tracerPid", C.tracerPid);
+	getBool("ptrace", C.ptrace);
+	getBool("timing", C.timing);
+	getBool("maps", C.maps);
+	getBool("integrity", C.integrity);
+	getBool("dynamic", C.dynamic);
+	uint64_t Interval = C.intervalMs;
+	getUInt("interval", Interval);
+	if (Interval <= std::numeric_limits<unsigned>::max()) C.intervalMs = (unsigned)Interval;
+	getUInt("threshold", C.thresholdNs);
+	getBool("responseCorrupt", C.responseCorrupt);
+	C.enabled = C.enabled || C.tracerPid || C.ptrace || C.timing || C.maps ||
+		C.integrity || C.dynamic;
+	return C;
+}
+
+bool AntiDebugConfig::validate(std::string* Reason) const {
+	auto fail = [&](StringRef Text) {
+		if (Reason) *Reason = Text.str();
+		return false;
+	};
+	if (intervalMs < 50 || intervalMs > 60000) return fail("interval must be 50..60000 ms");
+	if (thresholdNs == 0 || thresholdNs == std::numeric_limits<uint64_t>::max())
+		return fail("threshold must be positive");
+	if (dynamic && !(tracerPid || ptrace || timing || maps || integrity))
+		return fail("dynamic monitor requires at least one detector");
+	return true;
+}
+
+void AntiDebugConfig::mergeCompatibility(const VMPassConfig& VM) {
+	if (!VM.antiDebug) return;
+	enabled = true;
+	timing = true;
+	intervalMs = VM.adDispatchInterval;
+	thresholdNs = VM.adDispatchThreshold;
+}
 
 // ============================================================================
 // ObfuscationConfig 

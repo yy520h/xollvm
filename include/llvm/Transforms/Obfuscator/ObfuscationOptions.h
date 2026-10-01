@@ -10,6 +10,22 @@ namespace llvm {
 	extern llvm::cl::opt<uint64_t> ObfSeed;
 	extern llvm::cl::opt<bool> ObfDeterministic;
 	extern llvm::cl::opt<bool> ObfVerbose;
+	extern llvm::cl::opt<bool> ObfZoneEnable;
+	extern llvm::cl::opt<std::string> ObfZoneSoftwareId;
+	extern llvm::cl::opt<std::string> ObfZoneVersion;
+	extern llvm::cl::opt<std::string> ObfZoneAlgorithm;
+	extern llvm::cl::opt<std::string> ObfZoneEncryptKey;
+	extern llvm::cl::opt<std::string> ObfZoneEncryptIv;
+	extern llvm::cl::opt<std::string> ObfZoneLinkMode;
+	extern llvm::cl::opt<std::string> ObfZoneShutdownMode;
+	extern llvm::cl::opt<unsigned> ObfZoneHeartbeatPeriod;
+	extern llvm::cl::opt<unsigned> ObfZoneOfflineGrace;
+	extern llvm::cl::opt<std::string> ObfZoneCapabilityOperation;
+	extern llvm::cl::opt<std::string> ObfZoneCapabilityPublicKey;
+	extern llvm::cl::opt<std::string> ObfZoneCapabilityBuildId;
+	extern llvm::cl::opt<std::string> ObfZoneCapabilityCodeManifest;
+	extern llvm::cl::opt<unsigned> ObfZoneCapabilityValidSeconds;
+	extern llvm::cl::opt<std::string> ObfZoneCapabilityKeyId;
 
 
 	extern llvm::cl::opt<bool> ObfSeedManifest;
@@ -48,6 +64,8 @@ namespace llvm {
 	// Reporting / artifacts
 	extern llvm::cl::opt<std::string> ObfReportDir;
 	extern llvm::cl::opt<std::string> ObfReportJson;
+	extern llvm::cl::opt<std::string> ObfGraphDir;
+	extern llvm::cl::opt<std::string> ObfGraphMode;
 
 	// Pipeline ordering control
 	// Comma-separated list of canonical pass short names that imposes an

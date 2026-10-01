@@ -300,6 +300,23 @@ namespace llvm {
 		bool validate() const;
 	};
 
+	struct AntiDebugConfig {
+		bool enabled = false;
+		bool tracerPid = false;
+		bool ptrace = false;
+		bool timing = false;
+		bool maps = false;
+		bool integrity = false;
+		bool dynamic = false;
+		unsigned intervalMs = 1000;
+		uint64_t thresholdNs = 1000000;
+		bool responseCorrupt = true;
+
+		static AntiDebugConfig fromPassConfig(const PassConfig& PC);
+		bool validate(std::string* Reason = nullptr) const;
+		void mergeCompatibility(const struct VMPassConfig& VM);
+	};
+
 	struct VMPassConfig {
 		bool     enable = false;
 		unsigned minBlocks = 1;
@@ -316,7 +333,7 @@ namespace llvm {
 		bool     hardened = false;    // MBA + opaque predicates on handler blocks
 		bool     regEncrypt = false;  // XOR-encrypt register values at rest
 		bool     rollingRegKey = false;  // P4-C: evolve per-slot reg XOR key on each store
-		bool     antiDebug = true;    // anti-debug traps (active when hardened=1)
+		bool     antiDebug = false;   // legacy anti-debug traps; explicit opt-in only
 		// configurable anti-debug thresholds
 		unsigned adDispatchThreshold = 5000;  // rdtsc delta for dispatch-level gate (cycles)
 		unsigned adHandlerThreshold = 5000;  // rdtsc delta for handler spot-checks (cycles) — at the debug-exception floor; debounced over kDebounce consecutive hits
@@ -354,7 +371,8 @@ namespace llvm {
 		// case constants — and the bytecode subop bytes — differ across builds.
 		// Two builds of the same source at different seeds share no static handler
 		// signature for the permuted families. Off = byte-identical (identity map).
-		bool     randISA = false;
+		// 默认开启；preset 展开后仍由显式 randISA=0 覆盖。
+		bool     randISA = true;
 
 		// enginePoolSize: number of distinct shared VM engines built per module
 		// (W1 "the real kill"). N>1 builds N structurally-independent engines;
@@ -381,11 +399,12 @@ namespace llvm {
 		// setting it everywhere gives a full per-function engine build. Highest
 		// structural resilience, highest .text cost. Off = use enginePoolSize.
 		bool     perFnEngine = false;
+		AntiDebugConfig antiDebugConfig;
 
 		static VMPassConfig fromPassConfig(const PassConfig& PC);
 		bool validate() const;
 	};
 
 
-} // namespace llvm
 
+} // namespace llvm

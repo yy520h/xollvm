@@ -46,6 +46,10 @@ VM_ENGINE_GATES = [
     "vm_engine_dispatch",
 ]
 
+# Stable assertions shared by the demand-pruning fixtures. Unlike the legacy
+# full-handler gates, these remain valid after unused handlers are removed.
+VM_DEMAND_STABLE_GATES = ["vm_engine_exists", "vm_engine_indirectbr"]
+
 VM_SHARED_GATES = VM_CORE_GATES + VM_ENGINE_GATES
 
 VM_AES_GATES = [
@@ -143,10 +147,14 @@ def register(reg: Registry, **_opts) -> None:
     vm_v7 = ann_extra("vm_v7")
 
     reg.add(name="rt_vm_v7_basic", passes=["vm"],
-            ann_override=vm_v7,
-            gates=VM_CORE_GATES + ["vm_enc_ctor", "vm_no_threaded_dispatch",
-                   "vm_no_keyeddisp", "vm_no_bindadeb_ctor", "vm_no_randisa",
-                   "vm_no_enginepool", "vm_no_metamorph_engines"],
+             ann_override=vm_v7,
+             gates=VM_CORE_GATES + ["vm_enc_ctor", "vm_no_threaded_dispatch",
+                    "vm_no_keyeddisp", "vm_no_bindadeb_ctor",
+                    "vm_no_enginepool", "vm_no_metamorph_engines"] + VM_RANDISA_GATES,
+             extra_opts=_DBG, category="vm")
+    reg.add(name="rt_vm_v7_basic_randisa_disabled", passes=["vm"],
+            ann_override="obf: vm(minBlocks=1,obfRegIdx=1,encBytecode=1,randISA=0)",
+            gates=VM_CORE_GATES + ["vm_enc_ctor", "vm_no_randisa"],
             extra_opts=_DBG, category="vm")
     reg.add(name="rt_vm_v7_bare", passes=["vm"],
             ann_override=ann_extra("vm_v7_bare"),

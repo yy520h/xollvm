@@ -53,6 +53,21 @@ class TestResult:
     cross: Dict[str, str] = field(default_factory=dict)
 
 
+def _vm_witness_error(report_path: Path, function_name: str) -> Optional[str]:
+    if not report_path.exists():
+        return f"VM witness report missing: {report_path}"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return f"VM witness report parse failed: {e}"
+    functions = report.get("functions", []) if isinstance(report, dict) else []
+    matches = [fn for fn in functions
+               if isinstance(fn, dict) and fn.get("name") == function_name]
+    if not matches or not isinstance(matches[0].get("vm"), dict):
+        return f"structured VM witness missing for {function_name}"
+    return None
+
+
 def _check_dump_expectations(
     tc: TestCase,
     enabled: list[str],
@@ -192,7 +207,7 @@ def run_test(
     tdir.mkdir(parents=True, exist_ok=True)
 
     test_report_root: Optional[Path] = None
-    if report_enabled:
+    if report_enabled or tc.witness_required:
         test_report_root = report_root / tc.name
         test_report_root.mkdir(parents=True, exist_ok=True)
 
@@ -214,7 +229,7 @@ def run_test(
             if "-obf-no-skips" not in base_opts:
                 base_opts.append("-obf-no-skips")
         # JSON post-check still needs the report dir.
-        need_report = report_enabled or (
+        need_report = report_enabled or tc.witness_required or (
             eff_no_skips and tc.allowed_skip_reasons
         )
         if not need_report or test_report_root is None:
@@ -373,6 +388,13 @@ def run_test(
             break
 
         obf_ir = read_text(obf_ll)
+
+        if tc.witness_required and rdir is not None:
+            witness_error = _vm_witness_error(rdir / "obf_report.json", "obf_target")
+            if witness_error:
+                res.status = "FAIL"
+                res.reason = f"seed {seed}: {witness_error}"
+                break
 
         if report_enabled and rdir is not None:
             j = rdir / "obf_report.json"

@@ -21,12 +21,14 @@
 #include "llvm/Transforms/Obfuscator/ObfuscationAnnotationAnalysis.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationPipeline.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
 #include "llvm/Transforms/Obfuscator/PassIds.h"
 #include "llvm/Transforms/Obfuscator/PassRng.h"
 #include "llvm/Transforms/Obfuscator/SeedManifest.h"
 #include "llvm/Transforms/Obfuscator/StringEncryption.h"
 #include "llvm/Transforms/Obfuscator/TargetCompat.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
+#include "llvm/Transforms/Obfuscator/ZoneAuth.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
 namespace llvm {
@@ -265,6 +267,17 @@ namespace llvm {
 				Report.BaseSeed = (uint64_t)llvm::ObfSeed;
 				Report.ModuleSeed = Cache.ModuleSeed;
 				Report.FunctionSeed = Cache.getFunctionSeed(F);
+				if (auto AD = Cfg.getPassConfig("antidebug")) {
+					AntiDebugConfig A = AntiDebugConfig::fromPassConfig(*AD);
+					Report.AntiDebugEnabled = A.enabled;
+					Report.AntiDebugDynamic = A.dynamic;
+					Report.AntiDebugResponse = A.responseCorrupt ? "corrupt" : "none";
+					if (A.tracerPid) Report.AntiDebugDetectors.push_back("tracerPid");
+					if (A.ptrace) Report.AntiDebugDetectors.push_back("ptrace");
+					if (A.timing) Report.AntiDebugDetectors.push_back("timing");
+					if (A.maps) Report.AntiDebugDetectors.push_back("maps");
+					if (A.integrity) Report.AntiDebugDetectors.push_back("integrity");
+				}
 
 				Report.InstsBefore = llvm::obf::countInstructions(F);
 				DiffBefore = llvm::obf::computeDifficultyComponents(F);
@@ -590,6 +603,10 @@ namespace llvm {
 					if (Error E = llvm::obf::maybeWriteObfReportJson(M, MAM))
 						errs() << "[obf] report: " << toString(std::move(E)) << "\n";
 				}
+				if (llvm::obf::isGraphReportEnabled()) {
+					if (Error E = llvm::obf::writeGraphReport(M))
+						errs() << "[obf] graph: " << toString(std::move(E)) << "\n";
+				}
 				return PreservedAnalyses::all();
 			}
 
@@ -597,6 +614,10 @@ namespace llvm {
 
 			if (ObfVerify)
 				MPM.addPass(llvm::obf::ObfVerifyModulePass("pre"));
+
+			// Zone authorization must establish its local gate before function-level
+			// obfuscation sees the annotated body.
+			MPM.addPass(ZoneAuthModulePass());
 
 			// fmerge runs first among module passes: it collapses annotated
 			// functions into super-functions before strenc/the function
@@ -622,12 +643,21 @@ namespace llvm {
 			// aborts loudly (report_fatal_error) if any pass produced invalid IR.
 			MPM.addPass(llvm::obf::ObfVerifyModulePass("final"));
 
+			VMPlanCoordinator Coordinator;
+			VMPlanCoordinator* PreviousCoordinator = VMPlanCoordinator::setActive(&Coordinator);
 			PreservedAnalyses PA = MPM.run(M, MAM);
+			VMPlanCoordinator::setActive(PreviousCoordinator);
+			if (!Coordinator.freeze() || !Coordinator.commit())
+				return PreservedAnalyses::none();
 
 			// Emit JSON report at end of module pipeline (if configured).
 			if (llvm::obf::isReportEnabled()) {
 				if (Error E = llvm::obf::maybeWriteObfReportJson(M, MAM))
 					errs() << "[obf] report: " << toString(std::move(E)) << "\n";
+			}
+			if (llvm::obf::isGraphReportEnabled()) {
+				if (Error E = llvm::obf::writeGraphReport(M))
+					errs() << "[obf] graph: " << toString(std::move(E)) << "\n";
 			}
 
 			return PA;

@@ -307,6 +307,7 @@ class TestCase:
     category:     str         = "pass"
     no_config_check: bool     = False
     src_override: Optional[str] = None
+    witness_required: bool = False
 
 
 class Registry:
@@ -448,6 +449,76 @@ def render_vm_v7_multi_fn_aes_program(annotation: str) -> str:
 
 def render_vm_v7_enginepool_program(annotation: str) -> str:
     return programs.render("vm.enginepool", annotation=annotation)
+
+
+def _render_vm_demand_single(annotation: str, return_type: str,
+                             params: str, expression: str, *,
+                             float_inputs: bool = False) -> str:
+    if float_inputs:
+        parse_x = 'strtof(argv[1], 0)'
+        parse_y = 'strtof(argv[2], 0)'
+        output = 'printf("%.9g\\n", (double)obf_target(x, y));'
+        input_type = "float"
+    else:
+        parse_x = '(uint32_t)strtoul(argv[1], 0, 0)'
+        parse_y = '(uint32_t)strtoul(argv[2], 0, 0)'
+        output = 'printf("%u\\n", (unsigned)obf_target(x, y));'
+        input_type = "uint32_t"
+    return f'''#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+__attribute__((noinline, annotate("{annotation}")))
+{return_type} obf_target({params}) {{ return {expression}; }}
+
+int main(int argc, char** argv) {{
+    {input_type} x = argc > 1 ? {parse_x} : 17;
+    {input_type} y = argc > 2 ? {parse_y} : 9;
+    {output}
+    return 0;
+}}
+'''
+
+
+def render_vm_demand_add_program(annotation: str) -> str:
+    return _render_vm_demand_single(annotation, "uint32_t", "uint32_t x, uint32_t y",
+                                    "x + y")
+
+
+def render_vm_demand_mul_program(annotation: str) -> str:
+    return _render_vm_demand_single(annotation, "uint32_t", "uint32_t x, uint32_t y",
+                                    "x * y")
+
+
+def render_vm_demand_fadd_program(annotation: str) -> str:
+    return _render_vm_demand_single(annotation, "float", "float x, float y",
+                                    "x + y", float_inputs=True)
+
+
+def render_vm_demand_icmp_eq_program(annotation: str) -> str:
+    return _render_vm_demand_single(annotation, "uint32_t", "uint32_t x, uint32_t y",
+                                    "x == y")
+
+
+def render_vm_demand_incompatible_program(annotation_a: str,
+                                          annotation_b: str) -> str:
+    return f'''#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+__attribute__((noinline, annotate("{annotation_a}")))
+uint32_t obf_target(uint32_t x, uint32_t y) {{ return x + y; }}
+
+__attribute__((noinline, annotate("{annotation_b}")))
+uint32_t obf_other(uint32_t x, uint32_t y) {{ return x * y; }}
+
+int main(int argc, char** argv) {{
+    uint32_t x = argc > 1 ? (uint32_t)strtoul(argv[1], 0, 0) : 17;
+    uint32_t y = argc > 2 ? (uint32_t)strtoul(argv[2], 0, 0) : 9;
+    printf("%u\\n", (unsigned)(obf_target(x, y) + obf_other(x, y)));
+    return 0;
+}}
+'''
 
 
 def render_vm_v7_switch_dispatch_program(annotation: str) -> str:

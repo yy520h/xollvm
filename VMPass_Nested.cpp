@@ -21,6 +21,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
@@ -566,6 +567,7 @@ void VMImpl::virtualizeNestedHelpersOnce() {
 	// invalid IR on the helper's small wrapper shape; left off until that is
 	// fixed. The distinct inner engine already provides the second layer.
 	InnerCfg.hardened = false;
+	VMPlanCoordinator* PreviousCoordinator = VMPlanCoordinator::setActive(nullptr);
 
 	for (unsigned i = 0; i < kNumNestedHelpers; ++i) {
 		Function* HelperFn = M.getFunction(kNestedHelperOrder[i].Name);
@@ -575,12 +577,14 @@ void VMImpl::virtualizeNestedHelpersOnce() {
 		// Forward MasterSeed so the inner emitter's RandISA subop map matches the
 		// plain engine's handler switch-cases (same module-uniform permutation).
 		VMImpl Inner(*HelperFn, InnerCfg, InnerRng, MasterSeed);
+		Inner.setFullHandlerRequirements();
 		if (!Inner.run()) {
 			LLVM_DEBUG(dbgs() << "[vm] nested-VM: failed to virtualize '"
 				<< HelperFn->getName() << "': " << Inner.FailReason << "\n");
 			if (ObfVerbose)
 				errs() << "[vm] nested-VM: failed to virtualize '" << HelperFn->getName()
-				<< "': " << Inner.FailReason << "\n";
+					<< "': " << Inner.FailReason << "\n";
 		}
 	}
+	VMPlanCoordinator::setActive(PreviousCoordinator);
 }

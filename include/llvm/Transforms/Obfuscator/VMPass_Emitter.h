@@ -38,6 +38,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Requirements.h"
 
 #include <cstring>
 
@@ -68,6 +69,7 @@ namespace llvm {
 		SmallVector<Value*, 8>           CalleeTab;  // callee table (CALL* targets)
 		// 6.2: parallel FunctionType table -- one entry per CalleeTab slot.
 		SmallVector<FunctionType*, 8>    CalleeFTyTab;
+		VMRequirementSet Requirements;
 
 		/// Metadata for an entry-block alloca created by PHI demotion.
 		struct PhiAllocaDesc {
@@ -127,6 +129,9 @@ namespace llvm {
 		/// (byte-identical to pre-feature). The pointed-to map must be the same
 		/// module-wide instance the shared handler switch-cases were built from.
 		void setISAEnc(const ISAEnc* E) { IsaEnc = E; }
+		const ISAEnc* getISAEnc() const { return IsaEnc; }
+		void setRequirements(VMRequirementSet *R) { RequirementSink = R; }
+		const VMRequirementSet &getRequirements() const { return Requirements; }
 
 		/// Compile F into bytecode.  Salt is the CTSalt byte used to XOR register
 		/// index bytes (0 when obfRegIdx is disabled).
@@ -144,6 +149,8 @@ namespace llvm {
 		bool               KeyedDispatch = false;
 		bool               SuperOps = false;
 		const ISAEnc* IsaEnc = nullptr;
+		// 外部接收器只在发射成功后获得快照，不参与临时收集。
+		VMRequirementSet *RequirementSink = nullptr;
 
 		/// Apply the RandISA BinSubop permutation (identity when off/null).
 		uint8_t encBinSubop(uint8_t Logical) const {
@@ -415,6 +422,7 @@ namespace llvm {
 
 		uint8_t encOp(VMOp Op) const { return OpMap ? OpMap->encode(Op) : (uint8_t)Op; }
 		void bop(VMOp Op) {
+			Requirements.requireOpcode(Op);
 			uint8_t v = encOp(Op);
 			// keyedDispatch: K(IP) is baked in using ip() as it stands right now.
 			// When constInStream later splices a prologue in front of the

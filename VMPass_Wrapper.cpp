@@ -149,11 +149,11 @@ void VMImpl::buildVMEntry()
 // Records which register file slot the return value occupies so
 // buildWrapper() can extract it after vm_engine returns.
 
-void VMImpl::computeReturnInfo() {
+void VMImpl::computeReturnInfo(Function &Body) {
 	WrapRetSlot = -1;
 	WrapRetKind = VMEngine::RK2_VOID;
 
-	for (BasicBlock& BB : F) {
+	for (BasicBlock& BB : Body) {
 		auto* RI = dyn_cast<ReturnInst>(BB.getTerminator());
 		if (!RI) continue;
 		Value* RV = RI->getReturnValue();
@@ -603,6 +603,17 @@ void VMImpl::buildWrapper() {
 		// per-function callee XOR mask (0 when unhardened)
 		Cfg.hardened ? blindI64(CalleeMask) : B.getInt64(0),       // callee_mask
 	};
+	if (AntiDebug.enabled) {
+		if (auto* Response = M.getGlobalVariable("__obf_antidebug_response", true)) {
+			Value* Flag = B.CreateLoad(I32Ty, Response, "vm.ad.response");
+			cast<LoadInst>(Flag)->setVolatile(true);
+			Value* Poisoned = B.CreateXor(B.getInt32(SaltConst), B.getInt32(ADPoisonKey),
+				"vm.ad.salt.poison");
+			Args[VMEngine::kParamSalt] = B.CreateSelect(
+				B.CreateICmpNE(Flag, B.getInt32(0), "vm.ad.detected"),
+				Poisoned, blindI32(SaltConst), "vm.ad.salt.effective");
+		}
+	}
 	if (LazyActive) Args.push_back(LazyCtxArg);              // lazyctx
 
 	// Load engine function pointer from handler table slot [OP_COUNT*K]
@@ -1006,4 +1017,5 @@ void VMImpl::mbaHardenWrapper() {
 
 	LLVM_DEBUG(dbgs() << "[vm] MBA-hardened wrapper for '"
 		<< F.getName() << "' [sites=" << Sites << "]\n");
+	(void)Sites;
 }

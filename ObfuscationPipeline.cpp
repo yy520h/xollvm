@@ -15,6 +15,7 @@
 #include "llvm/Transforms/Obfuscator/VirtualCall.h"
 #include "llvm/Transforms/Obfuscator/ObfRepairSSA.h"
 #include "llvm/Transforms/Obfuscator/VMPass.h"
+#include "llvm/Transforms/Obfuscator/AntiDebug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
@@ -411,6 +412,9 @@ void ObfuscationPipeline::buildPipeline(FunctionPassManager& FPM,
 		else if (passName == "vm") {
 			add(VMPass(), passName, false);
 		}
+		else if (passName == "antidebug") {
+			add(AntiDebugPass(), passName, false);
+		}
 	}
 
 	if (ObfVerify)
@@ -497,6 +501,11 @@ std::vector<ObfPassEntry> ObfuscationPipeline::getPassEntries(
 				return VMPass().run(F, AM);
 				};
 			E.NeedsSSARepair = true;   // restructures CFG aggressively
+		}
+		else if (passName == "antidebug") {
+			E.Run = [](Function& F, FunctionAnalysisManager& AM) {
+				return AntiDebugPass().run(F, AM);
+			};
 		}
 		else {
 			continue; // unknown pass, skip

@@ -20,6 +20,7 @@
 
 #include "llvm/Transforms/Obfuscator/VMPass.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscator/FunctionObfContextAnalysis.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
@@ -184,27 +185,43 @@ PreservedAnalyses VMPass::run(Function& F, FunctionAnalysisManager& AM) {
 		}
 	}
 
-	VMImpl Impl(VCtx);
-	if (!Impl.run()) {
-		LLVM_DEBUG(dbgs() << "[vm] fail '" << F.getName() << "': " << Impl.FailReason << "\n");
+	auto Impl = std::make_unique<VMImpl>(VCtx);
+	if (auto AD = getObfConfig(F, AM).getPassConfig("antidebug"))
+		Impl->AntiDebug = AntiDebugConfig::fromPassConfig(*AD);
+	Impl->AntiDebug.mergeCompatibility(VCtx.Cfg);
+	if (auto* Coordinator = VMPlanCoordinator::active()) {
+		if (!Impl->prepare()) {
+			auto& MutFOC = *AM.getResult<FunctionObfContextAnalysis>(F);
+			llvm::obf::recordObfPassSkip(MutFOC, "vm",
+				Impl->FailReason.empty() ? "impl_failed" : Impl->FailReason);
+			return PreservedAnalyses::all();
+		}
+		EngineConfigKey Key = EngineConfigKey::fromConfig(VCtx.Cfg,
+			VMEngine::enginePoolOf(Impl->EngineId), Impl->EngineId, VCtx.MasterSeed,
+			&Impl->AntiDebug);
+		Coordinator->addPrepared(std::move(Impl), VCtx.Cfg, Key);
+		return PreservedAnalyses::all();
+	}
+	if (!Impl->run()) {
+		LLVM_DEBUG(dbgs() << "[vm] fail '" << F.getName() << "': " << Impl->FailReason << "\n");
 		if (ObfVerbose) {
-			if (!Impl.FailReason.empty())
-				errs() << "[vm] fail '" << F.getName() << "': " << Impl.FailReason << "\n";
+			if (!Impl->FailReason.empty())
+				errs() << "[vm] fail '" << F.getName() << "': " << Impl->FailReason << "\n";
 			else
 				errs() << "[vm] fail '" << F.getName() << "'" << "\n";
 		}
 		auto& MutFOC = *AM.getResult<FunctionObfContextAnalysis>(F);
 		llvm::obf::recordObfPassSkip(MutFOC, "vm",
-			Impl.FailReason.empty() ? "impl_failed" : Impl.FailReason);
+			Impl->FailReason.empty() ? "impl_failed" : Impl->FailReason);
 		return PreservedAnalyses::all();
 	}
 
 	if (ObfVerbose)
 		errs() << "[vm] virtualised '" << F.getName() << "' ["
-		<< Impl.E.BC.size() << "B bytecode | "
-		<< (unsigned)Impl.E.NVR << "vregs+"
-		<< (unsigned)Impl.E.NVR64 << "vregs64+"
-		<< (unsigned)Impl.E.NPR << "pregs"
+		<< Impl->E.BC.size() << "B bytecode | "
+		<< (unsigned)Impl->E.NVR << "vregs+"
+		<< (unsigned)Impl->E.NVR64 << "vregs64+"
+		<< (unsigned)Impl->E.NPR << "pregs"
 		<< (VCtx.Cfg.obfRegIdx ? " |obf-idx" : "")
 		<< (VCtx.Cfg.encBytecode ? " |enc-bc" : "")
 		<< (VCtx.Cfg.hardened ? " |hardened" : "")

@@ -64,7 +64,7 @@ namespace llvm::obf {
 		/// \param HardCap       Absolute ceiling regardless of multiplier.
 		///                      0 means "no cap" (multiplier-only).
 		IRBudget(unsigned InitialInsts, unsigned Multiplier, unsigned HardCap)
-			: Initial(InitialInsts), Mult(Multiplier), Cap(HardCap) {
+			: Initial(InitialInsts), Mult(Multiplier) {
 			if (Multiplier == 0) {
 				// Budget disabled — effectively infinite.
 				Limit = UINT_MAX;
@@ -233,7 +233,6 @@ namespace llvm::obf {
 	private:
 		unsigned Initial = 0;
 		unsigned Mult = 0;
-		unsigned Cap = 0;
 		unsigned Limit = UINT_MAX;
 		std::vector<PassBudgetRecord> Records;
 	};

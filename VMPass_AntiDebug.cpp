@@ -74,7 +74,7 @@ void VMImpl::emitSaltCorruption(IRBuilder<>& B, Value* SaltPtr, uint32_t PoisonK
 // Gated by hardened=1 && antiDebug=1.
 
 void VMImpl::buildIntegrityHashCtor() {
-	if (!Cfg.hardened || !Cfg.antiDebug) return;
+	if (!(Cfg.hardened && Cfg.antiDebug) && !AntiDebug.integrity) return;
 	if (!GVBytecode || E.BC.empty()) return;
 
 	unsigned BCLen = (unsigned)E.BC.size();

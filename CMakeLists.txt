@@ -66,6 +66,7 @@ endif()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_subdirectory(aes_stub)
+add_subdirectory(zone_runtime)
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +107,9 @@ set(OBF_SOURCES
   ADec/Tech_ConstLaunder.cpp
   AntiOptimizationShield.cpp
   VMPass.cpp
+  VMPass_Requirements.cpp
   VMPass_Emitter.cpp
+  VMPass_Plan.cpp
   VMPass_Verifier.cpp
   VMPass_Impl.cpp
   VMPass_AntiDebug.cpp
@@ -117,12 +120,14 @@ set(OBF_SOURCES
   VMPass_Nested.cpp
   VMPass_Wrapper.cpp
   VMPass_Decoys.cpp
+  AntiDebug.cpp
   EHUtils.cpp
   TargetCompat.cpp
   FunctionObfContextAnalysis.cpp
   ObfuscationAnnotationAnalysis.cpp
   ObfuscationOptions.cpp
   ObfuscationConfig.cpp
+  ZoneAuth.cpp
 
   # Registration entry point (getObfuscatorPluginInfo / llvmGetPassPluginInfo).
   registration/PluginEntry.cpp
@@ -142,8 +147,10 @@ set(LLVM_REQUIRES_EH ON)
 # before the target so they apply whether add_llvm_pass_plugin builds a module
 # (.so) or an object library (static extension).
 include_directories(
+  "${CMAKE_CURRENT_SOURCE_DIR}"
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
   "${CMAKE_CURRENT_BINARY_DIR}/aes_stub"
+  "${CMAKE_CURRENT_BINARY_DIR}/zone_runtime"
 )
 
 # intrinsics_gen only exists inside an LLVM build tree.
@@ -187,4 +194,20 @@ add_llvm_pass_plugin(Obfuscator
 add_dependencies(Obfuscator aes_stub_inc)
 if(TARGET obj.Obfuscator)
   add_dependencies(obj.Obfuscator aes_stub_inc)
+endif()
+
+if(LLVM_INCLUDE_TESTS AND DEFINED LLVM_MAIN_SRC_DIR)
+  add_custom_target(ObfuscatorUnitTests)
+  set(LLVM_LINK_COMPONENTS Core Support AsmParser)
+  add_unittest(ObfuscatorUnitTests VMRequirementsTests
+    utils/VMRequirementsTest.cpp
+    VMPass_Requirements.cpp
+    VMPass_Emitter.cpp
+    VMPass_Verifier.cpp
+  )
+  if(LLVM_OBFUSCATOR_LINK_INTO_TOOLS)
+    target_compile_definitions(VMRequirementsTests PRIVATE OBF_TEST_VM_IMPL=1)
+    target_link_libraries(VMRequirementsTests PRIVATE Obfuscator)
+    llvm_config(VMRequirementsTests Linker BitReader TransformUtils Analysis ScalarOpts IPO)
+  endif()
 endif()

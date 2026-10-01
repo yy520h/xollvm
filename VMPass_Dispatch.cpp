@@ -96,8 +96,9 @@ void VMImpl::buildHandlerTable() {
 		for (unsigned v = 0; v < K; ++v) {
 			unsigned VB = (K > 1 && IsCall) ? (K - 1) : v;
 			BasicBlock* HB = SharedEngineMode ? SS->OpcBB[L][VB]
-											   : OpcBB[L][VB];
-			assert(HB && "missing opcode handler variant");
+																: OpcBB[L][VB];
+			if (!HB) HB = SharedEngineMode ? SS->Invalid : InvalidBB;
+			assert(HB && "missing opcode handler variant and invalid block");
 			Es[PermP * K + v] = BlockAddress::get(BAFn, HB);
 		}
 	}
@@ -266,7 +267,7 @@ void VMImpl::buildDispatch() {
 		IndirectBrInst* IBR = B.CreateIndirectBr(Hndl, OP_COUNT * NumVariants + 1);
 		for (unsigned i = 0; i < OP_COUNT; ++i)
 			for (unsigned v = 0; v < NumVariants; ++v)
-				IBR->addDestination(OpcBB[i][v]);
+				IBR->addDestination(OpcBB[i][v] ? OpcBB[i][v] : InvalidBB);
 		IBR->addDestination(ExitBB);
 	}
 
@@ -396,14 +397,6 @@ namespace {
 namespace llvm {
 	namespace VMEngine {
 
-		static const char* const kParamNames[kNumParams] = {
-			"bc", "bc_len", "regs", "regs64", "fregs", "pregs",
-			"callees", "salt", "regMask", "reg64Mask", "fregMask", "pregMask",
-			"handlers", "fty_indices",
-			"regkeys", "reg64keys", "fregkeys",
-			"callee_mask",
-
-		};
 		static constexpr const char* kPopulatedMDKey = "obf.vm.engine.populated";
 
 		Function* getOrBuildVMEngine(Module& M, unsigned EngineId) {
@@ -587,6 +580,9 @@ void VMImpl::populateVMEngine() {
 	}
 
 	// Build all 51 opcode handlers
+	InvalidBB = BasicBlock::Create(Ctx, "vm.invalid", EF);
+	IRBuilder<>(InvalidBB).CreateUnreachable();
+	SS->Invalid = InvalidBB;
 	NumVariants = Cfg.handlerVariants;
 	if (NumVariants < 1) NumVariants = 1;
 	if (NumVariants > kMaxHandlerVariants) NumVariants = kMaxHandlerVariants;
@@ -650,6 +646,17 @@ void VMImpl::populateVMEngine() {
 	SS->Populated = true;
 	SS->FTyCountAtLastBuild = (unsigned)SS->SharedFTys.size();
 	VMEngine::markEnginePopulated(EF);
+	// Persist the engine witness on the final IR so report generation does not
+	// depend on the transient SharedState map after the module pass completes.
+	LLVMContext& ReportCtx = EF->getContext();
+	EF->setMetadata("obf.vm.engine", MDNode::get(ReportCtx, {
+		ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(ReportCtx), EngineId)),
+		ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(ReportCtx), SS->NumVariants)),
+		ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(ReportCtx), SS->NumDecoys)),
+		ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(ReportCtx),
+			OP_COUNT * SS->NumVariants + 1 + (SS->EncDispatch ? OP_COUNT : 0) + SS->NumDecoys)),
+		ConstantAsMetadata::get(ConstantInt::get(Type::getInt1Ty(ReportCtx), SS->EncDispatch))
+	}));
 
 	if (Cfg.hardened)
 		hardenVMEngine(EF, SS);

@@ -20,13 +20,14 @@ def clang_for_lang(tools: Tools, is_cpp: bool) -> Path:
       • On Windows, clang.exe/clang-cl.exe can compile C++ as well, so we keep it.
       • On Unix, prefer clang++ if available (same bin dir as clang).
     """
+    compiler_base = tools.host_clang or tools.clang
     if not is_cpp:
-        return tools.clang
+        return compiler_base
 
     if platform.system() == "Windows":
-        return tools.clang
+        return compiler_base
 
-    clang = tools.clang
+    clang = compiler_base
     name = clang.name
     if name.startswith("clang-cl"):
         return clang
@@ -61,7 +62,18 @@ def compile_src_to_ll(tools: Tools, src: Path, out: Path, *, is_cpp: bool, v: bo
 def compile_ll_to_exe(tools: Tools, ll: Path, exe: Path, opt: str, *, is_cpp: bool, v: bool = False) -> None:
     compiler = clang_for_lang(tools, is_cpp)
     extra = ["-std=c++17"] if is_cpp else []
-    run_cmd([str(compiler), f"-{opt}", *extra, str(ll), "-o", str(exe)], verbose=v)
+    if tools.host_clang is not None:
+        obj = exe.with_suffix(".o")
+        run_cmd([
+            str(tools.clang), f"-{opt}", "-fPIC", "-c", str(ll), "-o", str(obj),
+        ], verbose=v)
+        run_cmd([
+            str(compiler), str(obj), "-lm", *extra, "-o", str(exe),
+        ], verbose=v)
+        return
+    run_cmd([
+        str(tools.clang), f"-{opt}", *extra, str(ll), "-o", str(exe),
+    ], verbose=v)
 
 
 def run_obfuscation(

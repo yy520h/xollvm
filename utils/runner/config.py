@@ -9,23 +9,28 @@ from pathlib import Path
 from .util import die
 
 
+_TERMUX_CLANG = Path("/data/data/com.termux/files/usr/bin/clang")
+
+
 @dataclass(frozen=True)
 class Tools:
     clang: Path
     opt: Path
     llc: Path | None = None  # optional — only required for cross-arch builds
+    host_clang: Path | None = None
 
 
 def detect_tools(build_dir: Path, config: str) -> Tools:
     exe = ".exe" if platform.system() == "Windows" else ""
     search = [build_dir / "bin", build_dir / config / "bin"]
-    bin_dir = None
+    bin_dir: Path | None = None
     for d in search:
         if (d / f"opt{exe}").exists():
             bin_dir = d
             break
     if not bin_dir:
         die(f"Cannot find opt in: {', '.join(str(d) for d in search)}")
+    assert bin_dir is not None
 
     clang = bin_dir / f"clang{exe}"
     if not clang.exists():
@@ -35,5 +40,7 @@ def detect_tools(build_dir: Path, config: str) -> Tools:
 
     llc_path = bin_dir / f"llc{exe}"
     llc = llc_path if llc_path.exists() else None
+    host_clang = _TERMUX_CLANG if platform.system() == "Android" and _TERMUX_CLANG.exists() else None
 
-    return Tools(clang=clang, opt=bin_dir / f"opt{exe}", llc=llc)
+    return Tools(clang=clang, opt=bin_dir / f"opt{exe}", llc=llc,
+                 host_clang=host_clang)

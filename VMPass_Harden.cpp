@@ -241,7 +241,7 @@ void VMImpl::hardenVMEngine(Function* EF, VMEngine::SharedState* SS) {
 			// and their cumulative false-positive exposure. Keep trap count
 			// independent of K. (At K=1 every handler block is variant 0.)
 			if (VariantOf.lookup(&BB) != 0) continue;
-			if (HardenRng.range(100) >= (int)Cfg.adHandlerProb) continue;
+			if (HardenRng.range(100) >= Cfg.adHandlerProb) continue;
 
 			TrapCandidates.push_back(&BB);
 		}

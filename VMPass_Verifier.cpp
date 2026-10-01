@@ -5,6 +5,7 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Verifier.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Requirements.h"
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Twine.h"
@@ -15,7 +16,8 @@ namespace llvm {
 
 	bool verifyBytecode(const BytecodeEmitter& E, uint8_t CTSalt, const VMOpcodeMap& OpMap,
 		std::string& OutErr, uint32_t& OutBadIP,
-		uint32_t SaltFull, bool BlindTargets, bool KeyedDispatch) {
+		uint32_t SaltFull, bool BlindTargets, bool KeyedDispatch,
+		const VMRequirementSet *Allowed) {
 		const auto& BC = E.BC;
 
 		// keyedDispatch: mirrors BytecodeEmitter::opKeyByteCT / VMImpl::opKeyByteIR
@@ -46,6 +48,8 @@ namespace llvm {
 		DenseSet<uint32_t> BlockStarts;
 		for (const auto& KV : E.BlockIP)
 			BlockStarts.insert(KV.second);
+		DenseSet<uint32_t> InstructionStarts;
+		SmallVector<std::pair<uint32_t, uint32_t>, 16> PendingTargets;
 
 		auto fail = [&](uint32_t IP, const Twine& Msg) -> bool {
 			OutBadIP = IP;
@@ -80,8 +84,45 @@ namespace llvm {
 				return fail(IP, Twine(Which) + " target " + Twine(Tgt) + " out of bounds (bc=" + Twine(BC.size()) + ")");
 			if (!BlockStarts.count(Tgt))
 				return fail(IP, Twine(Which) + " target " + Twine(Tgt) + " is not a block start");
+			PendingTargets.push_back({IP, Tgt});
 			return true;
-			};
+		};
+
+		const ISAEnc Identity;
+		const ISAEnc &Isa = E.getISAEnc() ? *E.getISAEnc() : Identity;
+		auto decodeBin = [&](uint8_t V) { return Isa.decBinSubop(V); };
+		auto decodeCast = [&](uint8_t V) { return Isa.decCastKind(V); };
+		auto decodeIcmp = [&](uint8_t V) { return Isa.decIcmpPred(V); };
+		auto decodeFBin = [&](uint8_t V) { return Isa.decFBinSubop(V); };
+		auto decodeFcmp = [&](uint8_t V) { return Isa.decFcmpPred(V); };
+		auto requireOpcode = [&](uint32_t IP, VMOp Op) -> bool {
+			if (Allowed && !Allowed->contains(Op))
+				return fail(IP, Twine("opcode not in VM requirement set: ") + vmOpcodeName(Op));
+			return true;
+		};
+		auto requireBin = [&](uint32_t IP, VMOp Op, uint8_t Physical) -> bool {
+			uint8_t Logical = decodeBin(Physical);
+			if (Logical == 0xFF)
+				return fail(IP, "invalid BINOP subop encoding");
+			if (Allowed && !Allowed->allowsBinSubop(Op, Logical))
+				return fail(IP, "BINOP subop not in VM requirement set");
+			return true;
+		};
+		auto requireIcmp = [&](uint32_t IP, VMOp Op, uint8_t Physical) -> bool {
+			uint8_t Logical = decodeIcmp(Physical);
+			if (Logical == 0xFF || (Op == OP_ANDCMPZ &&
+				Logical != CmpInst::ICMP_EQ && Logical != CmpInst::ICMP_NE))
+				return fail(IP, "invalid ICMP predicate encoding");
+			if (Allowed && !Allowed->allowsIcmpPredicate(Op, Logical))
+				return fail(IP, "ICMP predicate not in VM requirement set");
+			return true;
+		};
+		auto requireFCast = [&](uint32_t IP, VMOp Op, uint8_t Raw) -> bool {
+			if (Allowed && !Allowed->allowsFCastKind(Op, Raw & 0x7Fu,
+				(Raw & FCAST_F32_FLAG) != 0))
+				return fail(IP, "FCAST kind/precision not in VM requirement set");
+			return true;
+		};
 
 
 		// shared CALL verifier body -- used by all 5 CALL opcodes.
@@ -109,6 +150,22 @@ namespace llvm {
 				return fail(IP, Twine("OP_CALL fn index out of range: ") + Twine((unsigned)FnIdx));
 			if (NArgs > 16)
 				return fail(IP, Twine("OP_CALL nargs too large: ") + Twine((unsigned)NArgs));
+			FunctionType *FTy = FnIdx < E.CalleeFTyTab.size() ? E.CalleeFTyTab[FnIdx] : nullptr;
+			if (!FTy)
+				return fail(IP, "OP_CALL missing concrete FunctionType");
+			// 发射器已把每个变参的实际类型写入 concrete FunctionType。
+			if (NArgs != FTy->getNumParams())
+				return fail(IP, "OP_CALL argument arity does not match FunctionType");
+			Type *RT = FTy->getReturnType();
+			bool ReturnMatches = DstKind == 0 ? RT->isVoidTy() :
+				DstKind == 1 ? RT->isIntegerTy(32) :
+				DstKind == 2 ? RT->isPointerTy() :
+				DstKind == 3 ? RT->isIntegerTy(64) :
+				(RT->isFloatTy() || RT->isDoubleTy());
+			if (!ReturnMatches)
+				return fail(IP, "OP_CALL return kind does not match FunctionType");
+			if (Allowed && !Allowed->allowsCallType(FTy))
+				return fail(IP, "OP_CALL FunctionType not in VM requirement set");
 			
 			uint32_t Total = Hdr + (uint32_t)NArgs;
 			if (IP + Total > BC.size())
@@ -116,15 +173,17 @@ namespace llvm {
 			uint32_t ArgBase = IP + Hdr;
 			for (unsigned i = 0; i < NArgs; ++i) {
 				unsigned Idx = decIdx(BC[ArgBase + i]);
-				// arg register file is determined by FTy at runtime;
-				// verify conservatively that Idx is in range of at least one file.
-				unsigned MaxSlots = std::max({ (unsigned)E.NVR, (unsigned)E.NVR64,
-				(unsigned)E.NPR, (unsigned)E.NFR });
-				if (!chk(IP, "arg", Idx, MaxSlots)) return false;
+				Type *AT = FTy->getParamType(i);
+				if (!AT->isPointerTy() && !AT->isIntegerTy(64) &&
+					!AT->isFloatTy() && !AT->isDoubleTy() &&
+					!(AT->isIntegerTy() && AT->getIntegerBitWidth() <= 32))
+					return fail(IP, "OP_CALL unsupported argument type");
+				unsigned Limit = AT->isPointerTy() ? E.NPR :
+					AT->isIntegerTy(64) ? E.NVR64 :
+					AT->isFloatingPointTy() ? E.NFR : E.NVR;
+				if (!chk(IP, "arg", Idx, Limit)) return false;
 			}
 			return true;
-			// caller advances IP by Total
-			(void)Total;  // suppress unused-warning
 			};
 		// Compute Total for IP advancement (same formula as inside verifyCall)
 		auto callTotal = [&](uint32_t IP, bool HasDst) -> uint32_t {
@@ -138,12 +197,14 @@ namespace llvm {
 
 		uint32_t IP = 0;
 		while (IP < BC.size()) {
+			InstructionStarts.insert(IP);
 			uint8_t Phys = BC[IP];
 			if (KeyedDispatch) Phys ^= opKeyByteCT(SaltFull, IP);
 			if (Phys >= OP_COUNT)
 				return fail(IP, Twine("invalid opcode byte ") + Twine((unsigned)Phys));
 
 			VMOp Opc = OpMap.decode(Phys);
+			if (!requireOpcode(IP, Opc)) return false;
 			switch (Opc) {
 			case OP_LOADI: {
 				if (IP + 6 > BC.size()) return fail(IP, "OP_LOADI truncated");
@@ -166,6 +227,7 @@ namespace llvm {
 				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
 				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
 				if (!chk(IP, "vreg", decIdx(BC[IP + 3]), E.NVR)) return false;
+				if (!requireBin(IP, OP_BINOP, BC[IP + 4])) return false;
 				IP += 5; break;
 			}
 			case OP_MULADD: {
@@ -189,7 +251,7 @@ namespace llvm {
 				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;  // dst
 				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;  // a
 				if (!chk(IP, "vreg", decIdx(BC[IP + 3]), E.NVR)) return false;  // b
-				// BC[IP + 4] = pred byte (not a register index)
+				if (!requireIcmp(IP, OP_CMPSEL, BC[IP + 4])) return false;
 				if (!chk(IP, "vreg", decIdx(BC[IP + 5]), E.NVR)) return false;  // t
 				if (!chk(IP, "vreg", decIdx(BC[IP + 6]), E.NVR)) return false;  // f
 				IP += 7; break;
@@ -199,7 +261,7 @@ namespace llvm {
 				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;  // dst
 				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;  // a
 				if (!chk(IP, "vreg", decIdx(BC[IP + 3]), E.NVR)) return false;  // b
-				// BC[IP + 4] = pred byte (EQ/NE, not a register index)
+				if (!requireIcmp(IP, OP_ANDCMPZ, BC[IP + 4])) return false;
 				IP += 5; break;
 			}
 			case OP_ICMP: {
@@ -207,6 +269,7 @@ namespace llvm {
 				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
 				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
 				if (!chk(IP, "vreg", decIdx(BC[IP + 3]), E.NVR)) return false;
+				if (!requireIcmp(IP, OP_ICMP, BC[IP + 4])) return false;
 				IP += 5; break;
 			}
 			case OP_ICMP64: {
@@ -214,17 +277,23 @@ namespace llvm {
 				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
 				if (!chk(IP, "vreg64", decIdx(BC[IP + 2]), E.NVR64)) return false;
 				if (!chk(IP, "vreg64", decIdx(BC[IP + 3]), E.NVR64)) return false;
+				if (!requireIcmp(IP, OP_ICMP64, BC[IP + 4])) return false;
 				IP += 5; break;
 			}
 			case OP_CAST: {
 				if (IP + 4 > BC.size()) return fail(IP, "OP_CAST truncated");
 				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR)) return false;
 				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
+				uint8_t Kind = decodeCast(BC[IP + 3]);
+				if (Kind == 0xFF || (Allowed && !Allowed->allowsCastKind(OP_CAST, Kind)))
+					return fail(IP, "CAST kind not in VM requirement set");
 				IP += 4; break;
 			}
 			case OP_CAST64: {
 				if (IP + 4 > BC.size()) return fail(IP, "OP_CAST64 truncated");
 				unsigned Kind = (unsigned)BC[IP + 3];
+				if (Allowed && !Allowed->allowsCastKind(OP_CAST64, Kind))
+					return fail(IP, "CAST64 kind not in VM requirement set");
 				if (Kind <= (unsigned)C64_SEXT32) {
 					if (!chk(IP, "vreg64", decIdx(BC[IP + 1]), E.NVR64)) return false;
 					if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
@@ -378,6 +447,9 @@ namespace llvm {
 			case OP_SELECT: {
 				if (IP + 6 > BC.size()) return fail(IP, "OP_SELECT truncated");
 				uint8_t Kind = BC[IP + 1];
+				if (Kind > 2) return fail(IP, "OP_SELECT invalid kind");
+				if (Allowed && !Allowed->SelectKinds.test(Kind))
+					return fail(IP, "SELECT kind not in VM requirement set");
 				if (!chk(IP, "vreg", decIdx(BC[IP + 3]), E.NVR)) return false; 
 				if (Kind == 0) {
 					if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
@@ -404,6 +476,7 @@ namespace llvm {
 				if (!chk(IP, "vreg64", decIdx(BC[IP + 1]), E.NVR64)) return false;
 				if (!chk(IP, "vreg64", decIdx(BC[IP + 2]), E.NVR64)) return false;
 				if (!chk(IP, "vreg64", decIdx(BC[IP + 3]), E.NVR64)) return false;
+				if (!requireBin(IP, OP_BINOP64, BC[IP + 4])) return false;
 				IP += 5; break;
 			}
 			case OP_SWITCH: {
@@ -446,11 +519,11 @@ namespace llvm {
 				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;
 				if (!chk(IP, "freg", decIdx(BC[IP + 2]), E.NFR)) return false;
 				if (!chk(IP, "freg", decIdx(BC[IP + 3]), E.NFR)) return false;
-				{
-					uint8_t Sub = BC[IP + 4] & ~(uint8_t)FBS_F32_FLAG;
-					if (Sub > (uint8_t)FBS_FREM)
-						return fail(IP, Twine("OP_BINOP_F invalid subop: ") + Twine((unsigned)Sub));
-				}
+				uint8_t RawSub = BC[IP + 4];
+				uint8_t Sub = decodeFBin(RawSub & ~(uint8_t)FBS_F32_FLAG);
+				bool IsF32 = (RawSub & FBS_F32_FLAG) != 0;
+				if (Sub == 0xFF || (Allowed && !Allowed->allowsFBinSubop(Sub, IsF32)))
+					return fail(IP, "floating BINOP subop/precision not in VM requirement set");
 				IP += 5; break;
 			}
 			case OP_FCMP: {     // dst_vr:u8 a_fr:u8 b_fr:u8 pred:u8 (5 bytes) → result in vreg
@@ -458,6 +531,9 @@ namespace llvm {
 				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR))  return false;  // dst in vreg
 				if (!chk(IP, "freg", decIdx(BC[IP + 2]), E.NFR))  return false;
 				if (!chk(IP, "freg", decIdx(BC[IP + 3]), E.NFR))  return false;
+				uint8_t Pred = decodeFcmp(BC[IP + 4]);
+				if (Pred == 0xFF || (Allowed && !Allowed->FcmpPredicates.test(Pred)))
+					return fail(IP, "FCMP predicate not in VM requirement set");
 				IP += 5; break;
 			}
 			
@@ -470,6 +546,7 @@ namespace llvm {
 					if (K != FK_FPEXT && K != FK_FPTRUNC)
 						return fail(IP, Twine("OP_FCAST_FF invalid kind ") + Twine(K));
 				}
+				if (!requireFCast(IP, OP_FCAST_FF, BC[IP + 3])) return false;
 				IP += 4; break;
 			}
 			case OP_FCAST_FV: {   // dst_vr:u8 src_fr:u8 kind:u8 (4 bytes) — freg→vreg i32
@@ -481,6 +558,7 @@ namespace llvm {
 					if (K != FK_FPTOSI && K != FK_FPTOUI)
 						return fail(IP, Twine("OP_FCAST_FV invalid kind ") + Twine(K));
 				}
+				if (!requireFCast(IP, OP_FCAST_FV, BC[IP + 3])) return false;
 				IP += 4; break;
 			}
 			case OP_FCAST_FV64: { // dst_vr64:u8 src_fr:u8 kind:u8 (4 bytes) — freg→vreg64 i64
@@ -492,6 +570,7 @@ namespace llvm {
 					if (K != FK_FPTOSI64 && K != FK_FPTOUI64)
 						return fail(IP, Twine("OP_FCAST_FV64 invalid kind ") + Twine(K));
 				}
+				if (!requireFCast(IP, OP_FCAST_FV64, BC[IP + 3])) return false;
 				IP += 4; break;
 			}
 			case OP_FCAST_VF: {   // dst_fr:u8 src_vr:u8 kind:u8 (4 bytes) — vreg i32→freg
@@ -503,6 +582,7 @@ namespace llvm {
 					if (K != FK_SITOFP && K != FK_UITOFP)
 						return fail(IP, Twine("OP_FCAST_VF invalid kind ") + Twine(K));
 				}
+				if (!requireFCast(IP, OP_FCAST_VF, BC[IP + 3])) return false;
 				IP += 4; break;
 			}
 			case OP_FCAST_V64F: { // dst_fr:u8 src_vr64:u8 kind:u8 (4 bytes) — vreg64 i64→freg
@@ -514,6 +594,7 @@ namespace llvm {
 					if (K != FK_SI64TOFP && K != FK_UI64TOFP)
 						return fail(IP, Twine("OP_FCAST_V64F invalid kind ") + Twine(K));
 				}
+				if (!requireFCast(IP, OP_FCAST_V64F, BC[IP + 3])) return false;
 				IP += 4; break;
 			}
 
@@ -572,6 +653,9 @@ namespace llvm {
 
 		if (!BlockStarts.count(0))
 			return fail(0, "missing block start at IP=0");
+		for (auto [BranchIP, Target] : PendingTargets)
+			if (!InstructionStarts.count(Target))
+				return fail(BranchIP, "branch target is not an instruction boundary");
 
 		return true;
 	}

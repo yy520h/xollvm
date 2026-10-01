@@ -18,11 +18,11 @@ from ._runner import TestResult, run_test  # re-export for runner.cli
 
 from . import (
     adec, budget, constenc, edge, eh, exhaustive, extended, features, fmerge,
-    passes, seed, strenc, vm,
+    passes, seed, strenc, vm, vm_demand, antidebug,
 )
 
 _MODULES = (passes, features, adec, budget, seed, eh, vm, strenc, constenc,
-            fmerge, edge, extended, exhaustive)
+             fmerge, edge, extended, exhaustive, vm_demand, antidebug)
 
 
 def make_tests(*, extended: bool, exhaustive_combos: bool,

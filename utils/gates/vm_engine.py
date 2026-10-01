@@ -9,6 +9,213 @@ from . import register
 from ._ir import extract_fn_body
 
 
+def _engine_bodies(ir: str) -> list[str]:
+    bodies = []
+    for match in re.finditer(
+            r"^define internal void @(?:\"([^\"]+)\"|([\w.$]+))\(",
+            ir, re.MULTILINE):
+        name = match.group(1) or match.group(2)
+        if name.startswith("__vm_engine"):
+            body = extract_fn_body(ir, name)
+            if body is not None:
+                bodies.append(body)
+    return bodies
+
+
+def _vm_labels(engine: str) -> set[str]:
+    return set(re.findall(r"^vm\.opc\.([\w]+)(?:\.v\d+)?\d*:",
+                          engine, re.MULTILINE))
+
+
+def _semantic_labels(engine: str, prefix: str) -> set[str]:
+    return set(re.findall(r"^" + re.escape(prefix) + r"\.([a-z_]+)\d*\s*:",
+                          engine, re.MULTILINE))
+
+
+def _semantic_ops(engine: str, prefix: str, operations: set[str]) -> set[str]:
+    return _semantic_labels(engine, prefix) & operations
+
+
+_BINOP_OPS = {"add", "sub", "mul", "and", "or", "xor", "shl", "lshr",
+              "ashr", "sdiv", "udiv", "srem", "urem"}
+_FBINOP_OPS = {"add", "sub", "mul", "div", "rem"}
+_ICMP_PREDICATES = {"eq", "ne", "ugt", "uge", "ult", "ule", "sgt", "sge",
+                    "slt", "sle"}
+
+
+def _one_engine(ir: str) -> tuple[str | None, str | None]:
+    engines = _engine_bodies(ir)
+    if not engines:
+        return None, "no internal __vm_engine definition found"
+    if len(engines) != 1:
+        return None, f"expected one compatible engine, found {len(engines)}"
+    return engines[0], None
+
+
+@register("vm_demand_int_add_only")
+def vm_demand_int_add_only(ir: str) -> Optional[str]:
+    engine, error = _one_engine(ir)
+    if error or engine is None:
+        return error or "VM engine body unavailable"
+    labels = _vm_labels(engine)
+    if "binop" not in labels:
+        return "integer-add engine has no OP_BINOP handler"
+    if not re.search(r"^vm\.bo\.add(?:\d*)\s*:", engine, re.MULTILINE):
+        return "integer-add engine lacks an explicit vm.bo.add semantic branch"
+    expected = {"store32", "load32", "binop", "ret_int"}
+    forbidden = sorted(labels - expected)
+    if forbidden:
+        return f"integer-add engine contains handlers outside its demand closure: {forbidden}"
+    extra_subops = sorted(_semantic_ops(engine, "vm.bo", _BINOP_OPS) - {"add"})
+    if extra_subops:
+        return f"integer-add engine contains unused BINOP subops: {extra_subops}"
+    if "urem" in _semantic_ops(engine, "vm.bo", _BINOP_OPS):
+        return "integer-add engine contains unused integer remainder subop"
+    if _semantic_ops(engine, "vm.bof", _FBINOP_OPS):
+        return "integer-add engine contains floating BINOP subops"
+    return None
+
+
+@register("vm_demand_int_mul_no_add")
+def vm_demand_int_mul_no_add(ir: str) -> Optional[str]:
+    engine, error = _one_engine(ir)
+    if error or engine is None:
+        return error or "VM engine body unavailable"
+    labels = _vm_labels(engine)
+    expected = {"store32", "load32", "binop", "ret_int"}
+    forbidden = sorted(labels - expected)
+    if forbidden:
+        return f"integer-mul engine contains handlers outside its demand closure: {forbidden}"
+    if not re.search(r"^vm\.bo\.mul(?:\d*)\s*:", engine, re.MULTILINE):
+        return "integer-mul engine lacks an explicit vm.bo.mul semantic branch"
+    extra_subops = sorted(_semantic_ops(engine, "vm.bo", _BINOP_OPS) - {"mul"})
+    if extra_subops:
+        return f"integer-mul engine contains unused BINOP subops: {extra_subops}"
+    if re.search(r"%vm\.add\w*\s*=\s*add i32", engine):
+        return "integer-mul engine still contains the default integer-add fallback"
+    if re.search(r"^vm\.bo\.def\w*:", engine, re.MULTILINE):
+        return "integer-mul engine still has a permissive vm.bo.def fallback block"
+    return None
+
+
+@register("vm_demand_fadd_only")
+def vm_demand_fadd_only(ir: str) -> Optional[str]:
+    engine, error = _one_engine(ir)
+    if error or engine is None:
+        return error or "VM engine body unavailable"
+    labels = _vm_labels(engine)
+    # 实际发射前会扩宽局部 float alloca，并插入精度转换。
+    expected = {"store_f", "load_f", "fcast_ff", "binop_f", "ret_f"}
+    forbidden = sorted(labels - expected)
+    if forbidden:
+        return f"float-add engine contains handlers outside its demand closure: {forbidden}"
+    if "binop_f" not in labels:
+        return "float-add engine has no OP_BINOP_F handler"
+    if not re.search(r"^vm\.bof\.add(?:\d*)\s*:", engine, re.MULTILINE):
+        return "float-add engine lacks an explicit vm.bof.add semantic branch"
+    extra_subops = sorted(_semantic_ops(engine, "vm.bof", _FBINOP_OPS) - {"add"})
+    if extra_subops:
+        return f"float-add engine contains unused floating BINOP subops: {extra_subops}"
+    return None
+
+
+@register("vm_demand_icmp_eq_only")
+def vm_demand_icmp_eq_only(ir: str) -> Optional[str]:
+    engine, error = _one_engine(ir)
+    if error or engine is None:
+        return error or "VM engine body unavailable"
+    labels = _vm_labels(engine)
+    expected = {"store32", "load32", "icmp", "cast", "ret_int"}
+    forbidden = sorted(labels - expected)
+    if forbidden:
+        return f"icmp-eq engine contains handlers outside its demand closure: {forbidden}"
+    if "icmp" not in labels:
+        return "icmp-eq engine has no OP_ICMP handler"
+    if "icmp64" in labels:
+        return "i32 icmp-eq engine contains the unused OP_ICMP64 handler"
+    icmp_labels = _semantic_ops(engine, "vm.ic", _ICMP_PREDICATES)
+    if "eq" not in icmp_labels:
+        return "icmp-eq engine lacks an explicit vm.ic.eq semantic branch"
+    extra_predicates = sorted(icmp_labels - {"eq"})
+    if extra_predicates:
+        return f"icmp-eq engine contains unused ICMP predicates: {extra_predicates}"
+    return None
+
+
+def _engine_blocks(engine: str) -> dict[str, str]:
+    labels = list(re.finditer(r"^([\w.$]+):[^\n]*\n", engine, re.MULTILINE))
+    return {match.group(1): engine[match.end():labels[i + 1].start()
+                                 if i + 1 < len(labels) else len(engine)]
+            for i, match in enumerate(labels)}
+
+
+def _trap_blocks(blocks: dict[str, str]) -> set[str]:
+    return {name for name, body in blocks.items()
+            if re.search(r"call void @llvm\.trap\(\)", body)
+            and re.search(r"^\s*unreachable\b", body, re.MULTILINE)}
+
+
+@register("vm_demand_invalid_dispatch")
+def vm_demand_invalid_dispatch(ir: str) -> Optional[str]:
+    engines = _engine_bodies(ir)
+    if not engines:
+        return "VM engine missing"
+    for engine in engines:
+        blocks = _engine_blocks(engine)
+        traps = _trap_blocks(blocks)
+        if not traps:
+            return "VM engine lacks an explicit trap/unreachable invalid path"
+        # 只检查 opcode/dmap 索引；变体选择及其他宿主取余仍然合法。
+        if re.search(r"%(?:vm\.safe|vm\.dm\.slot)\d*\s*=\s*urem\b", engine):
+            return "VM dispatch reinterprets an invalid opcode/dmap index using modulo"
+        fetches = [body for body in blocks.values()
+                   if re.search(r"%vm\.oidx\d*\s*=\s*zext\b", body)]
+        if not fetches:
+            return "VM engine has no inspectable opcode fetch"
+        for body in fetches:
+            check = re.search(r"%([\w.$]+)\s*=\s*icmp uge i32 %vm\.oidx\d*, 56\b", body)
+            if check is None:
+                return "VM fetch lacks an opcode-domain bounds check"
+            branch = re.search(r"br i1 %" + re.escape(check.group(1))
+                               + r", label %([\w.$]+), label %([\w.$]+)", body)
+            if branch is None or branch.group(1) not in traps:
+                return "VM opcode bounds failure does not branch to invalid"
+            if re.search(r"%(?:vm\.ohsl|vm\.dm\.p)\d*\s*=", body):
+                return "VM table lookup occurs before the opcode bounds branch"
+            if branch.group(2) not in blocks:
+                return "VM valid-opcode continuation is missing"
+        for successors in re.findall(r"indirectbr[^\[]*\[([^\]]*)\]", engine):
+            if not any(re.search(r"label %" + re.escape(name) + r"(?:,|\s|$)", successors)
+                       for name in traps):
+                return "VM indirectbr does not declare the invalid destination"
+    return None
+
+
+@register("vm_demand_invalid_subop")
+def vm_demand_invalid_subop(ir: str) -> Optional[str]:
+    engine, error = _one_engine(ir)
+    if error or engine is None:
+        return error or "VM engine missing"
+    traps = _trap_blocks(_engine_blocks(engine))
+    defaults = re.findall(r"switch i32 %vm\.bo(?:64)?\.op(?:\.b)?\d*, label %([\w.$]+)", engine)
+    if not defaults:
+        return "VM BINOP has no explicit semantic switch"
+    if any(default not in traps for default in defaults):
+        return "VM BINOP default accepts an invalid subop instead of trapping"
+    return None
+
+
+@register("vm_demand_incompatible_engines")
+def vm_demand_incompatible_engines(ir: str) -> Optional[str]:
+    engines = _engine_bodies(ir)
+    if len(engines) < 2:
+        return "incompatible randISA configurations were merged into one VM engine"
+    refs = re.findall(r"blockaddress\(@(__vm_engine[\w.$]*),", ir)
+    if len(set(refs)) < 2:
+        return "incompatible callers do not reference distinct VM engines"
+    return None
+
+
 @register("vm_engine_exists")
 def vm_engine_exists(ir: str) -> Optional[str]:
     if "define internal void @__vm_engine(" not in ir:
@@ -56,13 +263,8 @@ def vm_engine_has_handlers(ir: str) -> Optional[str]:
     engine = extract_fn_body(ir, "__vm_engine")
     if engine is None:
         return "__vm_engine function body not found"
-    expected = ["loadi", "movr", "binop", "icmp", "cast", "ptrtoint", "inttoptr",
-                "load32", "store32", "gep", "jmp", "jmpc",
-                "ret_void", "ret_int", "ret_ptr",
-                "call_void", "call_int", "call_ptr"]
-    missing = [n for n in expected if not re.search(r"vm\.opc\." + n + r"\b", engine)]
-    if missing:
-        return f"__vm_engine missing handler blocks: {missing}"
+    if not re.search(r"vm\.opc\.[A-Za-z0-9_.]+\b", engine):
+        return "__vm_engine has no opcode handler blocks"
     return None
 
 

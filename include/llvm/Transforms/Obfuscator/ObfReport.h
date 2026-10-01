@@ -4,6 +4,8 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Requirements.h"
+#include <optional>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -14,6 +16,41 @@ namespace llvm::obf {
 
 	// Stable schema version for the JSON obfuscation map.
 	constexpr unsigned kObfReportSchemaVersion = 1;
+
+	struct GraphNode {
+		std::string Id;
+		std::string Label;
+		std::string Type;
+		bool Generated = false;
+	};
+
+	struct GraphEdge {
+		std::string Id;
+		std::string From;
+		std::string To;
+		std::string Type;
+		bool StaticExact = false;
+	};
+
+	struct GraphVMEngine {
+		std::string FunctionId;
+		unsigned EngineId = 0;
+		unsigned HandlerVariants = 0;
+		unsigned Decoys = 0;
+		unsigned HandlerTableEntries = 0;
+		bool EncryptedDispatch = false;
+	};
+
+	struct GraphModel {
+		std::vector<GraphNode> Nodes;
+		std::vector<GraphEdge> Edges;
+		std::vector<GraphVMEngine> VMEngines;
+
+		void addNode(GraphNode N);
+		void addEdge(GraphEdge E);
+	};
+
+	void collectFinalIRGraph(const Module& M, GraphModel& Model);
 
 	struct DifficultyComponents {
 		unsigned Insts = 0;
@@ -82,6 +119,11 @@ namespace llvm::obf {
 		std::string CfgBeforeDot;
 		std::string CfgAfterDot;
 		std::vector<CfgStageArtifact> CfgPerPass;
+		std::optional<VMEngineWitness> VM;
+		bool AntiDebugEnabled = false;
+		std::vector<std::string> AntiDebugDetectors;
+		bool AntiDebugDynamic = false;
+		std::string AntiDebugResponse;
 	};
 
 	struct ObfReportSink {
@@ -99,8 +141,17 @@ namespace llvm::obf {
 	/// True when any report output option is enabled.
 	bool isReportEnabled();
 
+	/// True when the final module/function SVG graph report is enabled.
+	bool isGraphReportEnabled();
+
 	/// Absolute report directory (may be empty).
 	std::string getReportDir();
+
+	/// Absolute graph report directory (may be empty).
+	std::string getGraphReportDir();
+
+	/// Returns "obfuscated" or "direct" for the graph report mode.
+	StringRef getGraphReportMode();
 
 	/// Absolute JSON output path (may be empty). If -obf-report-json is empty and
 	/// -obf-report-dir is set, this returns "<dir>/obf_report.json".
@@ -130,6 +181,9 @@ namespace llvm::obf {
 	/// Writes JSON to the configured output path. If reporting is disabled, this is
 	/// a no-op returning success.
 	Error maybeWriteObfReportJson(Module& M, ModuleAnalysisManager& MAM);
+
+	/// Writes one program call graph SVG and one final CFG SVG per function.
+	Error writeGraphReport(Module& M);
 
 } // namespace llvm::obf
 
