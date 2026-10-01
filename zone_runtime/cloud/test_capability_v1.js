@@ -100,20 +100,44 @@ assert.strictEqual(
 );
 
 function testDispatchBlobPresent() {
+  const serverTime = 1000;
   const event = {
     protocol: "capability_v1",
     software_id: "s", version: "1.0.0", build_id: "b",
     device_id: "hw-device-1", operation: "vm_dispatch",
     state: "00".repeat(16), client_nonce: "11".repeat(16),
-    request_id: "22".repeat(16), client_time: 1000,
+    request_id: "22".repeat(16), client_time: serverTime,
     client_tick: 424242, code_manifest: "sha256-manifest", payload: "p",
   };
-  const response = JSON.parse(capability_v1(event, { serverTime: 1000 }));
+  CODE_CONFIG.kServer = "server-test-secret";
+  CODE_CONFIG.signingPrivateKey = privateKey;
+  CODE_CONFIG.keyId = "test-key-1";
+  const response = JSON.parse(capability_v1(event, { serverTime }));
   if (typeof response.dispatch_blob !== "string" || response.dispatch_blob.length === 0) {
     throw new Error("dispatch_blob missing");
   }
   if (typeof response.window_id !== "string") {
     throw new Error("window_id missing");
+  }
+  assert.strictEqual(response.ok, true);
+  assert.strictEqual(
+    response.window_id,
+    String(Math.floor(serverTime / Number(CODE_CONFIG.validSeconds)))
+  );
+
+  const signed = { ...response };
+  delete signed.signature;
+  assert.strictEqual(
+    crypto.verify(null, Buffer.from(canonicalizeResponse(signed)), publicKey, Buffer.from(response.signature, "base64")),
+    true
+  );
+  for (const field of ["window_id", "dispatch_blob"]) {
+    const tampered = { ...signed, [field]: `${signed[field]}-tampered` };
+    assert.strictEqual(
+      crypto.verify(null, Buffer.from(canonicalizeResponse(tampered)), publicKey, Buffer.from(response.signature, "base64")),
+      false,
+      `signature must cover ${field}`
+    );
   }
 }
 testDispatchBlobPresent();
