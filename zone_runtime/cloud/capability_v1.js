@@ -21,6 +21,7 @@ const REQUEST_FIELDS = [
 const RESPONSE_FIELDS = [
   "protocol", "ok", "operation", "request_hash", "device_id_hash", "next_state",
   "vm_value", "server_time", "issued_at", "expires_at", "policy_version", "key_id",
+  "window_id", "dispatch_blob",
 ];
 
 function canonicalize(fields, value) {
@@ -112,6 +113,13 @@ function capability_v1(event, context, callback) {
   const timeBucket = Math.floor(serverTime / bucketSize);
   const nextState = hmac(serverKey, `state-v1\0${request.state}\0${requestHash}\0${request.client_nonce}\0${timeBucket}\0${request.operation}`);
   const vmValue = hmac(serverKey, `vm-v1\0${nextState}\0${requestHash}\0${request.code_manifest}\0${request.device_id}\0${request.operation}`);
+  const windowSize = Number(CODE_CONFIG.validSeconds);
+  const windowId = String(Math.floor(serverTime / windowSize));
+  const dispatchMessage = [
+    "dispatch-v1", request.device_id, String(request.client_tick),
+    request.client_nonce, windowId, request.code_manifest, request.operation,
+  ].join("\u0000");
+  const dispatchBlob = crypto.sign(null, Buffer.from(dispatchMessage), privateKey).toString("base64");
   const response = {
     protocol: 1,
     ok: true,
@@ -125,6 +133,8 @@ function capability_v1(event, context, callback) {
     expires_at: serverTime + Number(CODE_CONFIG.validSeconds),
     policy_version: Number(CODE_CONFIG.policyVersion),
     key_id: keyId,
+    window_id: windowId,
+    dispatch_blob: dispatchBlob,
   };
   response.signature = crypto.sign(null, Buffer.from(canonicalizeResponse(response)), privateKey).toString("base64");
   return finish(JSON.stringify(response));

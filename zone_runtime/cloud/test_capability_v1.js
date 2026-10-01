@@ -99,4 +99,23 @@ assert.strictEqual(
   true
 );
 
+function testDispatchBlobPresent() {
+  const event = {
+    protocol: "capability_v1",
+    software_id: "s", version: "1.0.0", build_id: "b",
+    device_id: "hw-device-1", operation: "vm_dispatch",
+    state: "00".repeat(16), client_nonce: "11".repeat(16),
+    request_id: "22".repeat(16), client_time: 1000,
+    client_tick: 424242, code_manifest: "sha256-manifest", payload: "p",
+  };
+  const response = JSON.parse(capability_v1(event, { serverTime: 1000 }));
+  if (typeof response.dispatch_blob !== "string" || response.dispatch_blob.length === 0) {
+    throw new Error("dispatch_blob missing");
+  }
+  if (typeof response.window_id !== "string") {
+    throw new Error("window_id missing");
+  }
+}
+testDispatchBlobPresent();
+
 console.log("capability_v1 tests passed");
