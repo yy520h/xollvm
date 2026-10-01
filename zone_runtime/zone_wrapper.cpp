@@ -167,43 +167,14 @@ std::string makeGuardHash(const std::string& nonce,
 	return out.str();
 }
 
-// 构造 vm_dispatch 能力请求；字段与 xollvm_zone_capability_begin 保持一致，
-// 额外加入 client_tick 供云端绑定到派发窗口。nonce 每次请求重新生成。
-std::string buildDispatchRequestJson(const std::string& operation,
-	const std::string& manifest) {
-	ZoneState& s = state();
-	const char* buildId = std::getenv("XOLLVM_ZONE_CAPABILITY_BUILD_ID");
-	const char* deviceId = std::getenv("XOLLVM_ZONE_DEVICE_ID");
-	const std::string buildIdValue = buildId && buildId[0] ? buildId : "";
-	const std::string deviceIdValue = deviceId && deviceId[0] ? deviceId : "";
-	std::string stateValue = s.capabilityClient ? s.capabilityClient->state() : std::string();
-	if (stateValue.empty())
-		stateValue = std::string(32, '0');
-	nlohmann::json requestJson = {
-		{"protocol", "capability_v1"},
-		{"software_id", s.softwareId},
-		{"version", s.version},
-		{"build_id", buildIdValue},
-		{"device_id", deviceIdValue},
-		{"operation", operation},
-		{"state", stateValue},
-		{"client_nonce", randomHex(16)},
-		{"request_id", randomHex(16)},
-		{"client_time", static_cast<uint64_t>(std::time(nullptr))},
-		{"client_tick", xollvm::readClientTick()},
-		{"code_manifest", manifest},
-		{"payload", ""}};
-	return requestJson.dump();
-}
-
-// 解析可能被 Result.RetMsg 多层包裹的响应 JSON，返回指定字符串字段，失败返回空串。
-// 解包逻辑与 xollvm_zone_capability_begin 的 4 层 Result.RetMsg 一致。
-std::string extractJsonString(const std::string& encoded, const char* field) {
+// 从响应 Data.value 中逐层解开 Result.RetMsg 包裹（最多 4 层），
+// 返回最内层的 JSON；解析失败返回 false。capability_begin 与 dispatch 共用此函数。
+bool unwrapResponseJson(const std::string& encoded, nlohmann::json* out) {
 	nlohmann::json json;
 	try {
 		json = nlohmann::json::parse(encoded);
 	} catch (const nlohmann::json::parse_error&) {
-		return std::string();
+		return false;
 	}
 	for (unsigned int unwrapDepth = 0; unwrapDepth < 4; ++unwrapDepth) {
 		const nlohmann::json* wrapped = nullptr;
@@ -218,12 +189,71 @@ std::string extractJsonString(const std::string& encoded, const char* field) {
 		try {
 			json = nlohmann::json::parse(wrapped->get<std::string>());
 		} catch (const nlohmann::json::parse_error&) {
-			return std::string();
+			return false;
 		}
 	}
+	*out = std::move(json);
+	return true;
+}
+
+// 从已解包的 JSON 中取指定字符串字段，缺失或类型不符返回空串。
+std::string jsonStringField(const nlohmann::json& json, const char* field) {
 	if (!json.is_object() || !json.contains(field) || !json[field].is_string())
 		return std::string();
 	return json[field].get<std::string>();
+}
+
+// 解析可能被 Result.RetMsg 多层包裹的响应 JSON，返回指定字符串字段，失败返回空串。
+std::string extractJsonString(const std::string& encoded, const char* field) {
+	nlohmann::json json;
+	if (!unwrapResponseJson(encoded, &json))
+		return std::string();
+	return jsonStringField(json, field);
+}
+
+// 将 CapabilityRequest 序列化为与云端一致的 JSON 请求体；字段定义只此一处，
+// xollvm_zone_capability_begin 与 vm_dispatch 请求共用，避免 schema 漂移。
+nlohmann::json capabilityRequestJson(const xollvm::CapabilityRequest& request) {
+	return {
+		{"protocol", request.protocol}, {"software_id", request.software_id},
+		{"version", request.version}, {"build_id", request.build_id},
+		{"device_id", request.device_id}, {"operation", request.operation},
+		{"state", request.state}, {"client_nonce", request.client_nonce},
+		{"request_id", request.request_id}, {"client_time", request.client_time},
+		{"code_manifest", request.code_manifest}, {"payload", request.payload}};
+}
+
+// 网络调用前在锁内快照的 ZoneState 字段，网络期间只读快照，避免无锁访问。
+struct DispatchSnapshot {
+	std::string softwareId;
+	std::string version;
+	std::string manifest;
+	std::string clientState;
+	std::string buildId;
+	std::string deviceId;
+};
+
+// 构造 vm_dispatch 能力请求；标准字段复用 capabilityRequestJson，
+// 额外加入 client_tick 供云端绑定到派发窗口。nonce 每次请求重新生成。
+std::string buildDispatchRequestJson(const std::string& operation,
+	const DispatchSnapshot& snapshot) {
+	xollvm::CapabilityRequest request;
+	request.protocol = "capability_v1";
+	request.software_id = snapshot.softwareId;
+	request.version = snapshot.version;
+	request.build_id = snapshot.buildId;
+	request.device_id = snapshot.deviceId;
+	request.operation = operation;
+	request.state = snapshot.clientState.empty()
+		? std::string(32, '0') : snapshot.clientState;
+	request.client_nonce = randomHex(16);
+	request.request_id = randomHex(16);
+	request.client_time = static_cast<uint64_t>(std::time(nullptr));
+	request.code_manifest = snapshot.manifest;
+	request.payload = "";
+	nlohmann::json requestJson = capabilityRequestJson(request);
+	requestJson["client_tick"] = xollvm::readClientTick();
+	return requestJson.dump();
 }
 
 } // namespace
@@ -471,43 +501,17 @@ extern "C" int xollvm_zone_capability_begin(const char* operation, const char* p
 		deviceIdHash[i * 2] = hex[deviceDigest[i] >> 4];
 		deviceIdHash[i * 2 + 1] = hex[deviceDigest[i] & 0x0f];
 	}
-	nlohmann::json requestJson = {
-		{"protocol", capabilityRequest.protocol}, {"software_id", capabilityRequest.software_id},
-		{"version", capabilityRequest.version}, {"build_id", capabilityRequest.build_id},
-		{"device_id", capabilityRequest.device_id}, {"operation", capabilityRequest.operation},
-		{"state", capabilityRequest.state}, {"client_nonce", capabilityRequest.client_nonce},
-		{"request_id", capabilityRequest.request_id}, {"client_time", capabilityRequest.client_time},
-		{"code_manifest", capabilityRequest.code_manifest}, {"payload", capabilityRequest.payload}};
 	ApiResponse response;
 	const int requestResult = helper->GetAntiAlgorithmValue(
-		response, "capability_v1", requestJson.dump());
+		response, "capability_v1", capabilityRequestJson(capabilityRequest).dump());
 	if (requestResult != 1 || response.Data.value.empty()) {
 		std::cerr << "Zone capability request failed\n";
 		return 0;
 	}
 	nlohmann::json json;
-	try {
-		json = nlohmann::json::parse(response.Data.value);
-	} catch (const nlohmann::json::parse_error&) {
+	if (!unwrapResponseJson(response.Data.value, &json)) {
 		std::cerr << "Zone capability rejected: malformed response JSON\n";
 		return 0;
-	}
-	for (unsigned int unwrapDepth = 0; unwrapDepth < 4; ++unwrapDepth) {
-		const nlohmann::json* encoded = nullptr;
-		if (json.is_string()) {
-			encoded = &json;
-		} else if (json.is_object() && json.contains("Result") && json["Result"].is_object() &&
-			json["Result"].contains("RetMsg") && json["Result"]["RetMsg"].is_string()) {
-			encoded = &json["Result"]["RetMsg"];
-		} else {
-			break;
-		}
-		try {
-			json = nlohmann::json::parse(encoded->get<std::string>());
-		} catch (const nlohmann::json::parse_error&) {
-			std::cerr << "Zone capability rejected: malformed wrapped response JSON\n";
-			return 0;
-		}
 	}
 	if (!json.is_object()) {
 		std::cerr << "Zone capability rejected: response root is not an object\n";
@@ -614,14 +618,26 @@ extern "C" void xollvm_zone_capability_clear(void) {
 extern "C" int xollvm_zone_vm_dispatch_refresh(void) {
 	ZoneState& s = state();
 	std::unique_lock<std::mutex> lock(s.mutex);
-	if (!s.helper || !s.loggedIn || !s.capabilityClient || s.algorithm != "capability_v1")
+	if (!s.helper || !s.loggedIn || !s.leaseValid || !s.capabilityClient ||
+		s.algorithm != "capability_v1")
 		return 0;
+	// 网络调用前在锁内快照所有需要的状态，解锁后只读快照。
+	xollvm::CapabilityClient* client = s.capabilityClient.get();
+	DispatchSnapshot snapshot;
+	snapshot.softwareId = s.softwareId;
+	snapshot.version = s.version;
+	snapshot.manifest = s.capabilityBuildManifest;
+	snapshot.clientState = client->state();
+	const char* buildId = std::getenv("XOLLVM_ZONE_CAPABILITY_BUILD_ID");
+	const char* deviceId = std::getenv("XOLLVM_ZONE_DEVICE_ID");
+	snapshot.buildId = buildId && buildId[0] ? buildId : "";
+	snapshot.deviceId = deviceId && deviceId[0] ? deviceId : "";
 	const std::string operation = "vm_dispatch";
-	const std::string manifest = s.capabilityBuildManifest;
 	ZoneHelper* helper = s.helper.get();
 	lock.unlock();
 	ApiResponse response;
-	if (helper->GetAntiAlgorithmValue(response, "capability_v1", buildDispatchRequestJson(operation, manifest)) != 1 ||
+	if (helper->GetAntiAlgorithmValue(response, "capability_v1",
+			buildDispatchRequestJson(operation, snapshot)) != 1 ||
 		response.Data.value.empty())
 		return 0;
 	const std::string signedBlob = extractJsonString(response.Data.value, "dispatch_blob");
@@ -631,6 +647,11 @@ extern "C" int xollvm_zone_vm_dispatch_refresh(void) {
 	const uint64_t tick = xollvm::readClientTick();
 	const std::string key = xollvm::deriveDispatchKey(signedBlob, tick);
 	lock.lock();
+	// 回写前复核 generation：客户端未被替换、仍登录且租约有效，否则丢弃结果。
+	if (s.capabilityClient.get() != client || !s.loggedIn || !s.leaseValid) {
+		lock.unlock();
+		return 0;
+	}
 	s.dispatchSignedBlob = signedBlob;
 	s.dispatchWindowId = windowId;
 	s.dispatchKey = key;

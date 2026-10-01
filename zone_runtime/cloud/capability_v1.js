@@ -11,6 +11,7 @@ MC4CAQAwBQYDK2VwBCIEIKYtg9+dXA9mqw8j15fMlppe2kvS/MjSyS5qSiVty8N/
   keyId: "key-1",
   bucketSeconds: 60,
   validSeconds: 300,
+  dispatchWindowSeconds: 60,
   policyVersion: 1,
 };
 
@@ -113,7 +114,7 @@ function capability_v1(event, context, callback) {
   const timeBucket = Math.floor(serverTime / bucketSize);
   const nextState = hmac(serverKey, `state-v1\0${request.state}\0${requestHash}\0${request.client_nonce}\0${timeBucket}\0${request.operation}`);
   const vmValue = hmac(serverKey, `vm-v1\0${nextState}\0${requestHash}\0${request.code_manifest}\0${request.device_id}\0${request.operation}`);
-  const windowSize = Number(CODE_CONFIG.validSeconds);
+  const windowSize = Number(CODE_CONFIG.dispatchWindowSeconds);
   const windowId = String(Math.floor(serverTime / windowSize));
   const dispatchMessage = [
     "dispatch-v1", request.device_id, String(request.client_tick),

@@ -122,7 +122,13 @@ function testDispatchBlobPresent() {
   assert.strictEqual(response.ok, true);
   assert.strictEqual(
     response.window_id,
-    String(Math.floor(serverTime / Number(CODE_CONFIG.validSeconds)))
+    String(Math.floor(serverTime / Number(CODE_CONFIG.dispatchWindowSeconds)))
+  );
+  assert.strictEqual(CODE_CONFIG.dispatchWindowSeconds, 60);
+  assert.notStrictEqual(
+    Number(CODE_CONFIG.dispatchWindowSeconds),
+    Number(CODE_CONFIG.validSeconds),
+    "dispatch window must be distinct from capability validity"
   );
 
   const signed = { ...response };
