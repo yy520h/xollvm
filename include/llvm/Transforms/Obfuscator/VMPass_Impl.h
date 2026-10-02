@@ -364,6 +364,7 @@ namespace llvm {
 		const bool     NestedVMHardened; // reserved: harden the inner VM layer
 		const bool     ThreadedDispatch; // inline fetch/decode/indirectbr into every handler's back-edge; no central vm.dispatch/vm.fetch
 		const bool     KeyedDispatch;    // XOR each opcode byte with a per-IP compile-time key at emit/fetch time
+		const bool     CloudDispatch;    // dispatch 索引叠加运行时云值 offset（合法值=0）；错误/过期值越界自然崩溃
 		const bool     SuperOps;         // fuse eligible i32 mul+add chains into one OP_MULADD opcode at emission
 		const bool     BindAntiDebug;    // fold anti-debug detection into the AES round-key mask instead of salt-poisoning traps
 		const bool     RandISA;          // per-build permutation of semantic operand-field byte encodings (currently BinSubop)
@@ -374,7 +375,9 @@ namespace llvm {
 		// including the helper's own inner-virtualization, wants the plain one).
 		// The poolIdx (P10) selects which of EnginePoolSize structurally-distinct
 		// engines this function runs; poolIdx 0 reproduces the pre-pool ids 0/1.
-		const unsigned EngineId;
+		// Non-const so the plan coordinator can split groups whose configs share
+		// a base id into separate engines before commit().
+		unsigned EngineId;
 		// Number of distinct engines in the module pool (P10, Cfg.enginePoolSize
 		// clamped to >=1). 1 = single shared engine (byte-identical to pre-pool).
 		const unsigned EnginePoolSize;
@@ -572,6 +575,7 @@ namespace llvm {
 			NestedVMHardened(Cfg.nestedVMHardened),
 			ThreadedDispatch(Cfg.threadedDispatch),
 			KeyedDispatch(Cfg.keyedDispatch),
+			CloudDispatch(Cfg.cloudDispatch),
 			SuperOps(Cfg.superOps),
 			BindAntiDebug(Cfg.bindAntiDebug),
 			RandISA(Cfg.randISA),
@@ -918,6 +922,17 @@ namespace llvm {
 			BasicBlock* BB = BasicBlock::Create(Ctx,
 				"vm.opc." + Name + ".v" + Twine(CurVariant), HFn);
 			OpcBB[Opc][CurVariant] = BB; return IRBuilder<>(BB);
+		}
+
+		// Emit a trapping invalid path: `call void @llvm.trap(); unreachable`.
+		// Used for the VM engine's invalid dispatch/handler blocks so an
+		// out-of-domain opcode or subop faults rather than falling through.
+		void emitTrapBlock(BasicBlock* BB) {
+			FunctionCallee Trap = M.getOrInsertFunction(
+				"llvm.trap", FunctionType::get(Type::getVoidTy(Ctx), false));
+			IRBuilder<> B(BB);
+			B.CreateCall(Trap);
+			B.CreateUnreachable();
 		}
 
 		// ── CALL handler support ─────────────────────────────────────────────

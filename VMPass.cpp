@@ -130,6 +130,7 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC) {
 	getBool("nestedVMHardened", Cfg.nestedVMHardened);
 	getBool("threadedDispatch", Cfg.threadedDispatch);
 	getBool("keyedDispatch", Cfg.keyedDispatch);
+	getBool("cloudDispatch", Cfg.cloudDispatch);
 	getBool("superOps", Cfg.superOps);
 	getBool("randISA", Cfg.randISA);
 	getUInt("enginePoolSize", Cfg.enginePoolSize);
@@ -200,6 +201,9 @@ PreservedAnalyses VMPass::run(Function& F, FunctionAnalysisManager& AM) {
 			VMEngine::enginePoolOf(Impl->EngineId), Impl->EngineId, VCtx.MasterSeed,
 			&Impl->AntiDebug);
 		Coordinator->addPrepared(std::move(Impl), VCtx.Cfg, Key);
+		// Tag the caller so the report can attach a VM witness to it (the full
+		// engine witness is finalized by the coordinator after commit).
+		F.setMetadata("obf.vm.caller", MDNode::get(F.getContext(), {}));
 		return PreservedAnalyses::all();
 	}
 	if (!Impl->run()) {
@@ -227,5 +231,6 @@ PreservedAnalyses VMPass::run(Function& F, FunctionAnalysisManager& AM) {
 		<< (VCtx.Cfg.hardened ? " |hardened" : "")
 		<< "]\n";
 
+	F.setMetadata("obf.vm.caller", MDNode::get(F.getContext(), {}));
 	return PreservedAnalyses::none();
 }

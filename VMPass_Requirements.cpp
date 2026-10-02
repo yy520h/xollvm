@@ -344,6 +344,7 @@ unsigned EnginePool, unsigned EngineOwner, uint64_t MappingSeed,
 	VM_BOOL(rollingRegKey); VM_BOOL(antiDebug); VM_BOOL(bindAntiDebug);
 	VM_BOOL(nestedVM); VM_BOOL(nestedVMHardened); VM_BOOL(threadedDispatch);
 	VM_BOOL(keyedDispatch); VM_BOOL(superOps); VM_BOOL(randISA);
+	VM_BOOL(cloudDispatch);
 	VM_BOOL(metamorphicEngines); VM_BOOL(perFnEngine);
 #undef VM_BOOL
 	Key.BoolFields = Key.Fields.size();

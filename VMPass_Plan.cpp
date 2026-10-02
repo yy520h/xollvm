@@ -3,6 +3,8 @@
 
 #include "llvm/ADT/STLExtras.h"
 
+#include <set>
+
 using namespace llvm;
 
 static thread_local VMPlanCoordinator* ActiveCoordinator = nullptr;
@@ -51,6 +53,30 @@ bool VMPlanCoordinator::freeze() {
 	}
 	for (auto& Group : Groups)
 		Group.Plan.Requirements.closeDependencies(Group.Plan.Config);
+
+	// Distinct EngineConfigKeys may map to the same base EngineId (e.g. two
+	// functions in a single-engine module whose configs differ only in
+	// randISA -- prepare() runs before pooling assigns ids). Left alone they
+	// would both build @__vm_engine and silently merge into one engine. Give
+	// every colliding group a fresh pool id, derived from its key hash, so
+	// incompatible configurations get physically separate engines. The first
+	// (uncollided) group keeps its id, preserving single-config builds.
+	{
+		std::set<unsigned> Used;
+		for (auto& Group : Groups) {
+			unsigned Base = Group.Candidates.front()->Impl->EngineId;
+			if (Used.insert(Base).second) {
+				Group.Plan.EngineId = Base;
+				continue;
+			}
+			unsigned Layer = VMEngine::engineLayer(Base);
+			unsigned Pool = (unsigned)(Group.Plan.Key.stableHash() & 0x3FFFFFFFu) | 0x40000000u;
+			unsigned New = VMEngine::makeEngineId(Pool, Layer);
+			while (!Used.insert(New).second)
+				New = VMEngine::makeEngineId(++Pool, Layer);
+			Group.Plan.EngineId = New;
+		}
+	}
 	Frozen = true;
 	return true;
 }
@@ -79,6 +105,9 @@ bool VMPlanCoordinator::commit() {
 		if (!Candidate->Accepted || !Candidate->Impl) continue;
 		const VMEnginePlan* Plan = planFor(Candidate->Key);
 		if (!Plan) return false;
+		// Apply the group's (possibly reassigned) engine id. prepare() does not
+		// bind EngineId; the engine function/state are built here in commit().
+		Candidate->Impl->EngineId = Plan->EngineId;
 		// Nested helpers are currently prepared during commit; their requirements
 		// are not frozen into the outer plan yet, so keep the complete handler
 		// domain for nested groups until helper closure moves before freeze.

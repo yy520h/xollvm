@@ -24,6 +24,7 @@
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
 #include "llvm/Transforms/Obfuscator/OpaqueUtils.h"
+#include "llvm/Transforms/Obfuscator/Utils.h"
 #include "llvm/Transforms/Obfuscator/MBAUtils.h"
 #include "llvm/Transforms/Obfuscator/Rng.h"
 
@@ -838,6 +839,27 @@ void VMImpl::flattenWrapper() {
 		Blocks.push_back(&BB);
 	}
 	if (Blocks.size() < 3) return; // too few blocks to flatten
+
+	// Flattening makes every block a switch case reachable directly from the
+	// dispatcher, so a value defined in one phase and consumed in another no
+	// longer has a dominating definition on all CFG paths (verifier:
+	// "Instruction does not dominate all uses"). Demote cross-block values and
+	// PHIs to stack slots before touching the CFG; the dispatcher then only
+	// reads them from memory, which is dominance-safe. Unlike Flattening.cpp we
+	// deliberately do NOT promote them back -- that would immediately
+	// reintroduce the violation on the flattened CFG.
+	{
+		llvm::SmallVector<llvm::AllocaInst*, 32> Demoted;
+		llvm::obf::demoteForCFGChange(F, Demoted);
+	}
+	// PHI demotion can split critical edges and add blocks; re-collect so those
+	// new blocks also become switch cases.
+	Blocks.clear();
+	for (BasicBlock& BB : F) {
+		if (&BB == EntryBB) continue;
+		Blocks.push_back(&BB);
+	}
+	if (Blocks.size() < 3) return;
 
 	// Assign random state tags to each block.
 	DenseMap<BasicBlock*, uint32_t> StateMap;

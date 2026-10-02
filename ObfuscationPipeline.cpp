@@ -139,7 +139,13 @@ ObfuscationPipeline::getOrderingRules() {
 		// after vcall the call sites have indirect (runtime) callees,
 		// which vm cannot emit into its constant CalleeTab.
 		/*before=*/ {"mba", "substitution", "split", "sdiff", "bcf"},
-		/*after=*/  {"vcall", "shield", "adec"},
+		// antidebug must run *after* vm: the standalone AntiDebugPass injects
+		// an entry guard whose fail path adds a second value-returning ret,
+		// which isVMEligible() rejects ("multi-value-return"). The VM pass
+		// consumes the same antidebug config itself and builds the detection
+		// gates into the shared engine, so the wrapper is the right place for
+		// the standalone pass's response-corrupt guard.
+		/*after=*/  {"vcall", "shield", "adec", "antidebug"},
 		/*conflicts=*/ {"flattening"},  // both restructure the whole CFG
     };
 

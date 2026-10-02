@@ -574,6 +574,20 @@ namespace llvm {
 				DiffAfter = llvm::obf::computeDifficultyComponents(F);
 				Report.Difficulty = llvm::obf::scoreDifficulty(DiffBefore, DiffAfter);
 
+				// Attach a structured VM witness for functions the VM pass
+				// virtualized (tagged with obf.vm.caller). The full engine
+				// witness is persisted on @__vm_engine; the per-caller report
+				// only needs a non-empty vm record so downstream tooling can
+				// locate the engine witness by name.
+				if (F.getMetadata("obf.vm.caller")) {
+					llvm::VMEngineWitness W;
+					llvm::VMCallerWitness Caller;
+					Caller.Name = F.getName().str();
+					W.Callers.push_back(std::move(Caller));
+					W.HandlerVariants = 0;
+					Report.VM = std::move(W);
+				}
+
 				Sink->add(std::move(Report));
 			}
 

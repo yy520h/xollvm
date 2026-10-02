@@ -67,9 +67,11 @@ void VMImpl::buildOpcodeHandlers() {
 void VMImpl::buildHandlersIntArith() {
 	if (!needsOpcode(OP_LOADI) && !needsOpcode(OP_LOADI64) && !needsOpcode(OP_MOVR) &&
 		!needsOpcode(OP_BINOP) && !needsOpcode(OP_BINOP64) && !needsOpcode(OP_MULADD) &&
-		!needsOpcode(OP_SHLADD) && !needsOpcode(OP_CMPSEL) && !needsOpcode(OP_ANDCMPZ)) return;
+		!needsOpcode(OP_SHLADD) && !needsOpcode(OP_CMPSEL) && !needsOpcode(OP_ANDCMPZ) &&
+		!needsOpcode(OP_ICMP) && !needsOpcode(OP_ICMP64) && !needsOpcode(OP_CAST) &&
+		!SuperOps) return;
 	//  OP_LOADI  [dst:u8 imm:u32le] -- vreg[dst] = imm 
-	if (needsOpcode(OP_BINOP)) {
+	if (needsOpcode(OP_LOADI)) {
 		auto B = mkOpc(OP_LOADI, "loadi");
 		Value* IP = advIP(B, 5);
 		stVR(B, rdVR(B, IP, 0, "vm.li.d"), rdU32(B, IP, 1, "vm.li.i"));
@@ -77,7 +79,7 @@ void VMImpl::buildHandlersIntArith() {
 	}
 
 	//  OP_LOADI64  [dst64:u8 imm:i64le] -- vreg64[dst] = imm
-	if (needsOpcode(OP_BINOP64)) {
+	if (needsOpcode(OP_LOADI64)) {
 		auto B = mkOpc(OP_LOADI64, "loadi64");
 		Value* IP = advIP(B, 9);
 		Value* Dst = rdVR64(B, IP, 0, "vm.li64.d");
@@ -89,7 +91,7 @@ void VMImpl::buildHandlersIntArith() {
 	}
 
 	//  OP_MOVR  [dst:u8 src:u8] -- vreg[dst] = vreg[src]
-	{
+	if (needsOpcode(OP_MOVR)) {
 		auto B = mkOpc(OP_MOVR, "movr");
 		Value* IP = advIP(B, 2);
 		stVR(B, rdVR(B, IP, 0, "vm.mr.d"), ldVR(B, rdVR(B, IP, 1, "vm.mr.s")));
@@ -98,7 +100,7 @@ void VMImpl::buildHandlersIntArith() {
 
 	//  OP_BINOP  -- [dst:u8 a:u8 b:u8 subop:u8] 
 	// NOTE: must not speculatively execute div/rem for other subops (would trap on BV==0).
-	{
+	if (needsOpcode(OP_BINOP)) {
 		auto B = mkOpc(OP_BINOP, "binop");
 		Value* IP = advIP(B, 4);
 		Value* Dst = rdVR(B, IP, 0, "vm.bo.d");
@@ -121,7 +123,7 @@ void VMImpl::buildHandlersIntArith() {
 		} else {
 			BasicBlock* MergeBB = BasicBlock::Create(Ctx, "vm.bo.merge", HFn);
 			BasicBlock* DefBB = BasicBlock::Create(Ctx, "vm.bo.invalid", HFn);
-			IRBuilder<>(DefBB).CreateUnreachable();
+			emitTrapBlock(DefBB);
 
 
 			unsigned CaseCount = 0;
@@ -161,7 +163,7 @@ void VMImpl::buildHandlersIntArith() {
 	}
 
 	//  OP_MULADD  -- [dst:u8 a:u8 b:u8 c:u8] -- dst = a*b + c (i32, superOps fusion)
-	{
+	if (SuperOps || needsOpcode(OP_MULADD)) {
 		auto B = mkOpc(OP_MULADD, "muladd");
 		Value* IP = advIP(B, 4);
 		Value* Dst = rdVR(B, IP, 0, "vm.ma.d");
@@ -177,7 +179,7 @@ void VMImpl::buildHandlersIntArith() {
 	}
 
 	//  OP_SHLADD -- [dst:u8 a:u8 b:u8 c:u8] -- dst = (a<<b) + c (i32, superOps fusion)
-	{
+	if (SuperOps || needsOpcode(OP_SHLADD)) {
 		auto B = mkOpc(OP_SHLADD, "shladd");
 		Value* IP = advIP(B, 4);
 		Value* Dst = rdVR(B, IP, 0, "vm.sa.d");
@@ -193,7 +195,7 @@ void VMImpl::buildHandlersIntArith() {
 	}
 
 	//  OP_CMPSEL -- [dst:u8 a:u8 b:u8 pred:u8 t:u8 f:u8] -- dst = (a <pred> b) ? t : f  (i32, superOps fusion)
-	{
+	if (SuperOps || needsOpcode(OP_CMPSEL)) {
 		auto B = mkOpc(OP_CMPSEL, "cmpsel");
 		Value* IP = advIP(B, 6);
 		Value* Dst = rdVR(B, IP, 0, "vm.cs.d");
@@ -223,7 +225,7 @@ void VMImpl::buildHandlersIntArith() {
 	}
 
 	//  OP_ANDCMPZ -- [dst:u8 a:u8 b:u8 pred:u8] -- dst = ((a&b) <eq|ne> 0) (i32 0/1, superOps fusion)
-	{
+	if (SuperOps || needsOpcode(OP_ANDCMPZ)) {
 		auto B = mkOpc(OP_ANDCMPZ, "andcmpz");
 		Value* IP = advIP(B, 4);
 		Value* Dst = rdVR(B, IP, 0, "vm.ac.d");
@@ -245,7 +247,7 @@ void VMImpl::buildHandlersIntArith() {
 
 	//  OP_BINOP64 -- [dst64:u8 a64:u8 b64:u8 subop:u8]
 	// NOTE: must not speculatively execute div/rem for other subops (would trap on BV==0).
-	{
+	if (needsOpcode(OP_BINOP64)) {
 		auto B = mkOpc(OP_BINOP64, "binop64");
 		Value* IP = advIP(B, 4);
 		Value* Dst = rdVR64(B, IP, 0, "vm.bo64.d");
@@ -266,7 +268,7 @@ void VMImpl::buildHandlersIntArith() {
 		} else {
 			BasicBlock* MergeBB = BasicBlock::Create(Ctx, "vm.bo64.merge", HFn);
 			BasicBlock* DefBB = BasicBlock::Create(Ctx, "vm.bo64.invalid", HFn);
-			IRBuilder<>(DefBB).CreateUnreachable();
+			emitTrapBlock(DefBB);
 
 			unsigned CaseCount = 0;
 			for (unsigned S = 0; S < ISAEnc::kNumBinSubop; ++S)
@@ -304,7 +306,7 @@ void VMImpl::buildHandlersIntArith() {
 		}
 	}
 	//  OP_ICMP -- [dst:u8 a:u8 b:u8 pred:u8] 
-	{
+	if (needsOpcode(OP_ICMP)) {
 		auto B = mkOpc(OP_ICMP, "icmp");
 		Value* IP = advIP(B, 4);
 		Value* Dst = rdVR(B, IP, 0, "vm.ic.d"), * AIdx = rdVR(B, IP, 1, "vm.ic.a");
@@ -318,22 +320,48 @@ void VMImpl::buildHandlersIntArith() {
 			stVR(B, Dst, Rv);
 			nextInsn(B);
 		} else {
+			// Explicit per-predicate dispatch: each needed ICMP predicate gets
+			// its own vm.ic.<pred> block (mirrors BINOP's semantic switch), so
+			// the engine's demand closure names the exact predicates used and
+			// an undeclared predicate falls to a trapping default.
 			using P = CmpInst::Predicate;
-			Value* Cs[] = {
-			  B.CreateICmpEQ(AV,BV), B.CreateICmpNE(AV,BV),
-			  B.CreateICmpUGT(AV,BV), B.CreateICmpUGE(AV,BV),
-			  B.CreateICmpULT(AV,BV), B.CreateICmpULE(AV,BV),
-			  B.CreateICmpSGT(AV,BV), B.CreateICmpSGE(AV,BV),
-			  B.CreateICmpSLT(AV,BV), B.CreateICmpSLE(AV,BV),
-			};
 			P Ps[] = { P::ICMP_EQ,P::ICMP_NE,P::ICMP_UGT,P::ICMP_UGE,P::ICMP_ULT,
 					P::ICMP_ULE,P::ICMP_SGT,P::ICMP_SGE,P::ICMP_SLT,P::ICMP_SLE };
-			Value* R = B.getInt1(false);
-			for (unsigned i = 0; i < 10; i++) {
-				if (!needsIcmpPredicate(OP_ICMP, (uint8_t)Ps[i])) continue;
-				R = B.CreateSelect(B.CreateICmpEQ(Pred, B.getInt32(IsaEnc.encIcmpPred((uint8_t)Ps[i]))), Cs[i], R);
-			}
-			stVR(B, Dst, B.CreateZExt(R, I32Ty, "vm.ic.r")); nextInsn(B);
+
+			BasicBlock* MergeBB = BasicBlock::Create(Ctx, "vm.ic.merge", HFn);
+			BasicBlock* DefBB = BasicBlock::Create(Ctx, "vm.ic.invalid", HFn);
+			emitTrapBlock(DefBB);
+
+			unsigned CaseCount = 0;
+			for (unsigned i = 0; i < 10; ++i)
+				CaseCount += needsIcmpPredicate(OP_ICMP, (uint8_t)Ps[i]);
+			SwitchInst* SW = B.CreateSwitch(Pred, DefBB, CaseCount);
+
+			IRBuilder<> BM(MergeBB);
+			auto* Phi = BM.CreatePHI(I32Ty, 10, "vm.ic.r");
+			stVR(BM, Dst, Phi);
+			nextInsn(BM);
+
+			auto addCase = [&](uint8_t Pred, const Twine& BBName, auto Emit) {
+				if (!needsIcmpPredicate(OP_ICMP, Pred)) return;
+				BasicBlock* CBB = BasicBlock::Create(Ctx, BBName, HFn);
+				IRBuilder<> BC(CBB);
+				Value* R = Emit(BC);
+				Phi->addIncoming(R, CBB);
+				BC.CreateBr(MergeBB);
+				SW->addCase(B.getInt32(IsaEnc.encIcmpPred(Pred)), CBB);
+				};
+
+			addCase((uint8_t)P::ICMP_EQ,  "vm.ic.eq",  [&](IRBuilder<>& BC) { return BC.CreateZExt(BC.CreateICmpEQ(AV,BV), I32Ty, "vm.ic.r"); });
+			addCase((uint8_t)P::ICMP_NE,  "vm.ic.ne",  [&](IRBuilder<>& BC) { return BC.CreateZExt(BC.CreateICmpNE(AV,BV), I32Ty, "vm.ic.r"); });
+			addCase((uint8_t)P::ICMP_UGT, "vm.ic.ugt", [&](IRBuilder<>& BC) { return BC.CreateZExt(BC.CreateICmpUGT(AV,BV), I32Ty, "vm.ic.r"); });
+			addCase((uint8_t)P::ICMP_UGE, "vm.ic.uge", [&](IRBuilder<>& BC) { return BC.CreateZExt(BC.CreateICmpUGE(AV,BV), I32Ty, "vm.ic.r"); });
+			addCase((uint8_t)P::ICMP_ULT, "vm.ic.ult", [&](IRBuilder<>& BC) { return BC.CreateZExt(BC.CreateICmpULT(AV,BV), I32Ty, "vm.ic.r"); });
+			addCase((uint8_t)P::ICMP_ULE, "vm.ic.ule", [&](IRBuilder<>& BC) { return BC.CreateZExt(BC.CreateICmpULE(AV,BV), I32Ty, "vm.ic.r"); });
+			addCase((uint8_t)P::ICMP_SGT, "vm.ic.sgt", [&](IRBuilder<>& BC) { return BC.CreateZExt(BC.CreateICmpSGT(AV,BV), I32Ty, "vm.ic.r"); });
+			addCase((uint8_t)P::ICMP_SGE, "vm.ic.sge", [&](IRBuilder<>& BC) { return BC.CreateZExt(BC.CreateICmpSGE(AV,BV), I32Ty, "vm.ic.r"); });
+			addCase((uint8_t)P::ICMP_SLT, "vm.ic.slt", [&](IRBuilder<>& BC) { return BC.CreateZExt(BC.CreateICmpSLT(AV,BV), I32Ty, "vm.ic.r"); });
+			addCase((uint8_t)P::ICMP_SLE, "vm.ic.sle", [&](IRBuilder<>& BC) { return BC.CreateZExt(BC.CreateICmpSLE(AV,BV), I32Ty, "vm.ic.r"); });
 		}
 	}
 
@@ -343,7 +371,7 @@ void VMImpl::buildHandlersIntArith() {
 
 
 	//  OP_ICMP64 -- [dst:u8 a:u8 b:u8 pred:u8] 
-	{
+	if (needsOpcode(OP_ICMP64)) {
 		auto B = mkOpc(OP_ICMP64, "icmp64");
 		Value* IP = advIP(B, 4);
 		Value* Dst = rdVR(B, IP, 0, "vm.ic64.d");
@@ -383,7 +411,7 @@ void VMImpl::buildHandlersIntArith() {
 
 
 	//  OP_CAST -- [dst:u8 src:u8 kind:u8] 
-	{
+	if (needsOpcode(OP_CAST)) {
 		auto B = mkOpc(OP_CAST, "cast");
 		Value* IP = advIP(B, 3);
 		Value* Dst = rdVR(B, IP, 0, "vm.ca.d"), * Src = rdVR(B, IP, 1, "vm.ca.s"), * Kind = rdByte(B, IP, 2, "vm.ca.k");
@@ -415,7 +443,7 @@ void VMImpl::buildHandlersConv() {
 		!needsOpcode(OP_CAST) && !needsOpcode(OP_CAST64) && !needsOpcode(OP_PTRTOINT64)) return;
 	//  OP_SELECT -- [kind:u8 dst:u8 cond:u8 t:u8 f:u8] 
 	// kind 0: integer vregs (dst/t/f are VR) ; kind 1: pointer pregs (dst/t/f are PR) ; kind 2: i64 vregs (dst/t/f are VR64)
-	{
+	if (needsOpcode(OP_SELECT)) {
 		auto B = mkOpc(OP_SELECT, "select");
 		Value* IP = advIP(B, 5);
 		Value* Kind = rdByte(B, IP, 0, "vm.sl.k");
@@ -482,7 +510,7 @@ void VMImpl::buildHandlersConv() {
 		}
 	}
 	//  OP_PTRTOINT -- [dst:u8 srcp:u8] 
-	{
+	if (needsOpcode(OP_PTRTOINT)) {
 		auto B = mkOpc(OP_PTRTOINT, "ptrtoint");
 		Value* IP = advIP(B, 2);
 		Value* Dst = rdVR(B, IP, 0, "vm.pi.d"), * SP = rdPR(B, IP, 1, "vm.pi.s");
@@ -491,7 +519,7 @@ void VMImpl::buildHandlersConv() {
 
 
 	//  OP_CAST64 -- [dst:u8 src:u8 kind:u8] 
-	{
+	if (needsOpcode(OP_CAST64)) {
 		auto B = mkOpc(OP_CAST64, "cast64");
 		Value* IP = advIP(B, 3);
 		Value* Kind = rdByte(B, IP, 2, "vm.c64.k");
@@ -564,7 +592,7 @@ void VMImpl::buildHandlersConv() {
 
 
 	//  OP_PTRTOINT64 -- [dst64:u8 srcp:u8] 
-	{
+	if (needsOpcode(OP_PTRTOINT64)) {
 		auto B = mkOpc(OP_PTRTOINT64, "ptrtoint64");
 		Value* IP = advIP(B, 2);
 		Value* Dst = rdVR64(B, IP, 0, "vm.pi64.d"), * SP = rdPR(B, IP, 1, "vm.pi64.s");
@@ -573,7 +601,7 @@ void VMImpl::buildHandlersConv() {
 
 
 	//  OP_INTTOPTR -- [dstp:u8 src:u8] 
-	{
+	if (needsOpcode(OP_INTTOPTR)) {
 		auto B = mkOpc(OP_INTTOPTR, "inttoptr");
 		Value* IP = advIP(B, 2);
 		Value* DP = rdPR(B, IP, 0, "vm.pp.d"), * Src = rdVR(B, IP, 1, "vm.pp.s");
@@ -588,7 +616,7 @@ void VMImpl::buildHandlersMem() {
 		!needsOpcode(OP_LOAD16) && !needsOpcode(OP_STORE16) && !needsOpcode(OP_LOADPTR) &&
 		!needsOpcode(OP_STOREPTR) && !needsOpcode(OP_GEP) && !needsOpcode(OP_GEP64)) return;
 	//  OP_LOAD32 -- [dst:u8 ptrreg:u8] 
-	{
+	if (needsOpcode(OP_LOAD32)) {
 		auto B = mkOpc(OP_LOAD32, "load32");
 		Value* IP = advIP(B, 2);
 		Value* Dst = rdVR(B, IP, 0, "vm.ld.d"), * PP = rdPR(B, IP, 1, "vm.ld.p");
@@ -596,7 +624,7 @@ void VMImpl::buildHandlersMem() {
 	}
 
 	//  OP_LOAD64 -- [dst64:u8 ptrreg:u8] 
-	{
+	if (needsOpcode(OP_LOAD64)) {
 		auto B = mkOpc(OP_LOAD64, "load64");
 		Value* IP = advIP(B, 2);
 		Value* Dst = rdVR64(B, IP, 0, "vm.ld64.d"), * PP = rdPR(B, IP, 1, "vm.ld64.p");
@@ -604,7 +632,7 @@ void VMImpl::buildHandlersMem() {
 	}
 
 	//  OP_STORE32 -- [val:u8 ptrreg:u8] 
-	{
+	if (needsOpcode(OP_STORE32)) {
 		auto B = mkOpc(OP_STORE32, "store32");
 		Value* IP = advIP(B, 2);
 		Value* VR = rdVR(B, IP, 0, "vm.st.v"), * PP = rdPR(B, IP, 1, "vm.st.p");
@@ -612,7 +640,7 @@ void VMImpl::buildHandlersMem() {
 	}
 
 	//  OP_STORE64 -- [val64:u8 ptrreg:u8] 
-	{
+	if (needsOpcode(OP_STORE64)) {
 		auto B = mkOpc(OP_STORE64, "store64");
 		Value* IP = advIP(B, 2);
 		Value* VIdx = rdVR64(B, IP, 0, "vm.st64.v"), * PP = rdPR(B, IP, 1, "vm.st64.p");
@@ -621,7 +649,7 @@ void VMImpl::buildHandlersMem() {
 
 	//  OP_GEP -- [dstp:u8 basep:u8 idx:u8 elemsz:u16le] 
 	// Byte offset = vreg[idx] * elemsz.  Interpreter always operates in bytes.
-	{
+	if (needsOpcode(OP_GEP)) {
 		auto B = mkOpc(OP_GEP, "gep");
 		Value* IP = advIP(B, 5);   // 3 reg bytes + 2 elemsz bytes
 		Value* DP = rdPR(B, IP, 0, "vm.gp.d"), * BP = rdPR(B, IP, 1, "vm.gp.b"), * Idx = rdVR(B, IP, 2, "vm.gp.i");
@@ -636,7 +664,7 @@ void VMImpl::buildHandlersMem() {
 	}
 
 	//  OP_GEP64 -- [dstp:u8 basep:u8 idx64:u8 elemsz:u16le] 
-	{
+	if (needsOpcode(OP_GEP64)) {
 		auto B = mkOpc(OP_GEP64, "gep64");
 		Value* IP = advIP(B, 5);
 		Value* DP = rdPR(B, IP, 0, "vm.gp64.d"), * BP = rdPR(B, IP, 1, "vm.gp64.b");
@@ -652,7 +680,7 @@ void VMImpl::buildHandlersMem() {
 
 
 	// LOAD/STORE -- 8/16:
-	{
+	if (needsOpcode(OP_LOAD8)) {
 		auto B = mkOpc(OP_LOAD8, "load8");
 		Value* IP = advIP(B, 2);
 		Value* Dst = rdVR(B, IP, 0, "vm.ld8.d");
@@ -661,7 +689,7 @@ void VMImpl::buildHandlersMem() {
 		stVR(B, Dst, B.CreateZExt(V8, I32Ty, "vm.ld8.z"));
 		nextInsn(B);
 	}
-	{
+	if (needsOpcode(OP_STORE8)) {
 		auto B = mkOpc(OP_STORE8, "store8");
 		Value* IP = advIP(B, 2);
 		Value* VIdx = rdVR(B, IP, 0, "vm.st8.v");
@@ -670,7 +698,7 @@ void VMImpl::buildHandlersMem() {
 		B.CreateStore(V8, ldPR(B, PP));
 		nextInsn(B);
 	}
-	{
+	if (needsOpcode(OP_LOAD16)) {
 		auto B = mkOpc(OP_LOAD16, "load16");
 		Value* IP = advIP(B, 2);
 		Value* Dst = rdVR(B, IP, 0, "vm.ld16.d");
@@ -679,7 +707,7 @@ void VMImpl::buildHandlersMem() {
 		stVR(B, Dst, B.CreateZExt(V16, I32Ty, "vm.ld16.z"));
 		nextInsn(B);
 	}
-	{
+	if (needsOpcode(OP_STORE16)) {
 		auto B = mkOpc(OP_STORE16, "store16");
 		Value* IP = advIP(B, 2);
 		Value* VIdx = rdVR(B, IP, 0, "vm.st16.v");
@@ -691,7 +719,7 @@ void VMImpl::buildHandlersMem() {
 
 
 	// LOAD/STORE -- PTR:
-	{
+	if (needsOpcode(OP_LOADPTR)) {
 		auto B = mkOpc(OP_LOADPTR, "loadptr");
 		Value* IP = advIP(B, 2);
 		Value* Dst = rdPR(B, IP, 0, "vm.lp.d");
@@ -700,7 +728,7 @@ void VMImpl::buildHandlersMem() {
 		stPR(B, Dst, V);
 		nextInsn(B);
 	}
-	{
+	if (needsOpcode(OP_STOREPTR)) {
 		auto B = mkOpc(OP_STOREPTR, "storeptr");
 		Value* IP = advIP(B, 2);
 		Value* VIdx = rdPR(B, IP, 0, "vm.sp.v");
@@ -716,7 +744,7 @@ void VMImpl::buildHandlersControl() {
 	if (!needsOpcode(OP_JMP) && !needsOpcode(OP_JMPC) && !needsOpcode(OP_SWITCH) &&
 		!needsOpcode(OP_RET_VOID) && !needsOpcode(OP_RET_INT) && !needsOpcode(OP_RET_PTR)) return;
 	//  OP_JMP -- [target:u32le] 
-	{
+	if (needsOpcode(OP_JMP)) {
 		auto B = mkOpc(OP_JMP, "jmp");
 		Value* IP = advIP(B, 4);
 		Value* JT = rdU32(B, IP, 0, "vm.jm.t");
@@ -726,7 +754,7 @@ void VMImpl::buildHandlersControl() {
 	}
 
 	//  OP_JMPC -- [cond:u8 tgt_t:u32 tgt_f:u32] 
-	{
+	if (needsOpcode(OP_JMPC)) {
 		auto B = mkOpc(OP_JMPC, "jmpc");
 		Value* IP = advIP(B, 9);
 		Value* Cond = rdVR(B, IP, 0, "vm.jc.c"), * Tt = rdU32(B, IP, 1, "vm.jc.t"), * Tf = rdU32(B, IP, 5, "vm.jc.f");
@@ -740,7 +768,7 @@ void VMImpl::buildHandlersControl() {
 
 	//  OP_SWITCH -- [cond:u8 ncases:u16le def:u32le [case:u32le tgt:u32le]*ncases] 
 	// Linear scan at runtime using a compact table; no per-case IR bloat.
-	{
+	if (needsOpcode(OP_SWITCH)) {
 		auto B = mkOpc(OP_SWITCH, "switch");
 		// CurIP points at first operand byte (fetch already consumed opcode)
 		auto* CurIP = B.CreateLoad(I32Ty, VMIP, "vm.sw.ip");
@@ -804,7 +832,7 @@ void VMImpl::buildHandlersControl() {
 
 
 	// OP_RET_VOID 
-	{
+	if (needsOpcode(OP_RET_VOID)) {
 		auto B = mkOpc(OP_RET_VOID, "ret_void");
 		advIP(B, 0);
 		if (SharedEngineMode) {
@@ -819,7 +847,7 @@ void VMImpl::buildHandlersControl() {
 	}
 
 
-	{
+	if (needsOpcode(OP_RET_INT)) {
 		auto B = mkOpc(OP_RET_INT, "ret_int");
 		Value* IP = advIP(B, 1);
 		if (SharedEngineMode) {
@@ -846,7 +874,7 @@ void VMImpl::buildHandlersControl() {
 	}
 
 
-	{
+	if (needsOpcode(OP_RET_PTR)) {
 		auto B = mkOpc(OP_RET_PTR, "ret_ptr");
 		Value* IP = advIP(B, 1);
 		if (SharedEngineMode) {
@@ -881,7 +909,7 @@ void VMImpl::buildHandlersFloat() {
 		!needsOpcode(OP_STORE_F) && !needsOpcode(OP_RET_F) && !needsOpcode(OP_SELECT_F) &&
 		!needsOpcode(OP_FNEG) && !needsOpcode(OP_LOAD_F32) && !needsOpcode(OP_STORE_F32)) return;
 	// OP_LOADI_F -- [dst_fr:u8 imm:f64le]    freg[dst] = imm 
-	{
+	if (needsOpcode(OP_LOADI_F)) {
 		auto B = mkOpc(OP_LOADI_F, "loadi_f");
 		Value* IP = advIP(B, 9);  // 1 dst + 8 bytes of f64
 		Value* Dst = rdFR(B, IP, 0, "vm.lif.d");
@@ -898,7 +926,7 @@ void VMImpl::buildHandlersFloat() {
 	}
 
 	// OP_MOVR_F -- [dst_fr:u8 src_fr:u8]  freg[dst] = freg[src] 
-	{
+	if (needsOpcode(OP_MOVR_F)) {
 		auto B = mkOpc(OP_MOVR_F, "movr_f");
 		Value* IP = advIP(B, 2);
 		stFR(B, rdFR(B, IP, 0, "vm.mrf.d"), ldFR(B, rdFR(B, IP, 1, "vm.mrf.s")));
@@ -910,7 +938,7 @@ void VMImpl::buildHandlersFloat() {
 	// When bit 7 is set the f64 result is rounded back to f32 precision
 	// (fptruncf32 then fpextf64) so float arithmetic matches native
 	// semantics exactly.
-	{
+	if (needsOpcode(OP_BINOP_F)) {
 		auto B = mkOpc(OP_BINOP_F, "binop_f");
 		Value* IP = advIP(B, 4);
 		Value* Dst = rdFR(B, IP, 0, "vm.bof.d");
@@ -940,7 +968,7 @@ void VMImpl::buildHandlersFloat() {
 
 		BasicBlock* FMergeBB = BasicBlock::Create(Ctx, "vm.bof.merge", HFn);
 		BasicBlock* FDefBB = BasicBlock::Create(Ctx, "vm.bof.invalid", HFn);
-		IRBuilder<>(FDefBB).CreateUnreachable();
+		emitTrapBlock(FDefBB);
 		unsigned FCaseCount = 0;
 		for (unsigned S = 0; S < ISAEnc::kNumFBinSubop; ++S)
 			FCaseCount += needsFBinSubop(S, false) + needsFBinSubop(S, true);
@@ -983,7 +1011,7 @@ void VMImpl::buildHandlersFloat() {
 	// Result is i1 zero-extended to i32 and stored in vreg.
 	// Switch+PHI pattern identical to OP_BINOP: only the matching predicate's
 	// fcmp executes per dispatch.  No speculative evaluation of all 14 branches.
-	{
+	if (needsOpcode(OP_FCMP)) {
 		auto B = mkOpc(OP_FCMP, "fcmp");
 		Value* IP = advIP(B, 4);
 		Value* Dst = rdVR(B, IP, 0, "vm.fcp.d");
@@ -1053,7 +1081,7 @@ void VMImpl::buildHandlersFloat() {
 	// OP_FCAST_FF --  [dst_fr:u8 src_fr:u8 kind:u8]  freg→freg  (fpext / fptrunc) 
 	// FK_FPEXT:  -- freg already stores f64; value is already widened — select returns SV unchanged.
 	// FK_FPTRUNC: -- round to f32 precision via fptrunc+fpext.
-	{
+	if (needsOpcode(OP_FCAST_FF)) {
 		auto B = mkOpc(OP_FCAST_FF, "fcast_ff");
 		Value* IP = advIP(B, 3);
 		Value* Dst = rdFR(B, IP, 0, "vm.cff.d");
@@ -1067,7 +1095,7 @@ void VMImpl::buildHandlersFloat() {
 	}
 
 	//  OP_FCAST_FV --  [dst_vr:u8 src_fr:u8 kind:u8]  freg→vreg i32  (fptosi / fptoui) 
-	{
+	if (needsOpcode(OP_FCAST_FV)) {
 		auto B = mkOpc(OP_FCAST_FV, "fcast_fv");
 		Value* IP = advIP(B, 3);
 		Value* Dst = rdVR(B, IP, 0, "vm.cfv.d");
@@ -1081,7 +1109,7 @@ void VMImpl::buildHandlersFloat() {
 	}
 
 	// OP_FCAST_FV64 -- [dst_vr64:u8 src_fr:u8 kind:u8]  freg→vreg64 i64 
-	{
+	if (needsOpcode(OP_FCAST_FV64)) {
 		auto B = mkOpc(OP_FCAST_FV64, "fcast_fv64");
 		Value* IP = advIP(B, 3);
 		Value* Dst = rdVR64(B, IP, 0, "vm.cfv64.d");
@@ -1096,7 +1124,7 @@ void VMImpl::buildHandlersFloat() {
 
 	//  OP_FCAST_VF -- [dst_fr:u8 src_vr:u8 kind:u8]  vreg i32→freg  (sitofp / uitofp)
 	//  kind bit 7 = FCAST_F32_FLAG: round f64 result to f32 precision.
-	{
+	if (needsOpcode(OP_FCAST_VF)) {
 		auto B = mkOpc(OP_FCAST_VF, "fcast_vf");
 		Value* IP = advIP(B, 3);
 		Value* Dst = rdFR(B, IP, 0, "vm.cvf.d");
@@ -1118,7 +1146,7 @@ void VMImpl::buildHandlersFloat() {
 
 	//  OP_FCAST_V64F -- [dst_fr:u8 src_vr64:u8 kind:u8]  vreg64 i64→freg
 	//  kind bit 7 = FCAST_F32_FLAG: round f64 result to f32 precision.
-	{
+	if (needsOpcode(OP_FCAST_V64F)) {
 		auto B = mkOpc(OP_FCAST_V64F, "fcast_v64f");
 		Value* IP = advIP(B, 3);
 		Value* Dst = rdFR(B, IP, 0, "vm.cv64f.d");
@@ -1143,7 +1171,7 @@ void VMImpl::buildHandlersFloat() {
 	// OP_LOAD_F  [dst_fr:u8 ptrreg:u8]    freg[dst] = *ptr (f64) 
 	// NOTE: always loads 8 bytes as f64. f32 memory pointers will produce incorrect
 	// results (reads 8 bytes from a 4-byte slot). Use double in IR for correct behaviour.
-	{
+	if (needsOpcode(OP_LOAD_F)) {
 		auto B = mkOpc(OP_LOAD_F, "load_f");
 		Value* IP = advIP(B, 2);
 		Value* Dst = rdFR(B, IP, 0, "vm.ldf.d");
@@ -1153,7 +1181,7 @@ void VMImpl::buildHandlersFloat() {
 	}
 
 	//  OP_STORE_F  [src_fr:u8 ptrreg:u8]    *ptr = freg[src] (f64) 
-	{
+	if (needsOpcode(OP_STORE_F)) {
 		auto B = mkOpc(OP_STORE_F, "store_f");
 		Value* IP = advIP(B, 2);
 		Value* Src = rdFR(B, IP, 0, "vm.stf.s");
@@ -1166,7 +1194,7 @@ void VMImpl::buildHandlersFloat() {
 	// OP_LOAD_F32  [dst_fr:u8 ptrreg:u8]  →  freg[dst] = fpext(*ptr as float) 
 	// Loads 4 bytes from a float* slot, fpext to f64, stores in freg.
 	// Used when the source IR has type float (not double) — e.g. float* function parameter.
-	{
+	if (needsOpcode(OP_LOAD_F32)) {
 		auto B = mkOpc(OP_LOAD_F32, "load_f32");
 		Value* IP = advIP(B, 2);
 		Value* Dst = rdFR(B, IP, 0, "vm.ldf32.d");
@@ -1179,7 +1207,7 @@ void VMImpl::buildHandlersFloat() {
 	// OP_STORE_F32  [val_fr:u8 ptrreg:u8]  →  *ptr (float*) = fptrunc(freg[val]) 
 	// fptrunc f64 freg value to float, stores 4 bytes.
 	// Used when the destination IR type is float — e.g. float* function parameter.
-	{
+	if (needsOpcode(OP_STORE_F32)) {
 		auto B = mkOpc(OP_STORE_F32, "store_f32");
 		Value* IP = advIP(B, 2);
 		Value* Src = rdFR(B, IP, 0, "vm.stf32.s");
@@ -1190,7 +1218,7 @@ void VMImpl::buildHandlersFloat() {
 	}
 
 	//  OP_RET_F  [src_fr:u8]    return freg[src] 
-	{
+	if (needsOpcode(OP_RET_F)) {
 		auto B = mkOpc(OP_RET_F, "ret_f");
 		Value* IP = advIP(B, 1);
 		if (SharedEngineMode) {
@@ -1215,7 +1243,7 @@ void VMImpl::buildHandlersFloat() {
 	}
 
 	// OP_SELECT_F  [dst_fr:u8 cond_vr:u8 t_fr:u8 f_fr:u8] 
-	{
+	if (needsOpcode(OP_SELECT_F)) {
 		auto B = mkOpc(OP_SELECT_F, "select_f");
 		Value* IP = advIP(B, 4);
 		Value* Dst = rdFR(B, IP, 0, "vm.slf.d");
@@ -1230,7 +1258,7 @@ void VMImpl::buildHandlersFloat() {
 
 
 	//  OP_FNEG  [dst_fr:u8 src_fr:u8]  
-	{
+	if (needsOpcode(OP_FNEG)) {
 		auto B = mkOpc(OP_FNEG, "fneg");
 		Value* IP = advIP(B, 2);
 		Value* Dst = rdFR(B, IP, 0, "vm.neg.d");

@@ -203,9 +203,21 @@ void VMImpl::buildDispatch() {
 		// Advance IP past opcode byte
 		B.CreateStore(B.CreateAdd(IP, B.getInt32(1), "vm.ip1"), VMIP)->setVolatile(true);
 
-		// Clamp opcode index (prevents out-of-bounds GEP on corrupted bytecode)
+		// Demand-mode opcode-domain check: the decoded opcode byte must be a
+		// valid handler index [0,OP_COUNT). No modulo clamp -- an out-of-domain
+		// opcode (corrupted/forged bytecode) branches to the trap block and
+		// faults instead of being folded back into a valid handler. The table
+		// lookup lives in vm.lookup, AFTER this branch.
 		Value* OIdx = B.CreateZExt(OpB, I32Ty, "vm.oidx");
-		Value* P = B.CreateURem(OIdx, B.getInt32(OP_COUNT), "vm.safe");
+		Value* Invalid = B.CreateICmpUGE(OIdx, B.getInt32(OP_COUNT), "vm.op.invalid");
+		BasicBlock* LookupBB = BasicBlock::Create(Ctx, "vm.lookup", HFn);
+		B.CreateCondBr(Invalid, InvalidBB, LookupBB);
+
+		//  vm.lookup: table lookup + indirect dispatch
+		IRBuilder<> LB(LookupBB);
+		// The opcode byte is already in [0,OP_COUNT) -- use it verbatim as the
+		// P-space index (no URem).
+		Value* P = OIdx;
 
 		// P2: route through the encrypted dispatch map (dmap) when encDispatch
 		// is on. dmap lives at handlers[OP_COUNT*K+1 + P] (M1: base table grew
@@ -214,17 +226,17 @@ void VMImpl::buildDispatch() {
 		// NumVariants below, after decode).
 		Value* FinalSlot;
 		if (EncDispatch) {
-			Value* DmIdx  = B.CreateAdd(P,
-				B.getInt32(OP_COUNT * NumVariants + 1), "vm.dm.i");
-			Value* DmPtr  = B.CreateGEP(PtrTy, EffHandlers, DmIdx, "vm.dm.p");
-			Value* DmRaw  = B.CreateLoad(PtrTy, DmPtr, "vm.dm.raw");
-			Value* DmInt  = B.CreateTrunc(
-								B.CreatePtrToInt(DmRaw, I64Ty, "vm.dm.i64"),
+			Value* DmIdx  = LB.CreateAdd(P,
+				LB.getInt32(OP_COUNT * NumVariants + 1), "vm.dm.i");
+			Value* DmPtr  = LB.CreateGEP(PtrTy, EffHandlers, DmIdx, "vm.dm.p");
+			Value* DmRaw  = LB.CreateLoad(PtrTy, DmPtr, "vm.dm.raw");
+			Value* DmInt  = LB.CreateTrunc(
+								LB.CreatePtrToInt(DmRaw, I64Ty, "vm.dm.i64"),
 								I32Ty, "vm.dm.i32");
-			auto*  SaltL  = B.CreateLoad(I32Ty, EffSalt, "vm.dm.salt");
+			auto*  SaltL  = LB.CreateLoad(I32Ty, EffSalt, "vm.dm.salt");
 			SaltL->setVolatile(true);
-			Value* Dec    = B.CreateXor(DmInt, SaltL, "vm.dm.dec");
-			FinalSlot     = B.CreateURem(Dec, B.getInt32(OP_COUNT), "vm.dm.slot");
+			Value* Dec    = LB.CreateXor(DmInt, SaltL, "vm.dm.dec");
+			FinalSlot     = Dec;
 		} else {
 			FinalSlot = P;
 		}
@@ -249,22 +261,35 @@ void VMImpl::buildDispatch() {
 		Value* TableSlot = FinalSlot;
 		if (NumVariants > 1) {
 			Value* SaltL = HFn->getArg(VMEngine::kParamSalt);
-			Value* Mix = B.CreateXor(
-				B.CreateMul(IP, B.getInt32(0x9E3779B1u), "vm.vs.mul"),
-				B.CreateLShr(SaltL, B.getInt32(3), "vm.vs.shr"),
+			Value* Mix = LB.CreateXor(
+				LB.CreateMul(IP, LB.getInt32(0x9E3779B1u), "vm.vs.mul"),
+				LB.CreateLShr(SaltL, LB.getInt32(3), "vm.vs.shr"),
 				"vm.vs.mix");
-			Value* VSel = B.CreateURem(Mix, B.getInt32(NumVariants), "vm.vs.sel");
-			TableSlot = B.CreateAdd(
-				B.CreateMul(FinalSlot, B.getInt32(NumVariants), "vm.vs.base"),
+			Value* VSel = LB.CreateURem(Mix, LB.getInt32(NumVariants), "vm.vs.sel");
+			TableSlot = LB.CreateAdd(
+				LB.CreateMul(FinalSlot, LB.getInt32(NumVariants), "vm.vs.base"),
 				VSel, "vm.vs.slot");
 		}
 
+		// cloudDispatch: 云值驱动的动态 offset。合法云值下运行时返回 0，
+		// TableSlot 不变；过期/错误/缺失云值下返回非 0（最高 VM_DISPATCH_OFFSET_MASK），
+		// 把 handler 表索引推离有效区，indirectbr 到非法地址自然崩溃。
+		// 本地不做任何范围/时效判断——越界即崩是解码的天然后果。
+		if (CloudDispatch) {
+			FunctionCallee OffsetFn = M.getOrInsertFunction(
+				"__zone_get_dispatch_offset",
+				FunctionType::get(I64Ty, {}, false));
+			Value* Off64 = LB.CreateCall(OffsetFn, {}, "vm.zone.off64");
+			Value* Off = LB.CreateTrunc(Off64, I32Ty, "vm.zone.off");
+			TableSlot = LB.CreateAdd(TableSlot, Off, "vm.zone.slot");
+		}
+
 		// GEP into handler table[table_slot]
-		Value* Slot = B.CreateGEP(PtrTy, EffHandlers, TableSlot, "vm.ohsl");
-		Value* Hndl = B.CreateLoad(PtrTy, Slot, "vm.hndl");
+		Value* Slot = LB.CreateGEP(PtrTy, EffHandlers, TableSlot, "vm.ohsl");
+		Value* Hndl = LB.CreateLoad(PtrTy, Slot, "vm.hndl");
 
 		// indirectbr with all opcode blocks (all variants) declared as successors
-		IndirectBrInst* IBR = B.CreateIndirectBr(Hndl, OP_COUNT * NumVariants + 1);
+		IndirectBrInst* IBR = LB.CreateIndirectBr(Hndl, OP_COUNT * NumVariants + 1);
 		for (unsigned i = 0; i < OP_COUNT; ++i)
 			for (unsigned v = 0; v < NumVariants; ++v)
 				IBR->addDestination(OpcBB[i][v] ? OpcBB[i][v] : InvalidBB);
@@ -316,25 +341,32 @@ void VMImpl::emitThreadedTail(IRBuilder<>& B) {
 	// Advance IP past opcode byte
 	FB.CreateStore(FB.CreateAdd(IP2, FB.getInt32(1), "vm.ip1"), VMIP)->setVolatile(true);
 
-	// Clamp opcode index (prevents out-of-bounds GEP on corrupted bytecode)
+	// Demand-mode opcode-domain check (mirrors buildDispatch): out-of-domain
+	// opcodes branch to the trap block instead of being modulo-clamped.
 	Value* OIdx = FB.CreateZExt(OpB, I32Ty, "vm.oidx");
-	Value* P = FB.CreateURem(OIdx, FB.getInt32(OP_COUNT), "vm.safe");
+	Value* Invalid = FB.CreateICmpUGE(OIdx, FB.getInt32(OP_COUNT), "vm.op.invalid");
+	BasicBlock* LookupBB = BasicBlock::Create(Ctx, "vm.lookup", HFn);
+	FB.CreateCondBr(Invalid, InvalidBB, LookupBB);
+
+	IRBuilder<> LB(LookupBB);
+	// Opcode byte is already in [0,OP_COUNT) -- use verbatim (no URem).
+	Value* P = OIdx;
 
 	// P2: route through the encrypted dispatch map (dmap) when encDispatch
 	// is on -- mirrors buildDispatch()'s vm.fetch logic exactly.
 	Value* FinalSlot;
 	if (EncDispatch) {
-		Value* DmIdx = FB.CreateAdd(P,
-			FB.getInt32(OP_COUNT * NumVariants + 1), "vm.dm.i");
-		Value* DmPtr = FB.CreateGEP(PtrTy, EffHandlers, DmIdx, "vm.dm.p");
-		Value* DmRaw = FB.CreateLoad(PtrTy, DmPtr, "vm.dm.raw");
-		Value* DmInt = FB.CreateTrunc(
-							FB.CreatePtrToInt(DmRaw, I64Ty, "vm.dm.i64"),
+		Value* DmIdx = LB.CreateAdd(P,
+			LB.getInt32(OP_COUNT * NumVariants + 1), "vm.dm.i");
+		Value* DmPtr = LB.CreateGEP(PtrTy, EffHandlers, DmIdx, "vm.dm.p");
+		Value* DmRaw = LB.CreateLoad(PtrTy, DmPtr, "vm.dm.raw");
+		Value* DmInt = LB.CreateTrunc(
+							LB.CreatePtrToInt(DmRaw, I64Ty, "vm.dm.i64"),
 							I32Ty, "vm.dm.i32");
-		auto*  SaltL = FB.CreateLoad(I32Ty, EffSalt, "vm.dm.salt");
+		auto*  SaltL = LB.CreateLoad(I32Ty, EffSalt, "vm.dm.salt");
 		SaltL->setVolatile(true);
-		Value* Dec   = FB.CreateXor(DmInt, SaltL, "vm.dm.dec");
-		FinalSlot    = FB.CreateURem(Dec, FB.getInt32(OP_COUNT), "vm.dm.slot");
+		Value* Dec   = LB.CreateXor(DmInt, SaltL, "vm.dm.dec");
+		FinalSlot    = Dec;
 	} else {
 		FinalSlot = P;
 	}
@@ -348,25 +380,36 @@ void VMImpl::emitThreadedTail(IRBuilder<>& B) {
 	Value* TableSlot = FinalSlot;
 	if (NumVariants > 1) {
 		Value* SaltL = HFn->getArg(VMEngine::kParamSalt);
-		Value* Mix = FB.CreateXor(
-			FB.CreateMul(IP2, FB.getInt32(0x9E3779B1u), "vm.vs.mul"),
-			FB.CreateLShr(SaltL, FB.getInt32(3), "vm.vs.shr"),
+		Value* Mix = LB.CreateXor(
+			LB.CreateMul(IP2, LB.getInt32(0x9E3779B1u), "vm.vs.mul"),
+			LB.CreateLShr(SaltL, LB.getInt32(3), "vm.vs.shr"),
 			"vm.vs.mix");
-		Value* VSel = FB.CreateURem(Mix, FB.getInt32(NumVariants), "vm.vs.sel");
-		TableSlot = FB.CreateAdd(
-			FB.CreateMul(FinalSlot, FB.getInt32(NumVariants), "vm.vs.base"),
+		Value* VSel = LB.CreateURem(Mix, LB.getInt32(NumVariants), "vm.vs.sel");
+		TableSlot = LB.CreateAdd(
+			LB.CreateMul(FinalSlot, LB.getInt32(NumVariants), "vm.vs.base"),
 			VSel, "vm.vs.slot");
 	}
 
+	// cloudDispatch: 云值驱动的动态 offset（threadedDispatch 版本，语义同 buildDispatch）
+	if (CloudDispatch) {
+		FunctionCallee OffsetFn = M.getOrInsertFunction(
+			"__zone_get_dispatch_offset",
+			FunctionType::get(I64Ty, {}, false));
+		Value* Off64 = LB.CreateCall(OffsetFn, {}, "vm.zone.off64");
+		Value* Off = LB.CreateTrunc(Off64, I32Ty, "vm.zone.off");
+		TableSlot = LB.CreateAdd(TableSlot, Off, "vm.zone.slot");
+	}
+
 	// GEP into handler table[table_slot]
-	Value* Slot = FB.CreateGEP(PtrTy, EffHandlers, TableSlot, "vm.ohsl");
-	Value* Hndl = FB.CreateLoad(PtrTy, Slot, "vm.hndl");
+	Value* Slot = LB.CreateGEP(PtrTy, EffHandlers, TableSlot, "vm.ohsl");
+	Value* Hndl = LB.CreateLoad(PtrTy, Slot, "vm.hndl");
 
 	// indirectbr with all opcode blocks (all variants) declared as successors
-	IndirectBrInst* IBR = FB.CreateIndirectBr(Hndl, OP_COUNT * NumVariants + 1);
+	IndirectBrInst* IBR = LB.CreateIndirectBr(Hndl, OP_COUNT * NumVariants + 2);
 	for (unsigned i = 0; i < OP_COUNT; ++i)
 		for (unsigned v = 0; v < NumVariants; ++v)
 			IBR->addDestination(OpcBB[i][v]);
+	IBR->addDestination(InvalidBB);
 	IBR->addDestination(ExitBB);
 }
 
@@ -581,7 +624,7 @@ void VMImpl::populateVMEngine() {
 
 	// Build all 51 opcode handlers
 	InvalidBB = BasicBlock::Create(Ctx, "vm.invalid", EF);
-	IRBuilder<>(InvalidBB).CreateUnreachable();
+	emitTrapBlock(InvalidBB);
 	SS->Invalid = InvalidBB;
 	NumVariants = Cfg.handlerVariants;
 	if (NumVariants < 1) NumVariants = 1;
@@ -606,6 +649,23 @@ void VMImpl::populateVMEngine() {
 	}
 
 	buildOpcodeHandlers();
+
+	// threadedDispatch pre-creates a placeholder block for every
+	// (opcode, variant) pair, but buildOpcodeHandlers only fills those where
+	// needsOpcode() is true (e.g. MULADD/SHLADD/CMPSEL/ANDCMPZ stay empty when
+	// superOps is off). Every placeholder is nevertheless listed as an
+	// indirectbr destination, so an unfilled one has no terminator and the
+	// module fails the verifier ("Basic Block ... does not have terminator").
+	// Give each remaining empty placeholder an unreachable: the bytecode
+	// emitter never selects a non-needed opcode, so these blocks stay dead.
+	if (ThreadedDispatch) {
+		for (unsigned i = 0; i < OP_COUNT; ++i)
+			for (unsigned v = 0; v < NumVariants; ++v) {
+				BasicBlock* BB = OpcBB[i][v];
+				if (BB && BB->empty())
+					new UnreachableInst(Ctx, BB);
+			}
+	}
 
 	// Make the K structurally-identical variants distinct (per-variant MBA).
 	diversifyHandlerVariants(EF);

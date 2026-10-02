@@ -360,6 +360,13 @@ namespace llvm {
 		// static byte->handler map no longer holds. Off = byte-identical.
 		bool     keyedDispatch = false;
 
+		// cloudDispatch: 云值驱动 dispatch。dispatch 时调用运行时
+		// __zone_get_dispatch_offset()，把返回值（合法云值下为 0，过期/错误/缺失
+		// 云值下非 0）加到 handler 表索引上。合法值下行为与关闭时完全一致；
+		// 非法值下索引被推离 handler 表，indirectbr 到非法地址自然崩溃。
+		// 本地无任何 if(valid)/if(expired) 判断。Off = byte-identical。
+		bool     cloudDispatch = false;
+
 		// superOps: fuse eligible i32 `mul`+`add` chains (mul result single-use,
 		// consumed directly by the add) into one OP_MULADD opcode instead of two
 		// OP_BINOP opcodes. Off = correctness-identical (OP_COUNT grows by one).
