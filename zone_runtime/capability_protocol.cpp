@@ -125,6 +125,9 @@ CanonicalResponse canonicalizeCapabilityResponse(const CapabilityResponse& respo
       {"expires_at", std::to_string(response.expires_at)},
       {"policy_version", std::to_string(response.policy_version)},
       {"key_id", response.key_id},
+      {"window_id", response.window_id},
+      {"dispatch_blob", response.dispatch_blob},
+      {"dispatch_v", response.dispatch_v},
   });
 }
 
@@ -178,7 +181,8 @@ bool parseCapabilityResponse(const std::string& canonical, CapabilityResponse* o
   if (!parseFields(canonical,
                    {"protocol", "ok", "operation", "request_hash", "device_id_hash",
                     "next_state", "vm_value", "server_time", "issued_at", "expires_at",
-                    "policy_version", "key_id"},
+                    "policy_version", "key_id", "window_id", "dispatch_blob",
+                    "dispatch_v"},
                    &values)) {
     return false;
   }
@@ -197,7 +201,7 @@ bool parseCapabilityResponse(const std::string& canonical, CapabilityResponse* o
   CapabilityResponse parsed{static_cast<uint32_t>(protocol), values[1] == "true", values[2],
                             values[3], values[4], values[5], values[6], server_time,
                             issued_at, expires_at, static_cast<uint32_t>(policy_version),
-                            values[11], {}};
+                            values[11], {}, values[12], values[13], values[14]};
   if (!validateCapabilityResponse(parsed)) {
     return false;
   }

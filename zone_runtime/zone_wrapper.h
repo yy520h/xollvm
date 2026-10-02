@@ -26,6 +26,7 @@ void xollvm_zone_capability_clear(void);
 char* xollvm_zone_vm_dispatch_value(void);
 char* xollvm_zone_vm_body_key(const char* function_id);
 int xollvm_zone_vm_dispatch_refresh(void);
+int xollvm_zone_vm_dispatch_copy_v(uint8_t* out32);
 void xollvm_zone_shutdown(void);
 void xollvm_zone_set_shutdown_mode(int automatic);
 

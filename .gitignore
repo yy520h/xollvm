@@ -3,6 +3,7 @@
 /out/
 build-*/
 cmake-build-*/
+/zone_runtime/tests/build/
 
 # CMake artifacts
 CMakeCache.txt

@@ -5,6 +5,7 @@
 
 #include "ZoneHelper.h"
 #include "Core/nlohmann/json.hpp"
+#include "Core/base64.h"
 
 #include <atomic>
 #include <chrono>
@@ -51,6 +52,10 @@ struct ZoneState {
 	std::string dispatchSignedBlob;
 	std::string dispatchNonce;
 	std::string dispatchWindowId;
+	// 云值驱动 dispatch：原始 32 字节 V（云端针对当前 window 搜索，使
+	// HMAC(V, window) & MASK == 0）。由 refresh 解析 dispatch_v 填入，
+	// 供 cloud_value_manager 计算 dispatch offset。
+	std::string dispatchV;
 	std::chrono::steady_clock::time_point dispatchFetchedAt;
 	uint32_t dispatchPrefetchSeconds = 50;
 	uint32_t dispatchWindowSeconds = 60;
@@ -296,6 +301,7 @@ extern "C" int xollvm_zone_initialize(const char* software_id,
 	s.dispatchSignedBlob.clear();
 	s.dispatchNonce.clear();
 	s.dispatchWindowId.clear();
+	s.dispatchV.clear();
 	s.dispatchFetchedAt = std::chrono::steady_clock::time_point{};
 	const char* capabilityOperation = std::getenv("XOLLVM_ZONE_CAPABILITY_OPERATION");
 	const char* capabilityManifest = std::getenv("XOLLVM_ZONE_CAPABILITY_CODE_MANIFEST");
@@ -648,21 +654,47 @@ extern "C" int xollvm_zone_vm_dispatch_refresh(void) {
 		return 0;
 	const std::string signedBlob = extractJsonString(response.Data.value, "dispatch_blob");
 	const std::string windowId = extractJsonString(response.Data.value, "window_id");
-	if (signedBlob.empty() || windowId.empty())
+	const std::string vB64 = extractJsonString(response.Data.value, "dispatch_v");
+	// 新模型：云端返回 dispatch_v（32B base64，已搜索使 offset==0）；
+	// 旧模型：返回 dispatch_blob（Ed25519 签名，供 body key 派生）。二者可并存。
+	if (windowId.empty() || (signedBlob.empty() && vB64.empty()))
 		return 0;
-	const uint64_t tick = xollvm::readClientTick();
-	const std::string key = xollvm::deriveDispatchKey(signedBlob, tick);
+	std::string vRaw;
+	if (!vB64.empty()) {
+		vRaw = base64_decode(vB64);
+		if (vRaw.size() != 32)
+			vRaw.clear();
+	}
+	std::string key;
+	if (!signedBlob.empty())
+		key = xollvm::deriveDispatchKey(signedBlob, xollvm::readClientTick());
 	lock.lock();
 	// 回写前复核 generation：客户端未被替换、仍登录且租约有效，否则丢弃结果。
 	if (s.capabilityClient.get() != client || !s.loggedIn || !s.leaseValid) {
 		lock.unlock();
 		return 0;
 	}
-	s.dispatchSignedBlob = signedBlob;
+	if (!signedBlob.empty()) {
+		s.dispatchSignedBlob = signedBlob;
+		s.dispatchKey = key;
+	}
+	if (!vRaw.empty())
+		s.dispatchV = vRaw;
 	s.dispatchNonce = requestNonce;
 	s.dispatchWindowId = windowId;
-	s.dispatchKey = key;
 	s.dispatchFetchedAt = std::chrono::steady_clock::now();
+	return 1;
+}
+
+// 供 cloud_value_manager 取回当前 V（32 字节原始值）。成功返回 1。
+extern "C" int xollvm_zone_vm_dispatch_copy_v(uint8_t* out32) {
+	if (!out32)
+		return 0;
+	ZoneState& s = state();
+	std::lock_guard<std::mutex> lock(s.mutex);
+	if (s.dispatchV.size() != 32)
+		return 0;
+	std::memcpy(out32, s.dispatchV.data(), 32);
 	return 1;
 }
 

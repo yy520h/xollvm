@@ -34,6 +34,11 @@ struct CapabilityResponse {
   uint32_t policy_version = 0;
   std::string key_id;
   std::string signature;
+  // 云值驱动 dispatch：与云端 capability_v1.js 的 RESPONSE_FIELDS 对齐，
+  // 参与签名 canonicalization（signature 本身不参与）。
+  std::string window_id;
+  std::string dispatch_blob;
+  std::string dispatch_v;
 };
 
 using CanonicalRequest = std::string;

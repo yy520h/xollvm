@@ -142,7 +142,7 @@ if(XOLLVM_ZONE_SDK_INCLUDE)
 
   add_library(xollvm_zone_sdk STATIC
     zone_wrapper.cpp capability_protocol.cpp capability_client.cpp
-    vm_dispatch_value.cpp ${_ZONE_SDK_SOURCES})
+    vm_dispatch_value.cpp cloud_value_manager.cpp ${_ZONE_SDK_SOURCES})
   target_include_directories(xollvm_zone_sdk PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}" "${_ZONE_SDK_ROOT}" "${_ZONE_SDK_CORE}"
     "${_ZONE_SDK_ROOT}/curl_core/curl/include"

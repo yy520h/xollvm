@@ -12,6 +12,17 @@ const keyPair = crypto.generateKeyPairSync("ed25519");
 const privateKey = keyPair.privateKey.export({ type: "pkcs8", format: "pem" });
 const publicKey = keyPair.publicKey;
 const fixedTime = 1700000000;
+// 测试用小掩码，使云端搜索在毫秒级完成（生产默认 0xfffff）。
+CODE_CONFIG.dispatchOffsetMask = 0xfff;
+
+// 复现客户端 cloud_value_manager.cpp 的 offset 算法：
+// first 8 bytes of HMAC-SHA256(V, little-endian uint64 window)，小端解释后 & mask。
+function clientOffset(v, windowId, mask) {
+  const win = Buffer.alloc(8);
+  win.writeBigUInt64LE(BigInt(windowId));
+  const digest = crypto.createHmac("sha256", v).update(win).digest();
+  return digest.readBigUInt64LE(0) & BigInt(mask);
+}
 const baseRequest = {
   protocol: "capability_v1",
   software_id: "demo",
@@ -129,6 +140,19 @@ function testDispatchBlobPresent() {
     Number(CODE_CONFIG.dispatchWindowSeconds),
     Number(CODE_CONFIG.validSeconds),
     "dispatch window must be distinct from capability validity"
+  );
+
+  // dispatch_v：32 字节云值，客户端算法下 offset 必须为 0（合法值）
+  if (typeof response.dispatch_v !== "string" || response.dispatch_v.length === 0) {
+    throw new Error("dispatch_v missing");
+  }
+  const decodedV = Buffer.from(response.dispatch_v, "base64");
+  assert.strictEqual(decodedV.length, 32, "dispatch_v must decode to 32 bytes");
+  const mask = Number(CODE_CONFIG.dispatchOffsetMask);
+  assert.strictEqual(
+    clientOffset(decodedV, response.window_id, mask),
+    0n,
+    "dispatch_v must make client offset zero"
   );
 
   const signed = { ...response };

@@ -12,6 +12,10 @@ MC4CAQAwBQYDK2VwBCIEIKYtg9+dXA9mqw8j15fMlppe2kvS/MjSyS5qSiVty8N/
   bucketSeconds: 60,
   validSeconds: 300,
   dispatchWindowSeconds: 60,
+  // 云值驱动 dispatch 的偏移掩码。必须与客户端编译期 VM_DISPATCH_OFFSET_MASK
+  // 一致。云端为每个 window 搜索一个 V，使客户端 HMAC(V, window) & mask == 0。
+  // 20-bit → 期望约 2^20 次 HMAC（每 window 只算一次，带缓存）。
+  dispatchOffsetMask: 0xfffff,
   policyVersion: 1,
 };
 
@@ -22,7 +26,7 @@ const REQUEST_FIELDS = [
 const RESPONSE_FIELDS = [
   "protocol", "ok", "operation", "request_hash", "device_id_hash", "next_state",
   "vm_value", "server_time", "issued_at", "expires_at", "policy_version", "key_id",
-  "window_id", "dispatch_blob",
+  "window_id", "dispatch_blob", "dispatch_v",
 ];
 
 function canonicalize(fields, value) {
@@ -75,6 +79,35 @@ function hash(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
+// 每个 window 只搜索一次；服务端可缓存复用。
+const dispatchVCache = new Map();
+
+// 搜索一个 32 字节 V，使客户端计算出的 offset 为 0。
+// 客户端算法（cloud_value_manager.cpp）：
+//   window 以小端 uint64 的 8 字节参与 HMAC-SHA256(V, window_le64)
+//   取摘要前 8 字节按小端解释为 uint64，再 & mask
+// 这里必须逐字节复现该算法。
+function deriveDispatchV(serverKey, windowId, mask) {
+  const cacheKey = `${serverKey}\u0000${windowId}\u0000${mask}`;
+  const cached = dispatchVCache.get(cacheKey);
+  if (cached) return cached;
+  const windowBuf = Buffer.alloc(8);
+  windowBuf.writeBigUInt64LE(BigInt(windowId));
+  const maskBig = BigInt(mask);
+  const limit = (Number(maskBig) + 1) * 16;  // 期望 mask+1，留 16x 余量
+  for (let i = 0; i < limit; ++i) {
+    const candidate = crypto.createHmac("sha256", serverKey)
+      .update(`dispatch-v\u0000${windowId}\u0000${i}`).digest();
+    const digest = crypto.createHmac("sha256", candidate).update(windowBuf).digest();
+    if ((digest.readBigUInt64LE(0) & maskBig) === 0n) {
+      if (dispatchVCache.size > 64) dispatchVCache.clear();
+      dispatchVCache.set(cacheKey, candidate);
+      return candidate;
+    }
+  }
+  return null;
+}
+
 function capability_v1(event, context, callback) {
   const finish = (result) => {
     if (typeof callback === "function") callback(null, result);
@@ -121,6 +154,8 @@ function capability_v1(event, context, callback) {
     request.client_nonce, windowId, request.code_manifest, request.operation,
   ].join("\u0000");
   const dispatchBlob = crypto.sign(null, Buffer.from(dispatchMessage), privateKey).toString("base64");
+  const dispatchV = deriveDispatchV(serverKey, windowId,
+    Number(CODE_CONFIG.dispatchOffsetMask));
   const response = {
     protocol: 1,
     ok: true,
@@ -136,6 +171,7 @@ function capability_v1(event, context, callback) {
     key_id: keyId,
     window_id: windowId,
     dispatch_blob: dispatchBlob,
+    dispatch_v: dispatchV ? dispatchV.toString("base64") : "",
   };
   response.signature = crypto.sign(null, Buffer.from(canonicalizeResponse(response)), privateKey).toString("base64");
   return finish(JSON.stringify(response));
