@@ -49,6 +49,7 @@ struct ZoneState {
 	std::string capabilityBuildManifest;
 	std::string dispatchKey;
 	std::string dispatchSignedBlob;
+	std::string dispatchNonce;
 	std::string dispatchWindowId;
 	std::chrono::steady_clock::time_point dispatchFetchedAt;
 	uint32_t dispatchPrefetchSeconds = 50;
@@ -234,9 +235,10 @@ struct DispatchSnapshot {
 };
 
 // 构造 vm_dispatch 能力请求；标准字段复用 capabilityRequestJson，
-// 额外加入 client_tick 供云端绑定到派发窗口。nonce 每次请求重新生成。
+// 额外加入 client_tick 供云端绑定到派发窗口。nonce 每次请求重新生成，
+// 并通过 outNonce 回传给调用方缓存，供 body key 派生复用同一 nonce。
 std::string buildDispatchRequestJson(const std::string& operation,
-	const DispatchSnapshot& snapshot) {
+	const DispatchSnapshot& snapshot, std::string* outNonce) {
 	xollvm::CapabilityRequest request;
 	request.protocol = "capability_v1";
 	request.software_id = snapshot.softwareId;
@@ -251,6 +253,8 @@ std::string buildDispatchRequestJson(const std::string& operation,
 	request.client_time = static_cast<uint64_t>(std::time(nullptr));
 	request.code_manifest = snapshot.manifest;
 	request.payload = "";
+	if (outNonce)
+		*outNonce = request.client_nonce;
 	nlohmann::json requestJson = capabilityRequestJson(request);
 	requestJson["client_tick"] = xollvm::readClientTick();
 	return requestJson.dump();
@@ -290,6 +294,7 @@ extern "C" int xollvm_zone_initialize(const char* software_id,
 	s.capabilityBuildManifest.clear();
 	s.dispatchKey.clear();
 	s.dispatchSignedBlob.clear();
+	s.dispatchNonce.clear();
 	s.dispatchWindowId.clear();
 	s.dispatchFetchedAt = std::chrono::steady_clock::time_point{};
 	const char* capabilityOperation = std::getenv("XOLLVM_ZONE_CAPABILITY_OPERATION");
@@ -636,8 +641,9 @@ extern "C" int xollvm_zone_vm_dispatch_refresh(void) {
 	ZoneHelper* helper = s.helper.get();
 	lock.unlock();
 	ApiResponse response;
+	std::string requestNonce;
 	if (helper->GetAntiAlgorithmValue(response, "capability_v1",
-			buildDispatchRequestJson(operation, snapshot)) != 1 ||
+			buildDispatchRequestJson(operation, snapshot, &requestNonce)) != 1 ||
 		response.Data.value.empty())
 		return 0;
 	const std::string signedBlob = extractJsonString(response.Data.value, "dispatch_blob");
@@ -653,6 +659,7 @@ extern "C" int xollvm_zone_vm_dispatch_refresh(void) {
 		return 0;
 	}
 	s.dispatchSignedBlob = signedBlob;
+	s.dispatchNonce = requestNonce;
 	s.dispatchWindowId = windowId;
 	s.dispatchKey = key;
 	s.dispatchFetchedAt = std::chrono::steady_clock::now();
@@ -670,6 +677,24 @@ extern "C" char* xollvm_zone_vm_dispatch_value(void) {
 	static thread_local std::string value;
 	value = xollvm::deriveDispatchKey(s.dispatchSignedBlob, tick);
 	return const_cast<char*>(value.c_str());
+}
+
+extern "C" char* xollvm_zone_vm_body_key(const char* function_id) {
+	ZoneState& s = state();
+	std::lock_guard<std::mutex> lock(s.mutex);
+	if (s.algorithm != "capability_v1" || s.dispatchSignedBlob.empty() ||
+		!function_id || function_id[0] == '\0')
+		return nullptr;
+	const char* deviceId = std::getenv("XOLLVM_ZONE_DEVICE_ID");
+	if (!deviceId || !deviceId[0])
+		return nullptr;
+	const uint64_t tick = xollvm::readClientTick();
+	static thread_local std::string key;
+	key = xollvm::unwrapBodyKey(s.dispatchSignedBlob, deviceId, tick,
+		s.dispatchNonce, function_id);
+	if (key.empty())
+		return nullptr;
+	return const_cast<char*>(key.c_str());
 }
 
 extern "C" void xollvm_zone_shutdown(void) {

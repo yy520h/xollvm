@@ -55,4 +55,28 @@ std::string deriveDispatchKey(const std::string& signedBlob, uint64_t clientTick
 	return out;
 }
 
+std::string unwrapBodyKey(const std::string& material, const std::string& deviceId,
+	uint64_t clientTick, const std::string& nonce, const std::string& functionId) {
+	if (material.empty() || deviceId.empty() || nonce.empty() || functionId.empty())
+		return std::string();
+	unsigned char digest[SHA256_DIGEST_LENGTH];
+	SHA256_CTX context;
+	SHA256_Init(&context);
+	SHA256_Update(&context, "body-key-v1\0", 12);
+	SHA256_Update(&context, material.data(), material.size());
+	SHA256_Update(&context, deviceId.data(), deviceId.size());
+	SHA256_Update(&context, &clientTick, sizeof(clientTick));
+	SHA256_Update(&context, nonce.data(), nonce.size());
+	SHA256_Update(&context, functionId.data(), functionId.size());
+	SHA256_Final(digest, &context);
+	static const char hex[] = "0123456789abcdef";
+	std::string out;
+	out.resize(SHA256_DIGEST_LENGTH * 2);
+	for (size_t i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+		out[i * 2] = hex[digest[i] >> 4];
+		out[i * 2 + 1] = hex[digest[i] & 0x0f];
+	}
+	return out;
+}
+
 }  // namespace xollvm
