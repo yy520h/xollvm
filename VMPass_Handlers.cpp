@@ -1073,6 +1073,16 @@ void VMImpl::buildHandlersFloat() {
 			addCase(FP::FCMP_ULE, "vm.fcp.ule", [&](IRBuilder<>& BC) { return BC.CreateFCmpULE(AV, BV, "vm.fcp.v"); });
 			addCase(FP::FCMP_UNE, "vm.fcp.une", [&](IRBuilder<>& BC) { return BC.CreateFCmpUNE(AV, BV, "vm.fcp.v"); });
 			addCase(FP::FCMP_UNO, "vm.fcp.uno", [&](IRBuilder<>& BC) { return BC.CreateFCmpUNO(AV, BV, "vm.fcp.v"); });
+			// 修复 #4：FCMP_TRUE (pred=15) 必须返回 1，而不是默认 0。
+			// 单独走 case，不走 addCase（它受 needsFcmpPredicate 限制，
+			// 而 FCMP_TRUE 通常不在需求集合内）。
+			{
+				BasicBlock* TCBB = BasicBlock::Create(Ctx, "vm.fcp.true", HFn);
+				IRBuilder<> BC(TCBB);
+				Phi->addIncoming(BC.getInt32(1), TCBB);
+				BC.CreateBr(MergeBB);
+				SW->addCase(B.getInt32(IsaEnc.encFcmpPred((uint8_t)FP::FCMP_TRUE)), TCBB);
+			}
 		}
 	}
 
@@ -1331,10 +1341,17 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 		FTyIdx = B.CreateZExt(FTyIdxByte, I32Ty, "vm.cl.ftyx");
 	}
 
-	// Pre-load all MaxArgs arg slots.  The per-FTy case BBs select the right
-	// register file for each argument statically (no runtime Cat switch needed).
-	SmallVector<Value*, MaxArgs> PVals, IVals, I64Vs, FregVals;
-	for (unsigned i = 0; i < MaxArgs; ++i) {
+	const unsigned NFTy = (unsigned)UniqueFTys.size();
+	// 只按真实形参数预读参数字节；超过 NArgs 的槽位不读取，避免越界。
+	// 同时按 SrcFTy 的真实参数类型分别选择 ptr / i32 / i64 / float / double
+	// 寄存器文件，保留 ABI 语义（修复 #2：float 被当 double 调）。
+	SmallVector<Value*, MaxArgs> PVals, IVals, I64Vs, F32Vs, FregVals;
+	SmallVector<Type*, MaxArgs> RealPTys;
+	unsigned EffectiveNArgs = 0;
+	FunctionType* FirstFTy = (NFTy > 0) ? UniqueFTys[0] : nullptr;
+	if (FirstFTy)
+		EffectiveNArgs = std::min<unsigned>(FirstFTy->getNumParams(), MaxArgs);
+	for (unsigned i = 0; i < EffectiveNArgs; ++i) {
 		// arg bytes now start at Base+2 (was Base+5).
 		Value* AB = loadBC(B, CurIP, Base + 2 + i, "vm.cl.ab");
 		Value* PIdx = deobf(B, AB, MaskPR, "vm.cl.pi");
@@ -1347,6 +1364,11 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 		I64Vs.push_back(B.CreateIntToPtr(ldVR64(B, V64I), PtrTy, "vm.cl.i64p"));
 
 		FregVals.push_back(ldFR(B, FIdx));
+		F32Vs.push_back(B.CreateFPTrunc(FregVals.back(), Type::getFloatTy(Ctx), "vm.cl.f32"));
+		if (FirstFTy && i < FirstFTy->getNumParams())
+			RealPTys.push_back(FirstFTy->getParamType(i));
+		else
+			RealPTys.push_back(PtrTy);
 	}
 
 
@@ -1367,7 +1389,6 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 	BasicBlock* MergeBB = BasicBlock::Create(Ctx, "vm.cl.merge", HFn);
 
 	// switch on FTyIdx -- one case per unique FunctionType.
-	unsigned NFTy = (unsigned)UniqueFTys.size();
 	PHINode* RetPHI = nullptr;
 
 
@@ -1395,8 +1416,13 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 		SmallVector<Type*, MaxArgs> ATys;
 		SmallVector<Value*, MaxArgs> CA;
 		for (unsigned i = 0; i < N && i < MaxArgs; ++i) {
-			Type* PT = SrcFTy->getParamType(i);
-			if (PT->isFloatTy() || PT->isDoubleTy()) {
+			Type* PT = (i < RealPTys.size()) ? RealPTys[i] : SrcFTy->getParamType(i);
+			if (PT->isFloatTy()) {
+				// 修复 #2：float 参数必须用真实 float 类型，不能升 double。
+				ATys.push_back(Type::getFloatTy(Ctx));
+				CA.push_back(F32Vs[i]);
+			}
+			else if (PT->isDoubleTy()) {
 				ATys.push_back(DoubleTy);
 				CA.push_back(FregVals[i]);
 			}
@@ -1408,9 +1434,7 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 					CA.push_back(I64Vs[i]);
 				else
 					CA.push_back(IVals[i]);
-
 			}
-
 		}
 
 
@@ -1432,6 +1456,7 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 		CSW.PVals.assign(PVals.begin(), PVals.end());
 		CSW.IVals.assign(IVals.begin(), IVals.end());
 		CSW.I64Vs.assign(I64Vs.begin(), I64Vs.end());
+		CSW.F32Vs.assign(F32Vs.begin(), F32Vs.end());
 		CSW.FregVals.assign(FregVals.begin(), FregVals.end());
 	}
 

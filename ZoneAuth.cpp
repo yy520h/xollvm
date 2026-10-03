@@ -3,6 +3,7 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #include "zone_runtime/zone_link_manifest.h"
@@ -171,6 +172,12 @@ static bool injectGate(Function& F, StringRef Capability, StringRef CodeManifest
 static void injectStartup(Function& F) {
 	Module& M = *F.getParent();
 	LLVMContext& C = M.getContext();
+	// 修复 #13：ZoneAuth 的 svc 退出是 Android/AArch64 特化，
+	// 仅在目标为 AArch64 时注入；x86_64/Windows 目标跳过以避免编译错误。
+	const Triple TargetTriple(M.getTargetTriple());
+	const bool IsAArch64 = TargetTriple.getArch() == Triple::aarch64;
+	if (!IsAArch64)
+		return;
 	FunctionType* InitTy = FunctionType::get(Type::getInt32Ty(C),
 		{PointerType::getUnqual(Type::getInt8Ty(C)),
 		 PointerType::getUnqual(Type::getInt8Ty(C)),
@@ -189,8 +196,7 @@ static void injectStartup(Function& F) {
 	FunctionCallee FirstHeartbeat = M.getOrInsertFunction(
 		"xollvm_zone_first_heartbeat", FunctionType::get(Type::getInt32Ty(C), false));
 	IRBuilder<> B(&*F.getEntryBlock().getFirstInsertionPt());
-	B.CreateCall(SetShutdownMode, {ConstantInt::get(Type::getInt32Ty(C),
-		ObfZoneShutdownMode == "auto" ? 1 : 0)});
+	// 修复 #17：移除重复的 SetShutdownMode 调用。
 	B.CreateCall(SetShutdownMode, {ConstantInt::get(Type::getInt32Ty(C),
 		ObfZoneShutdownMode == "auto" ? 1 : 0)});
 	auto Str = [&](StringRef Text, StringRef Name) -> llvm::Value* {
@@ -260,8 +266,6 @@ PreservedAnalyses ZoneAuthModulePass::run(Module& M, ModuleAnalysisManager& MAM)
 	if (!ObfZoneCapabilityOperation.empty() &&
 		(ObfZoneCapabilityPublicKey.empty() || ObfZoneCapabilityBuildId.empty() ||
 		 ObfZoneCapabilityCodeManifest.empty()))
-		return PreservedAnalyses::all();
-	if (ObfZoneShutdownMode != "auto" && ObfZoneShutdownMode != "manual")
 		return PreservedAnalyses::all();
 	for (Function& F : M)
 		if (F.getName() == "main")

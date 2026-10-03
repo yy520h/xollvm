@@ -328,29 +328,38 @@ void VMImpl::buildEncryptCtor() {
 					if (auto* MDFlags = StubM->getModuleFlagsMetadata())
 						MDFlags->eraseFromParent();
 					if (Linker::linkModules(M, std::move(StubM), 0)) {
-						errs() << "[vm] linkModules failed for AES stub\n";
+						llvm::report_fatal_error(
+							llvm::StringRef("[vm] AES stub linkModules failed — cannot build decryptor"),
+							/*gen_crash_diag=*/false);
 					}
 				}
 				else {
+					std::string Msg;
 					handleAllErrors(StubOrErr.takeError(),
-						[](const ErrorInfoBase& EI) {
-							errs() << "[vm] AES stub parse failed: "
-								<< EI.message() << "\n";
+						[&](const ErrorInfoBase& EI) {
+							Msg = EI.message();
 						});
+					llvm::report_fatal_error(
+						llvm::StringRef("[vm] AES stub parse failed: " + Msg),
+						/*gen_crash_diag=*/false);
 				}
 			}
 			else {
-				errs() << "[vm] embedded AES stub bitcode is empty — "
-					<< "did the CMake strenc_stub build rule run?\n";
+				llvm::report_fatal_error(
+					llvm::StringRef("[vm] embedded AES stub bitcode is empty — "
+						"did the CMake strenc_stub build rule run?"),
+					/*gen_crash_diag=*/false);
 			}
 		}
 		CTRDecryptFn = M.getFunction("__obf_aes_ctr_decrypt");
 	}
 
+	// 修复 #6：AES stub 缺失时必须中止编译，不能产出无法解密的坏文件。
 	if (!CTRDecryptFn) {
-		errs() << "[vm] ERROR: __obf_aes_ctr_decrypt not available "
-			<< "(embedded AES stub missing/unlinkable); bytecode ctor skipped\n";
-		return;
+		llvm::report_fatal_error(
+			llvm::StringRef("[vm] __obf_aes_ctr_decrypt not available after link attempt; "
+				"aborting to avoid emitting an undecryptable bytecode image"),
+			/*gen_crash_diag=*/false);
 	}
 
 

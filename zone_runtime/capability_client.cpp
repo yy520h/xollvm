@@ -82,8 +82,15 @@ bool CapabilityClient::writeState(const CapabilityResponse& response) {
 #endif
       return false;
     }
-    file << response.next_state << '\n' << response.operation << '\n'
-         << response.expires_at << '\n';
+    // 修复 #12：除了 next_state，同时持久化 vm_value / issued_at / expires_at，
+    // 使重启后 loadState 能恢复完整 response_，离线 require() 可用。
+    file << response.next_state << '\n'
+         << response.operation << '\n'
+         << response.expires_at << '\n'
+         << response.issued_at << '\n'
+         << response.vm_value << '\n'
+         << response.key_id << '\n'
+         << response.policy_version << '\n';
     file.flush();
     if (!file) {
 #ifdef XOLLVM_ZONE_DEBUG_PKT
@@ -108,13 +115,30 @@ bool CapabilityClient::writeState(const CapabilityResponse& response) {
 bool CapabilityClient::loadState() {
   if (config_.state_path.empty()) return false;
   std::ifstream file(config_.state_path, std::ios::binary);
+  if (!file) return false;
+  // 修复 #12：恢复完整 response，使重启后离线 require() 可用。
+  // 兼容旧格式（仅 3 行）：旧格式直接拒绝，强制重新登录。
   std::string operation;
-  uint64_t expires = 0;
-  if (!file || !(file >> state_ >> operation >> expires) ||
-      operation != config_.operation || expires < config_.server_time) {
+  uint64_t expires = 0, issued = 0;
+  std::string vmValue, keyId;
+  uint32_t policyVersion = 0;
+  if (!(file >> state_ >> operation >> expires >> issued >> vmValue >> keyId >> policyVersion)) {
     state_.clear();
     return false;
   }
+  if (operation != config_.operation || expires < config_.server_time) {
+    state_.clear();
+    return false;
+  }
+  // 恢复 response_ 的必要字段，供 require() 判断。
+  response_.next_state = state_;
+  response_.operation = operation;
+  response_.expires_at = expires;
+  response_.issued_at = issued;
+  response_.vm_value = vmValue;
+  response_.key_id = keyId;
+  response_.policy_version = policyVersion;
+  response_.ok = true;
   return true;
 }
 
@@ -150,6 +174,43 @@ bool CapabilityClient::acceptResponse(const CapabilityResponse& response,
       response.expires_at <= response.issued_at)
     return false;
   return writeState(response);
+}
+
+bool CapabilityClient::verifyDispatchResponse(const CapabilityResponse& response,
+                                              const std::string& expected_request_hash,
+                                              const std::string& expected_device_id_hash) const {
+  const uint64_t now = config_.server_time;
+  bool valid = validateCapabilityResponse(response);
+  bool sig = verifySignature(response);
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+  {
+    auto dbgline = [&](const char* name, bool ok, const std::string& detail) {
+      std::fprintf(stderr, "[Zone][vdsp] %-22s %s  %s\n", name, ok ? "ok" : "FAIL", detail.c_str());
+    };
+    dbgline("validate", valid, "");
+    dbgline("key_id", response.key_id == config_.key_id, response.key_id + " vs " + config_.key_id);
+    dbgline("request_hash", response.request_hash == expected_request_hash,
+            response.request_hash.substr(0,16)+" vs "+expected_request_hash.substr(0,16));
+    dbgline("device_id_hash", expected_device_id_hash.empty() ||
+            response.device_id_hash == expected_device_id_hash, "");
+    dbgline("policy_version", response.policy_version == config_.policy_version,
+            std::to_string(response.policy_version)+" vs "+std::to_string(config_.policy_version));
+    dbgline("signature", sig, sig ? "" : "dispatch_v 验签失败");
+    dbgline("issued<=now+skew", response.issued_at <= now + config_.clock_skew_seconds,
+            std::to_string(response.issued_at)+" vs now="+std::to_string(now));
+    dbgline("expires+skew>=now", response.expires_at + config_.clock_skew_seconds >= now,
+            std::to_string(response.expires_at)+" vs now="+std::to_string(now));
+  }
+#endif
+  if (!valid || response.key_id != config_.key_id ||
+      response.request_hash != expected_request_hash ||
+      (!expected_device_id_hash.empty() && response.device_id_hash != expected_device_id_hash) ||
+      response.policy_version != config_.policy_version || !sig ||
+      response.issued_at > now + config_.clock_skew_seconds ||
+      response.expires_at + config_.clock_skew_seconds < now ||
+      response.expires_at <= response.issued_at)
+    return false;
+  return true;
 }
 
 bool CapabilityClient::hasState() const { return !state_.empty(); }

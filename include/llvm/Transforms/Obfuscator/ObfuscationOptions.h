@@ -24,7 +24,7 @@ namespace llvm {
 	extern llvm::cl::opt<std::string> ObfZoneCapabilityPublicKey;
 	extern llvm::cl::opt<std::string> ObfZoneCapabilityBuildId;
 	extern llvm::cl::opt<std::string> ObfZoneCapabilityCodeManifest;
-	extern llvm::cl::opt<unsigned> ObfZoneCapabilityValidSeconds;
+	// 修复 #16：有效期由云端决定，客户端选项已移除。
 	extern llvm::cl::opt<std::string> ObfZoneCapabilityKeyId;
 
 

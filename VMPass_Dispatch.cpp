@@ -782,7 +782,12 @@ void VMImpl::ensureCallFTyCases() {
 			SmallVector<Value*, VMEngine::MaxArgs> CA;
 			for (unsigned i = 0; i < N && i < VMEngine::MaxArgs; ++i) {
 				Type* PT = SrcFTy->getParamType(i);
-				if (PT->isFloatTy() || PT->isDoubleTy()) {
+				if (PT->isFloatTy()) {
+					// 修复 #2：float 参数必须用真实 float 类型，不能升 double。
+					ATys.push_back(Type::getFloatTy(Ctx));
+					CA.push_back(CSW.F32Vs[i]);
+				}
+				else if (PT->isDoubleTy()) {
 					ATys.push_back(DoubleTy);
 					CA.push_back(CSW.FregVals[i]);
 				}

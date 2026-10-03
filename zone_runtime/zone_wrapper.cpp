@@ -175,7 +175,7 @@ std::string randomHex(size_t bytes) {
 	return out.str();
 }
 
-std::string makeGuardHash(const std::string& nonce,
+[[maybe_unused]] std::string makeGuardHash(const std::string& nonce,
 	const std::string& softwareId, const std::string& version) {
 	// 该摘要绑定本次挑战和当前构建配置；云端仍以签名结果为最终依据。
 	std::hash<std::string> hash;
@@ -225,7 +225,7 @@ std::string jsonStringField(const nlohmann::json& json, const char* field) {
 }
 
 // 解析可能被 Result.RetMsg 多层包裹的响应 JSON，返回指定字符串字段，失败返回空串。
-std::string extractJsonString(const std::string& encoded, const char* field) {
+[[maybe_unused]] std::string extractJsonString(const std::string& encoded, const char* field) {
 	nlohmann::json json;
 	if (!unwrapResponseJson(encoded, &json))
 		return std::string();
@@ -253,32 +253,6 @@ struct DispatchSnapshot {
 	std::string buildId;
 	std::string deviceId;
 };
-
-// 构造 vm_dispatch 能力请求；标准字段复用 capabilityRequestJson，
-// 额外加入 client_tick 供云端绑定到派发窗口。nonce 每次请求重新生成，
-// 并通过 outNonce 回传给调用方缓存，供 body key 派生复用同一 nonce。
-std::string buildDispatchRequestJson(const std::string& operation,
-	const DispatchSnapshot& snapshot, std::string* outNonce) {
-	xollvm::CapabilityRequest request;
-	request.protocol = "capability_v1";
-	request.software_id = snapshot.softwareId;
-	request.version = snapshot.version;
-	request.build_id = snapshot.buildId;
-	request.device_id = snapshot.deviceId;
-	request.operation = operation;
-	request.state = snapshot.clientState.empty()
-		? std::string(32, '0') : snapshot.clientState;
-	request.client_nonce = randomHex(16);
-	request.request_id = randomHex(16);
-	request.client_time = static_cast<uint64_t>(std::time(nullptr));
-	request.code_manifest = snapshot.manifest;
-	request.payload = "";
-	if (outNonce)
-		*outNonce = request.client_nonce;
-	nlohmann::json requestJson = capabilityRequestJson(request);
-	requestJson["client_tick"] = xollvm::readClientTick();
-	return requestJson.dump();
-}
 
 } // namespace
 
@@ -666,10 +640,54 @@ extern "C" int xollvm_zone_vm_dispatch_refresh(void) {
 	const std::string operation = "vm_dispatch";
 	ZoneHelper* helper = s.helper.get();
 	lock.unlock();
+
+	// 构造请求并计算 requestHash / deviceIdHash（与 capability_begin 相同的口径）
+	xollvm::CapabilityRequest capabilityRequest;
+	capabilityRequest.protocol = "capability_v1";
+	capabilityRequest.software_id = snapshot.softwareId;
+	capabilityRequest.version = snapshot.version;
+	capabilityRequest.build_id = snapshot.buildId;
+	capabilityRequest.device_id = snapshot.deviceId;
+	capabilityRequest.operation = operation;
+	capabilityRequest.state = snapshot.clientState.empty()
+		? std::string(32, '0') : snapshot.clientState;
+	capabilityRequest.client_nonce = randomHex(16);
+	capabilityRequest.request_id = randomHex(16);
+	capabilityRequest.client_time = static_cast<uint64_t>(std::time(nullptr));
+	capabilityRequest.code_manifest = snapshot.manifest;
+	capabilityRequest.payload = "";
+
+	const std::string canonicalRequest =
+		xollvm::canonicalizeCapabilityRequest(capabilityRequest);
+	unsigned char requestDigest[SHA256_DIGEST_LENGTH];
+	SHA256(reinterpret_cast<const unsigned char*>(canonicalRequest.data()),
+		canonicalRequest.size(), requestDigest);
+	static const char hex[] = "0123456789abcdef";
+	std::string requestHash;
+	requestHash.resize(SHA256_DIGEST_LENGTH * 2);
+	for (size_t i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+		requestHash[i * 2] = hex[requestDigest[i] >> 4];
+		requestHash[i * 2 + 1] = hex[requestDigest[i] & 0x0f];
+	}
+	std::string deviceIdHash;
+	{
+		unsigned char deviceDigest[SHA256_DIGEST_LENGTH];
+		SHA256(reinterpret_cast<const unsigned char*>(snapshot.deviceId.data()),
+			snapshot.deviceId.size(), deviceDigest);
+		deviceIdHash.resize(SHA256_DIGEST_LENGTH * 2);
+		for (size_t i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+			deviceIdHash[i * 2] = hex[deviceDigest[i] >> 4];
+			deviceIdHash[i * 2 + 1] = hex[deviceDigest[i] & 0x0f];
+		}
+	}
+
+	// 发起网络请求
+	nlohmann::json requestJson = capabilityRequestJson(capabilityRequest);
+	requestJson["client_tick"] = xollvm::readClientTick();
+	std::string requestNonce = capabilityRequest.client_nonce;
 	ApiResponse response;
-	std::string requestNonce;
 	int gav = helper->GetAntiAlgorithmValue(response, "capability_v1",
-			buildDispatchRequestJson(operation, snapshot, &requestNonce));
+			requestJson.dump());
 #ifdef XOLLVM_ZONE_DEBUG_PKT
 	std::fprintf(stderr, "[Zone][vmdisp] GetAntiAlgorithmValue rc=%d value.size=%zu\n",
 		gav, response.Data.value.size());
@@ -677,42 +695,77 @@ extern "C" int xollvm_zone_vm_dispatch_refresh(void) {
 #endif
 	if (gav != 1 || response.Data.value.empty())
 		return 0;
-	const std::string signedBlob = extractJsonString(response.Data.value, "dispatch_blob");
-	const std::string windowId = extractJsonString(response.Data.value, "window_id");
-	const std::string vB64 = extractJsonString(response.Data.value, "dispatch_v");
-#ifdef XOLLVM_ZONE_DEBUG_PKT
-	std::fprintf(stderr, "[Zone][vmdisp] parsed window_id='%s' vB64.len=%zu blob.len=%zu\n",
-		windowId.c_str(), vB64.size(), signedBlob.size());
-#endif
-	// 新模型：云端返回 dispatch_v（32B base64，已搜索使 offset==0）；
-	// 旧模型：返回 dispatch_blob（Ed25519 签名，供 body key 派生）。二者可并存。
-	if (windowId.empty() || (signedBlob.empty() && vB64.empty()))
-		return 0;
-	std::string vRaw;
-	if (!vB64.empty()) {
-		vRaw = base64_decode(vB64);
-		if (vRaw.size() != 32)
-			vRaw.clear();
-	}
-	std::string key;
-	if (!signedBlob.empty())
-		key = xollvm::deriveDispatchKey(signedBlob, xollvm::readClientTick());
-	lock.lock();
-	// 回写前复核 generation：客户端未被替换、仍登录且租约有效，否则丢弃结果。
-	if (s.capabilityClient.get() != client || !s.loggedIn || !s.leaseValid) {
-		lock.unlock();
+
+	// 解析完整 JSON 响应为 CapabilityResponse，供 verifyDispatchResponse 校验
+	nlohmann::json json;
+	if (!unwrapResponseJson(response.Data.value, &json)) {
+		std::fprintf(stderr, "[Zone][vmdisp] malformed response JSON\n");
 		return 0;
 	}
-	if (!signedBlob.empty()) {
-		s.dispatchSignedBlob = signedBlob;
-		s.dispatchKey = key;
+	if (!json.is_object())
+		return 0;
+	try {
+		xollvm::CapabilityResponse capabilityResponse;
+		capabilityResponse.protocol = json.value("protocol", 0u);
+		capabilityResponse.ok = json.value("ok", false);
+		capabilityResponse.operation = json.value("operation", std::string());
+		capabilityResponse.request_hash = json.value("request_hash", std::string());
+		capabilityResponse.device_id_hash = json.value("device_id_hash", std::string());
+		capabilityResponse.next_state = json.value("next_state", std::string());
+		capabilityResponse.vm_value = json.value("vm_value", std::string());
+		capabilityResponse.server_time = json.value("server_time", uint64_t{0});
+		capabilityResponse.issued_at = json.value("issued_at", uint64_t{0});
+		capabilityResponse.expires_at = json.value("expires_at", uint64_t{0});
+		capabilityResponse.policy_version = json.value("policy_version", 0u);
+		capabilityResponse.key_id = json.value("key_id", std::string());
+		capabilityResponse.signature = json.value("signature", std::string());
+		capabilityResponse.window_id = json.value("window_id", std::string());
+		capabilityResponse.dispatch_blob = json.value("dispatch_blob", std::string());
+		capabilityResponse.dispatch_v = json.value("dispatch_v", std::string());
+
+		// 修复 #7：vm_dispatch 响应必须走验签/request/device/有效期绑定校验，
+		// 不能把未验证的 dispatch_v 写入全局状态。
+		if (!client->verifyDispatchResponse(capabilityResponse,
+				requestHash, deviceIdHash)) {
+			std::fprintf(stderr,
+				"[Zone][vmdisp] dispatch response verification failed\n");
+			return 0;
+		}
+
+		const std::string signedBlob = capabilityResponse.dispatch_blob;
+		const std::string windowId = capabilityResponse.window_id;
+		const std::string vB64 = capabilityResponse.dispatch_v;
+		if (windowId.empty() || (signedBlob.empty() && vB64.empty()))
+			return 0;
+		std::string vRaw;
+		if (!vB64.empty()) {
+			vRaw = base64_decode(vB64);
+			if (vRaw.size() != 32)
+				vRaw.clear();
+		}
+		std::string key;
+		if (!signedBlob.empty())
+			key = xollvm::deriveDispatchKey(signedBlob, xollvm::readClientTick());
+		lock.lock();
+		// 回写前复核 generation：客户端未被替换、仍登录且租约有效，否则丢弃结果。
+		if (s.capabilityClient.get() != client || !s.loggedIn || !s.leaseValid) {
+			lock.unlock();
+			return 0;
+		}
+		if (!signedBlob.empty()) {
+			s.dispatchSignedBlob = signedBlob;
+			s.dispatchKey = key;
+		}
+		if (!vRaw.empty())
+			s.dispatchV = vRaw;
+		s.dispatchNonce = requestNonce;
+		s.dispatchWindowId = windowId;
+		s.dispatchFetchedAt = std::chrono::steady_clock::now();
+		return 1;
+	} catch (const nlohmann::json::exception&) {
+		std::fprintf(stderr, "[Zone][vmdisp] response conversion failed\n");
+		return 0;
 	}
-	if (!vRaw.empty())
-		s.dispatchV = vRaw;
-	s.dispatchNonce = requestNonce;
-	s.dispatchWindowId = windowId;
-	s.dispatchFetchedAt = std::chrono::steady_clock::now();
-	return 1;
 }
 
 // 供 cloud_value_manager 取回当前 V（32 字节原始值）。成功返回 1。

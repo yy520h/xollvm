@@ -74,8 +74,8 @@ cl::opt<std::string> llvm::ObfZoneCapabilityBuildId(
 	"obf-zone-capability-build-id", cl::desc("Optional non-secret capability build ID."), cl::init(""));
 cl::opt<std::string> llvm::ObfZoneCapabilityCodeManifest(
 	"obf-zone-capability-code-manifest", cl::desc("Optional non-secret capability code manifest."), cl::init(""));
-cl::opt<unsigned> llvm::ObfZoneCapabilityValidSeconds(
-	"obf-zone-capability-valid-seconds", cl::desc("Capability validity window."), cl::init(300));
+// 修复 #16：有效期由云端 capability_v1.js 的 CODE_CONFIG.validSeconds 决定，
+// 客户端配置不会生效。移除该选项避免误导。
 cl::opt<std::string> llvm::ObfZoneCapabilityKeyId(
 	"obf-zone-capability-key-id", cl::desc("Capability signing public-key version."), cl::init("key-1"));
 

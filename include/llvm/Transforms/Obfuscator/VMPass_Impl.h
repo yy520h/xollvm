@@ -277,14 +277,14 @@ namespace llvm {
 			SmallVector<FunctionType*, 16> SharedFTys;
 			DenseMap<FunctionType*, uint8_t> FTyToIdx;
 
-			struct CallSwitchInfo {
-				SwitchInst* SW = nullptr;
-				BasicBlock* MergeBB = nullptr;
-				PHINode* RetPHI = nullptr;
-				Value* Callee = nullptr;
-				SmallVector<Value*, 8> PVals, IVals, I64Vs, FregVals;
-				RetKind2    RK = RK2_VOID;
-			};
+		struct CallSwitchInfo {
+			SwitchInst* SW = nullptr;
+			BasicBlock* MergeBB = nullptr;
+			PHINode* RetPHI = nullptr;
+			Value* Callee = nullptr;
+			SmallVector<Value*, 8> PVals, IVals, I64Vs, F32Vs, FregVals;
+			RetKind2    RK = RK2_VOID;
+		};
 			CallSwitchInfo CallSW[5];
 
 			bool Populated = false;

@@ -29,6 +29,7 @@ CloudValueManager::CloudValueManager()
     , m_running(false)
     , m_thread(0)
     , m_initialized(false) {
+    std::lock_guard<std::mutex> lk(m_V.mutex);
     std::memcpy(m_V.data, INITIAL_V, V_SIZE);
     m_V.fetch_time.store(0, std::memory_order_release);
 }
@@ -76,7 +77,9 @@ void CloudValueManager::setTimeOffset(int64_t offset) {
 
 void CloudValueManager::updateV(const uint8_t* new_V, size_t len) {
     if (!new_V || len < V_SIZE) return;
+    std::lock_guard<std::mutex> lk(m_V.mutex);
     std::memcpy(m_V.data, new_V, V_SIZE);
+    m_V.window_id = getWindowId();
     m_V.fetch_time.store(getSyncedTimestamp(), std::memory_order_release);
 }
 
@@ -126,15 +129,23 @@ uint64_t CloudValueManager::computeDispatchOffset() {
         uint64_t window = getWindowId();
         uint8_t new_V[V_SIZE];
         if (fetchVFromCloud(window, new_V)) {
+            std::lock_guard<std::mutex> lk(m_V.mutex);
             std::memcpy(m_V.data, new_V, V_SIZE);
+            m_V.window_id = window;
             m_V.fetch_time.store(getSyncedTimestamp(), std::memory_order_release);
         }
     }
 
     uint8_t V_snapshot[V_SIZE];
-    std::memcpy(V_snapshot, m_V.data, V_SIZE);
-
-    uint64_t window = getWindowId();
+    uint64_t window;
+    {
+        // 修复 #9：加锁读取 m_V.data，避免与预取线程的 memcpy 撕裂。
+        // 修复 #10：必须使用 V 对应的 window_id 计算 HMAC，而非当前 window；
+        // 否则窗口翻转期间会装错窗口的 V 算出非 0 offset。
+        std::lock_guard<std::mutex> lk(m_V.mutex);
+        std::memcpy(V_snapshot, m_V.data, V_SIZE);
+        window = (m_V.window_id != 0) ? m_V.window_id : getWindowId();
+    }
     uint64_t raw = hmac64(V_snapshot, V_SIZE,
                           reinterpret_cast<const uint8_t*>(&window), sizeof(window));
 
@@ -147,6 +158,10 @@ bool CloudValueManager::fetchVFromCloud(uint64_t windowId, uint8_t* out_V) {
     //   xollvm_zone_vm_dispatch_refresh() 发起 vm_dispatch 请求并解析 dispatch_v
     //   xollvm_zone_vm_dispatch_copy_v()  取回 32 字节原始 V
     // 两者以弱符号声明：独立单测（未链接 zone_wrapper）时自动退化为无云值。
+    // 修复 #10：windowId 透传给 refresh，让云端知道我们要哪个窗口的 V。
+    // 但当前 zone_wrapper 的 refresh 未接收 windowId（云端按服务器当前窗口派发），
+    // 所以这里记录日志即可；真正使用 windowId 的地方在 computeDispatchOffset 中
+    // 选择 m_V.window_id 作为 HMAC 输入。
     (void)windowId;
     if (!xollvm_zone_vm_dispatch_refresh || !xollvm_zone_vm_dispatch_copy_v)
         return false;
@@ -185,7 +200,9 @@ void CloudValueManager::updaterThreadLoop() {
         }
 
         if (success) {
+            std::lock_guard<std::mutex> lk(m_V.mutex);
             std::memcpy(m_V.data, new_V, V_SIZE);
+            m_V.window_id = window;
             m_V.fetch_time.store(getSyncedTimestamp(), std::memory_order_release);
         }
         // 失败：继续用旧 V。窗口推进后 offset 自然偏离，VM 崩溃。

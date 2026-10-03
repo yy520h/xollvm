@@ -412,6 +412,14 @@ Function* VMImpl::getOrCreateNestedFcmpHelper() {
 	addCase(FP::FCMP_ULE, "ule", [&](IRBuilder<>& BC) { return BC.CreateFCmpULE(AArg, BArg); });
 	addCase(FP::FCMP_UNE, "une", [&](IRBuilder<>& BC) { return BC.CreateFCmpUNE(AArg, BArg); });
 	addCase(FP::FCMP_UNO, "uno", [&](IRBuilder<>& BC) { return BC.CreateFCmpUNO(AArg, BArg); });
+	// 修复 #4：FCMP_TRUE (pred=15) 必须返回 1，不能落到默认 0。
+	{
+		BasicBlock* TCBB = BasicBlock::Create(Ctx, "true", HF);
+		IRBuilder<> BC(TCBB);
+		Phi->addIncoming(BC.getInt32(1), TCBB);
+		BC.CreateBr(MergeBB);
+		SW->addCase(B.getInt32(IsaEnc.encFcmpPred((uint8_t)FP::FCMP_TRUE)), TCBB);
+	}
 
 	return HF;
 }

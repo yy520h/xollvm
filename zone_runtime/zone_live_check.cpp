@@ -26,7 +26,8 @@ int main() {
 		envOrEmpty("XOLLVM_ZONE_VERSION"),
 		envOrEmpty("XOLLVM_ZONE_ENCRYPT_KEY"),
 		envOrEmpty("XOLLVM_ZONE_ENCRYPT_IV"),
-		envOrEmpty("XOLLVM_ZONE_ALGORITHM"), 120, 180)) {
+		envOrEmpty("XOLLVM_ZONE_ALGORITHM"),
+		envOrEmpty("XOLLVM_ZONE_CAPABILITY_KEY_ID"), 120, 180)) {
 		std::cerr << "Zone initialize failed.\n";
 		return 1;
 	}

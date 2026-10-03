@@ -99,124 +99,83 @@ bool VMImpl::prepare() {
 			default: break;
 			}
 
-			//  Tier B: memcpy / memmove 
-			if (IID == Intrinsic::memcpy || IID == Intrinsic::memmove) {
-				if (auto* SzC = dyn_cast<ConstantInt>(CI->getArgOperand(2))) {
-					Type* ElemTy = nullptr;
-					switch (SzC->getZExtValue()) {
-					case 1: ElemTy = I8Ty;  break;
-					case 2: ElemTy = I16Ty; break;
-					case 4: ElemTy = I32Ty; break;
-					case 8: ElemTy = I64Ty; break;
-					default: break;
-					}
-					if (ElemTy) {
-						B.CreateStore(B.CreateLoad(ElemTy, CI->getArgOperand(1), "mc.ld"),
-							CI->getArgOperand(0));
-						CI->eraseFromParent();
-						continue;
-					}
+		//  Tier B: memcpy / memmove 
+		if (IID == Intrinsic::memcpy || IID == Intrinsic::memmove) {
+			if (auto* SzC = dyn_cast<ConstantInt>(CI->getArgOperand(2))) {
+				Type* ElemTy = nullptr;
+				switch (SzC->getZExtValue()) {
+				case 1: ElemTy = I8Ty;  break;
+				case 2: ElemTy = I16Ty; break;
+				case 4: ElemTy = I32Ty; break;
+				case 8: ElemTy = I64Ty; break;
+				default: break;
 				}
-				continue; // non-constant / odd size → markUnsupported later
-			}
-
-			//  Tier B: memset ─
-			if (IID == Intrinsic::memset) {
-				auto* SzC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
-				auto* ValC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
-				if (SzC && ValC && SzC->getZExtValue() <= 8) {
-					uint64_t Sz = SzC->getZExtValue();
-					uint8_t  Val = (uint8_t)ValC->getZExtValue();
-					uint64_t Fill = 0;
-					for (uint64_t i = 0; i < Sz; ++i) Fill |= ((uint64_t)Val << (i * 8));
-					Type* ElemTy = IntegerType::get(Ctx, (unsigned)(Sz * 8));
-					B.CreateStore(ConstantInt::get(ElemTy, Fill), CI->getArgOperand(0));
-					CI->eraseFromParent();
-					continue;
-				}
-				continue;
-			}
-
-			//  Tier C: fabs(x) → x >= 0.0 ? x : -x 
-			if (IID == Intrinsic::fabs) {
-				Value* X = CI->getArgOperand(0);
-				Type* FT = X->getType();
-				Value* Neg = B.CreateFNeg(X, "fabs.neg");
-				Value* Cmp = B.CreateFCmpOGE(X, ConstantFP::get(FT, 0.0), "fabs.cmp");
-				Value* R = B.CreateSelect(Cmp, X, Neg, "fabs.r");
-				CI->replaceAllUsesWith(R);
-				CI->eraseFromParent();
-				continue;
-			}
-
-			//  Tier C: fmuladd / fma → a*b + c ─
-			if (IID == Intrinsic::fmuladd || IID == Intrinsic::fma) {
-				Value* A = CI->getArgOperand(0);
-				Value* Bv = CI->getArgOperand(1);
-				Value* C = CI->getArgOperand(2);
-				Value* R = B.CreateFAdd(B.CreateFMul(A, Bv, "fma.mul"), C, "fma.add");
-				CI->replaceAllUsesWith(R);
-				CI->eraseFromParent();
-				continue;
-			}
-
-			//  Tier C: minnum / maxnum 
-			if (IID == Intrinsic::minnum) {
-				Value* A = CI->getArgOperand(0), * Bv = CI->getArgOperand(1);
-				Value* R = B.CreateSelect(B.CreateFCmpOLT(A, Bv, "min.cmp"), A, Bv, "min.r");
-				CI->replaceAllUsesWith(R);
-				CI->eraseFromParent();
-				continue;
-			}
-			if (IID == Intrinsic::maxnum) {
-				Value* A = CI->getArgOperand(0), * Bv = CI->getArgOperand(1);
-				Value* R = B.CreateSelect(B.CreateFCmpOGT(A, Bv, "max.cmp"), A, Bv, "max.r");
-				CI->replaceAllUsesWith(R);
-				CI->eraseFromParent();
-				continue;
-			}
-
-			//  Tier C: copysign(mag, sgn)
-			if (IID == Intrinsic::copysign) {
-				Value* Mag = CI->getArgOperand(0);
-				Value* Sgn = CI->getArgOperand(1);
-				Type* FT = Mag->getType();
-				Value* Zero = ConstantFP::get(FT, 0.0);
-				Value* NegM = B.CreateFNeg(Mag, "cs.nm");
-				Value* AbsM = B.CreateSelect(B.CreateFCmpOGE(Mag, Zero, "cs.ac"), Mag, NegM, "cs.am");
-				Value* R = B.CreateSelect(B.CreateFCmpOGE(Sgn, Zero, "cs.sc"),
-					AbsM, B.CreateFNeg(AbsM, "cs.na"), "cs.r");
-				CI->replaceAllUsesWith(R);
-				CI->eraseFromParent();
-				continue;
-			}
-
-			//  Tier D: abs(x, _) → x < 0 ? -x : x ─
-			if (IID == Intrinsic::abs) {
-				Value* X = CI->getArgOperand(0);
-				Type* IT = X->getType();
-				Value* Zero = ConstantInt::get(IT, 0);
-				Value* Neg = B.CreateSub(Zero, X, "abs.neg");
-				Value* R = B.CreateSelect(B.CreateICmpSLT(X, Zero, "abs.cmp"), Neg, X, "abs.r");
-				CI->replaceAllUsesWith(R);
-				CI->eraseFromParent();
-				continue;
-			}
-
-			// llvm.is.fpclass(x, 3) is the canonical isnan lowering.
-			// FCmp UNO has the same NaN semantics and is VM-supported.
-			if (IID == Intrinsic::is_fpclass) {
-				auto* Mask = dyn_cast<ConstantInt>(CI->getArgOperand(1));
-				if (Mask && Mask->getZExtValue() == 3) {
-					Value* X = CI->getArgOperand(0);
-					CI->replaceAllUsesWith(B.CreateFCmpUNO(X, X, "isnan.vm"));
+				if (ElemTy) {
+					B.CreateStore(B.CreateLoad(ElemTy, CI->getArgOperand(1), "mc.ld"),
+						CI->getArgOperand(0));
 					CI->eraseFromParent();
 					continue;
 				}
 			}
-
-			// Anything else: leave in place, isize() will markUnsupported.
+			continue; // non-constant / odd size → markUnsupported later
 		}
+
+		//  Tier B: memset ─
+		if (IID == Intrinsic::memset) {
+			auto* SzC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
+			auto* ValC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+			// 修复 #5：memset size==0 时 Sz*8=0 会创建 0 位整数类型，必须跳过。
+			if (SzC && ValC && SzC->getZExtValue() > 0 && SzC->getZExtValue() <= 8) {
+				uint64_t Sz = SzC->getZExtValue();
+				uint8_t  Val = (uint8_t)ValC->getZExtValue();
+				uint64_t Fill = 0;
+				for (uint64_t i = 0; i < Sz; ++i) Fill |= ((uint64_t)Val << (i * 8));
+				Type* ElemTy = IntegerType::get(Ctx, (unsigned)(Sz * 8));
+				B.CreateStore(ConstantInt::get(ElemTy, Fill), CI->getArgOperand(0));
+				CI->eraseFromParent();
+				continue;
+			}
+			continue;
+		}
+
+		//  修复 #5：以下 intrinsic 的降级并非严格语义等价，保留原样
+		//  让 isize() 标记为 unsupported（不做 VM），保证正确性。
+		//  fabs(-0) 在 IEEE 754 中返回 +0，但 FNeg(-0)= -0 不等于 +0；
+		//  fma 是融合乘加（单次舍入），拆成 mul+add 是两次舍入；
+		//  minnum/maxnum 对 NaN 有特定传播规则，简单 FCmp+Select 不等价；
+		//  copysign 涉及符号位操作，对 NaN 和 -0 行为与简单比较不同。
+		if (IID == Intrinsic::fabs || IID == Intrinsic::fmuladd ||
+			IID == Intrinsic::fma || IID == Intrinsic::minnum ||
+			IID == Intrinsic::maxnum || IID == Intrinsic::copysign) {
+			continue; // leave in place, isize() will markUnsupported
+		}
+
+		//  Tier D: abs(x, _) → x < 0 ? -x : x ─
+		if (IID == Intrinsic::abs) {
+			Value* X = CI->getArgOperand(0);
+			Type* IT = X->getType();
+			Value* Zero = ConstantInt::get(IT, 0);
+			Value* Neg = B.CreateSub(Zero, X, "abs.neg");
+			Value* R = B.CreateSelect(B.CreateICmpSLT(X, Zero, "abs.cmp"), Neg, X, "abs.r");
+			CI->replaceAllUsesWith(R);
+			CI->eraseFromParent();
+			continue;
+		}
+
+		// llvm.is.fpclass(x, 3) is the canonical isnan lowering.
+		// FCmp UNO has the same NaN semantics and is VM-supported.
+		if (IID == Intrinsic::is_fpclass) {
+			auto* Mask = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+			if (Mask && Mask->getZExtValue() == 3) {
+				Value* X = CI->getArgOperand(0);
+				CI->replaceAllUsesWith(B.CreateFCmpUNO(X, X, "isnan.vm"));
+				CI->eraseFromParent();
+				continue;
+			}
+		}
+
+		// Anything else: leave in place, isize() will markUnsupported.
+	}
 	}
 
 

@@ -16,8 +16,10 @@ import tempfile
 SYSTEM = re.compile(
     r"^(?:malloc|calloc|realloc|free|mem|str|wcs|printf|puts|abort|exit|"
     r"close|read|write|open|socket|connect|select|poll|fcntl|pthread_|dl|"
-    r"__|_Unwind|stdin|stdout|stderr|errno|android_|__cxa_|_Z)"
+    r"__|_Unwind|stdin|stdout|stderr|errno|android_|__cxa_)"
 )
+# 修复 #15：_Z 开头的 C++ mangled 符号不再被 SYSTEM 豁免，
+# 确保 bundled SDK 的 C++ 符号也被前缀化，避免符号冲突。
 
 
 def nm_symbols(path: pathlib.Path) -> set[str]:

@@ -41,9 +41,13 @@ constexpr size_t V_SIZE = 32;                 // HMAC-SHA256 输出长度
 constexpr uint32_t V_REQUEST_RETRY = 3;       // 网络失败重试次数
 
 // CloudValue 存储结构
+// 修复 #9：跨线程读取 m_V.data 时通过互斥锁保护，避免撕裂读。
+// fetch_time 保留原子变量供无锁快速判断；data 的读写必须在 mutex 保护下进行。
 struct CloudValue {
     uint8_t data[V_SIZE];
     std::atomic<int64_t> fetch_time;          // 获取时的服务器时间（秒）
+    std::mutex mutex;                         // 保护 data 的跨线程访问
+    uint64_t window_id = 0;                   // 当前 V 对应的窗口 id
 
     CloudValue() : fetch_time(0) {
         for (size_t i = 0; i < V_SIZE; ++i) data[i] = 0;
