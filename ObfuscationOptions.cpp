@@ -16,69 +16,6 @@ cl::opt<bool> llvm::ObfVerbose("obf-verbose",
 	cl::desc("Verbose obfuscator logging."),
 	cl::init(false));
 
-cl::opt<bool> llvm::ObfZoneEnable(
-	"obf-zone-enable",
-	cl::desc("Enable embedded Zone card authorization runtime."),
-	cl::init(false));
-
-cl::opt<std::string> llvm::ObfZoneSoftwareId(
-	"obf-zone-software-id",
-	cl::desc("Zone software identifier."),
-	cl::init(""));
-
-cl::opt<std::string> llvm::ObfZoneVersion(
-	"obf-zone-version",
-	cl::desc("Zone software version."),
-	cl::init(""));
-
-cl::opt<std::string> llvm::ObfZoneAlgorithm(
-	"obf-zone-algorithm",
-	cl::desc("Zone cloud algorithm name."),
-	cl::init(""));
-
-cl::opt<std::string> llvm::ObfZoneEncryptKey(
-	"obf-zone-encrypt-key",
-	cl::desc("Zone client encryption key."),
-	cl::init(""));
-
-cl::opt<std::string> llvm::ObfZoneEncryptIv(
-	"obf-zone-encrypt-iv",
-	cl::desc("Zone client encryption IV."),
-	cl::init(""));
-
-cl::opt<std::string> llvm::ObfZoneLinkMode(
-	"obf-zone-link-mode",
-	cl::desc("Zone link dependency mode: bundled or external."),
-	cl::init("bundled"));
-
-cl::opt<std::string> llvm::ObfZoneShutdownMode(
-	"obf-zone-shutdown-mode",
-	cl::desc("Zone shutdown ownership: auto or manual."),
-	cl::init("auto"));
-
-cl::opt<unsigned> llvm::ObfZoneHeartbeatPeriod(
-	"obf-zone-heartbeat-period",
-	cl::desc("Zone heartbeat refresh period in seconds."),
-	cl::init(120));
-
-cl::opt<unsigned> llvm::ObfZoneOfflineGrace(
-	"obf-zone-offline-grace",
-	cl::desc("Zone offline grace period in seconds."),
-	cl::init(180));
-
-cl::opt<std::string> llvm::ObfZoneCapabilityOperation(
-	"obf-zone-capability-operation", cl::desc("Optional capability operation."), cl::init(""));
-cl::opt<std::string> llvm::ObfZoneCapabilityPublicKey(
-	"obf-zone-capability-public-key", cl::desc("Optional server verification public key."), cl::init(""));
-cl::opt<std::string> llvm::ObfZoneCapabilityBuildId(
-	"obf-zone-capability-build-id", cl::desc("Optional non-secret capability build ID."), cl::init(""));
-cl::opt<std::string> llvm::ObfZoneCapabilityCodeManifest(
-	"obf-zone-capability-code-manifest", cl::desc("Optional non-secret capability code manifest."), cl::init(""));
-// 修复 #16：有效期由云端 capability_v1.js 的 CODE_CONFIG.validSeconds 决定，
-// 客户端配置不会生效。移除该选项避免误导。
-cl::opt<std::string> llvm::ObfZoneCapabilityKeyId(
-	"obf-zone-capability-key-id", cl::desc("Capability signing public-key version."), cl::init("key-1"));
-
 cl::opt<bool> llvm::ObfSeedManifest(
 	"obf-seed-manifest",
 	llvm::cl::desc("Print per-function/per-pass seed manifest (debug)"),

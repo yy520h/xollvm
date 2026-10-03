@@ -66,7 +66,6 @@ endif()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_subdirectory(aes_stub)
-add_subdirectory(zone_runtime)
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +126,7 @@ set(OBF_SOURCES
   ObfuscationAnnotationAnalysis.cpp
   ObfuscationOptions.cpp
   ObfuscationConfig.cpp
-  ZoneAuth.cpp
+
 
   # Registration entry point (getObfuscatorPluginInfo / llvmGetPassPluginInfo).
   registration/PluginEntry.cpp
@@ -150,7 +149,6 @@ include_directories(
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
   "${CMAKE_CURRENT_BINARY_DIR}/aes_stub"
-  "${CMAKE_CURRENT_BINARY_DIR}/zone_runtime"
 )
 
 # intrinsics_gen only exists inside an LLVM build tree.

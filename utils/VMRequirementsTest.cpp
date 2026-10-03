@@ -9,7 +9,6 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Requirements.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
-#include "llvm/Transforms/Obfuscator/ZoneAuth.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #ifdef OBF_TEST_VM_IMPL
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
@@ -17,72 +16,6 @@
 #endif
 
 using namespace llvm;
-
-TEST(ZoneAuthConfig, ParsesCapabilityAndPolicy) {
-	ObfuscationConfig C = AnnotationParser::parseAnnotationString(
-		"obf: zoneauth(capability=main, policy=fail_closed)");
-	auto P = C.getPassConfig("zoneauth");
-	ASSERT_TRUE(P.has_value());
-	ZoneAuthConfig Z = ZoneAuthConfig::fromPassConfig(*P);
-	EXPECT_TRUE(Z.enabled);
-	EXPECT_EQ(Z.capability, "main");
-	EXPECT_EQ(Z.policy, "fail_closed");
-	EXPECT_TRUE(Z.validate());
-}
-
-TEST(ZoneAuthConfig, RejectsMissingCapability) {
-	ObfuscationConfig C = AnnotationParser::parseAnnotationString(
-		"obf: zoneauth(policy=fail_closed)");
-	auto P = C.getPassConfig("zoneauth");
-	ASSERT_TRUE(P.has_value());
-	EXPECT_FALSE(ZoneAuthConfig::fromPassConfig(*P).validate());
-}
-
-TEST(ZoneAuthConfig, RejectsUnknownPolicy) {
-	ObfuscationConfig C = AnnotationParser::parseAnnotationString(
-		"obf: zoneauth(capability=main, policy=continue)");
-	auto P = C.getPassConfig("zoneauth");
-	ASSERT_TRUE(P.has_value());
-	EXPECT_FALSE(ZoneAuthConfig::fromPassConfig(*P).validate());
-}
-
-TEST(ZoneAuthIR, InjectsRequireCallForAnnotatedIntegerFunction) {
-	LLVMContext C;
-	SMDiagnostic D;
-	auto M = parseAssemblyString(
-		"@.str = private unnamed_addr constant [51 x i8] c\"obf: zoneauth(capability=main, policy=fail_closed)\\00\"\n"
-		"@llvm.global.annotations = appending global [1 x { ptr, ptr, ptr, i32, ptr }] [{ ptr, ptr, ptr, i32, ptr } { ptr @entry, ptr @.str, ptr null, i32 0, ptr null }]\n"
-		"define i32 @entry(i32 %x) { ret i32 %x }\n", D, C);
-	ASSERT_NE(M, nullptr);
-	ModuleAnalysisManager MAM;
-	ObfZoneEnable = true;
-	ObfZoneSoftwareId = "software";
-	ObfZoneVersion = "1.0";
-	ObfZoneEncryptKey = "key";
-	ObfZoneEncryptIv = "iv";
-	ObfZoneAlgorithm = "attest";
-	EXPECT_FALSE(ZoneAuthModulePass().run(*M, MAM).areAllPreserved());
-	ObfZoneEnable = false;
-	ObfZoneSoftwareId = "";
-	ObfZoneVersion = "";
-	ObfZoneEncryptKey = "";
-	ObfZoneEncryptIv = "";
-	ObfZoneAlgorithm = "";
-	EXPECT_NE(M->getFunction("xollvm_zone_require"), nullptr);
-	EXPECT_NE(M->getFunction("entry")->getEntryBlock().getTerminator(), nullptr);
-	EXPECT_FALSE(verifyModule(*M, &errs()));
-}
-
-TEST(ZoneAuthIR, DisabledLeavesRuntimeUnlinked) {
-	LLVMContext C;
-	SMDiagnostic D;
-	auto M = parseAssemblyString("define i32 @plain(i32 %x) { ret i32 %x }\n", D, C);
-	ASSERT_NE(M, nullptr);
-	ModuleAnalysisManager MAM;
-	ObfZoneEnable = false;
-	ZoneAuthModulePass().run(*M, MAM);
-	EXPECT_EQ(M->getFunction("xollvm_zone_require"), nullptr);
-}
 
 TEST(VMPlan, EmptyCoordinatorFreezesWithoutCandidates) {
 	VMPlanCoordinator Coordinator;

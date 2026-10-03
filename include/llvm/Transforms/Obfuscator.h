@@ -28,7 +28,6 @@
 #include "llvm/Transforms/Obfuscator/StringEncryption.h"
 #include "llvm/Transforms/Obfuscator/TargetCompat.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
-#include "llvm/Transforms/Obfuscator/ZoneAuth.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
 namespace llvm {
@@ -629,16 +628,12 @@ namespace llvm {
 			if (ObfVerify)
 				MPM.addPass(llvm::obf::ObfVerifyModulePass("pre"));
 
-			// Zone authorization must establish its local gate before function-level
-			// obfuscation sees the annotated body.
-			MPM.addPass(ZoneAuthModulePass());
-
-			// fmerge runs first among module passes: it collapses annotated
-			// functions into super-functions before strenc/the function
-			// pipeline ever see them, so downstream passes (flattening, bcf,
-			// mba, vm, ...) amplify the merged bodies. It will no-op if not
-			// enabled.
-			MPM.addPass(FunctionMergingPass());
+		// fmerge runs first among module passes: it collapses annotated
+		// functions into super-functions before strenc/the function
+		// pipeline ever see them, so downstream passes (flattening, bcf,
+		// mba, vm, ...) amplify the merged bodies. It will no-op if not
+		// enabled.
+		MPM.addPass(FunctionMergingPass());
 
 			if (ObfVerify)
 				MPM.addPass(llvm::obf::ObfVerifyModulePass("fmerge"));

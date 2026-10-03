@@ -38,7 +38,6 @@ OBF_MODULE_PASS("obfuscation", ObfuscationModulePass())
 OBF_MODULE_PASS("obf-dump-config", ObfDumpConfigPass())
 OBF_MODULE_PASS("obf-metrics", ObfMetricsPass())
 OBF_MODULE_PASS("fmerge", FunctionMergingPass())
-OBF_MODULE_PASS("zoneauth", ZoneAuthModulePass())
 
 OBF_FUNCTION_PASS("obfuscation-fn", ObfuscationFunctionDriverPass())
 
