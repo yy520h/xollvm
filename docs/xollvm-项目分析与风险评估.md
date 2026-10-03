@@ -32,7 +32,7 @@
 | 后续优化防护 | `AntiOptimizationShield.cpp` | 降低后续 `-O2/-O3` 还原混淆结构的概率 |
 | VM 虚拟化 | `VMPass*.cpp`、`VMPass*.h` | 字节码编译、engine、dispatch、wrapper |
 | 报告与诊断 | `ObfReport.cpp`、`ObfMetrics.cpp`、`ObfDebug.cpp` | CFG/JSON 报告、指标、跳过原因 |
-| 授权运行时 | `ZoneAuth.cpp`、`zone_runtime/` | Zone 登录、心跳、capability、cloud dispatch |
+| 授权运行时 | （已移除） | Zone 登录、心跳、capability、cloud dispatch（已分离到 demo 项目） |
 | 加密 stub | `aes_stub/` | AES-CTR / ChaCha 运行时解密 stub |
 
 ## 3. Pass 注册与配置流程
@@ -66,7 +66,7 @@ obf: 注解字符串
   -> ObfuscationConfig（passes + budget）
 ```
 
-全局命令行选项集中在 `ObfuscationOptions.cpp`，主要包括 `-obf-seed`、`-obf-deterministic`、`-obf-verify`、`-obf-max-function-insts`、`-obf-ir-budget-multiplier`、`-obf-pipeline-ordering`、`-obf-zone-*`、`-obf-report-*`。
+全局命令行选项集中在 `ObfuscationOptions.cpp`，主要包括 `-obf-seed`、`-obf-deterministic`、`-obf-verify`、`-obf-max-function-insts`、`-obf-ir-budget-multiplier`、`-obf-pipeline-ordering`、`-obf-report-*`。（`-obf-zone-*` 已随 zoneauth 移除）
 
 ## 4. 混淆管线顺序
 
@@ -97,13 +97,15 @@ fmerge / constenc
 模块级编排（`include/llvm/Transforms/Obfuscator.h` 中的 `ObfuscationModulePass::run`）：
 
 ```text
-ObfVerify(pre) → ZoneAuthModulePass → FunctionMergingPass
+ObfVerify(pre) → FunctionMergingPass
   → ObfVerify → StringEncryptionPass → ObfVerify
   → ObfuscationFunctionDriverPass（逐函数按注解驱动各 Pass，含预算事务）
   → ObfVerify(final)
   → VMPlanCoordinator.freeze() + commit()（VM engine 统一生成）
   → 报告输出
 ```
+
+（`ZoneAuthModulePass` 已随 zoneauth 功能移除）
 
 每个函数的 Pass 循环带事务化预算保护：单 Pass 超预算时回滚到执行前快照并记录 skip，而不是被下一个 Pass 才发现。
 
@@ -208,19 +210,11 @@ hardened 模式额外做常量 blind（opaque 表达式）、寄存器加密、�
 
 `zone_runtime/cloud/capability_v1.js`：对每个 window 搜索 32 字节 `dispatch_v`，使 `HMAC(V, window) & 0xFFF == 0`，随 Ed25519 签名的响应下发 `dispatch_v`/`window_id`/`dispatch_blob`。
 
-### 6.4 Zone 授权主流程
+### 6.4 Zone 授权主流程（已移除）
 
-`ZoneAuth.cpp` 在 `main` 注入：
-
-```text
-xollvm_zone_set_shutdown_mode(...)
-xollvm_zone_initialize(...)
-xollvm_zone_login_card(NULL)        // NULL => 运行期从 stdin 读卡密
-xollvm_zone_first_heartbeat()
-失败 => AArch64 svc 退出
-```
-
-受保护函数被改造为 `capability_begin/require/seed` 三重 gate 后执行原逻辑。`zone_wrapper.cpp` 管理登录（50005/50057）、心跳（50010/50090）、capability 请求与验签（`CapabilityClient::acceptResponse`）、以及 `xollvm_zone_shutdown` 时的 Logout 生命周期。
+`ZoneAuth.cpp` 已从编译器移除，zone_runtime 已分离到 demo 项目独立维护。
+编译器不再注入 Zone 授权调用。如需 Zone 授权，请在最终项目中自行集成
+zone_runtime 源码。
 
 ## 7. 构建、交付与平台约束
 
@@ -280,11 +274,11 @@ LLVM 工具链与 Zone runtime archive 是两个交付面：
 
 | # | 问题 | 位置 | 等级 | 状态 |
 | --- | --- | --- | --- | --- |
-| 13 | ZoneAuth 失败路径硬编码 AArch64 svc 退出，普通 workflow 同时构建 x86_64/Windows，ZoneAuth 实为 Android/AArch64 特化 | `ZoneAuth.cpp injectStartup()` | 中高 | **已修复**：仅在 `Triple::aarch64` 目标时注入 svc 退出，非 AArch64 目标跳过 |
-| 14 | `zone_archive_audit.py` 接收 target_triple 但不验证 archive 架构 | `zone_runtime/zone_archive_audit.py` | 中 | **已修复**：新增 `_archive_arch()` 用 `llvm-readobj` 验证 archive 架构与 target_triple 一致 |
-| 15 | 符号前缀化排除 `_Z` 开头 C++ mangled 符号，bundled SDK 的 C++ 符号隔离不充分 | `zone_runtime/zone_prefix_archive.py` | 中 | **已修复**：`_Z` 不再被 SYSTEM 正则豁免，C++ mangled 符号也参与前缀化 |
-| 16 | 配置项 `-obf-zone-capability-valid-seconds` 声明后未接入实际逻辑（有效期由云端决定） | `ObfuscationOptions.cpp` | 低 | **已修复**：移除该选项，避免误导 |
-| 17 | `injectStartup` 中 `SetShutdownMode` 被调用两次、`ObfZoneShutdownMode` 校验重复 | `ZoneAuth.cpp` | 低 | **已修复**：移除重复的 `SetShutdownMode` 调用和 `ObfZoneShutdownMode` 校验 |
+| 13 | ZoneAuth 失败路径硬编码 AArch64 svc 退出，普通 workflow 同时构建 x86_64/Windows，ZoneAuth 实为 Android/AArch64 特化 | `ZoneAuth.cpp injectStartup()` | 中高 | **已移除**：zoneauth 功能已从编译器移除 |
+| 14 | `zone_archive_audit.py` 接收 target_triple 但不验证 archive 架构 | `zone_runtime/zone_archive_audit.py` | 中 | **已移除**：zone_runtime 已分离到 demo 项目 |
+| 15 | 符号前缀化排除 `_Z` 开头 C++ mangled 符号，bundled SDK 的 C++ 符号隔离不充分 | `zone_runtime/zone_prefix_archive.py` | 中 | **已移除**：zone_runtime 已分离到 demo 项目 |
+| 16 | 配置项 `-obf-zone-capability-valid-seconds` 声明后未接入实际逻辑（有效期由云端决定） | `ObfuscationOptions.cpp` | 低 | **已移除**：`-obf-zone-*` 参数已随 zoneauth 移除 |
+| 17 | `injectStartup` 中 `SetShutdownMode` 被调用两次、`ObfZoneShutdownMode` 校验重复 | `ZoneAuth.cpp` | 低 | **已移除**：zoneauth 功能已从编译器移除 |
 
 ### 8.4 其他观察
 
@@ -296,10 +290,9 @@ LLVM 工具链与 Zone runtime archive 是两个交付面：
 ### 9.1 已覆盖
 
 - `utils/VMRequirementsTest.cpp`：VM 配置、requirement 合并、engine 分组、randISA 等单元测试。
-- `zone_runtime/tests/test_cloud_value_manager.cpp`：HMAC offset 范围、合法 V offset 0、错误 V 非 0、window rollover、C ABI。
-- `zone_runtime/tests/` Python 测试：capability 协议/客户端、marker、link helper、archive 审计、shutdown/设备码契约。
-- `zone_runtime/cloud/test_capability_v1.js`：云函数入口、签名、dispatch_v 长度、云/客户端 offset 算法一致性。
 - `utils/test_vm_cloud_dispatch_gates.py`：cloudDispatch 注入的结构 gate（两处注入、关闭时不引用符号）。
+
+（`zone_runtime/` 相关测试已随 zoneauth 功能移除，zone_runtime 已分离到 demo 项目）
 
 ### 9.2 主要缺口
 
@@ -331,8 +324,8 @@ LLVM 工具链与 Zone runtime archive 是两个交付面：
 1. cloud value 用互斥/双缓冲/版本号保证快照一致。
 2. 刷新结果校验当前 window。
 3. 明确 capability state 恢复语义（完整恢复或文档改口）。
-4. ZoneAuth 增加 target triple 门控。
-5. 完善 archive 架构审计与 C++ 符号隔离。
+4.（已移除）ZoneAuth 增加 target triple 门控。
+5.（已移除）完善 archive 架构审计与 C++ 符号隔离。
 
 ### P3 — 测试与 CI
 
@@ -363,7 +356,7 @@ XOLLVM 已从传统 LLVM 混淆 Pass 演进为「编译期 VM + 多级 IR 混淆
 
 - **VM 语义正确性**（CALL ABI、浮点谓词、intrinsic 等价性、AES 失败路径）。
 - **cloud dispatch 的可验证链路**（完整验签、window 绑定、并发一致性）。
-- **授权运行时的生命周期与平台边界**（state 恢复、AArch64 特化门控）。
+- **授权运行时的生命周期与平台边界**（state 恢复、AArch64 特化门控）。（zoneauth 已移除，由 demo 项目独立维护）
 - **测试从结构 gate 走向真实行为回归**。
 
 这些基础稳定后，再叠加 handler polymorphism、nested VM、更复杂的云值策略与反反编译技术，才不会持续放大调试与交付风险。

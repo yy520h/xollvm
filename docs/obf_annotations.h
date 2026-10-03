@@ -270,21 +270,11 @@
  *--------------------------------------------------------------------------*/
 
 /*----------------------------------------------------------------------------
- * zoneauth                                                Zone 卡密授权
- *   为函数注入 Zone 能力检查。函数只有在授权成功后才继续执行；授权失败时
- *   按 policy 决定返回安全失败值，或继续执行原逻辑。
+ * zoneauth（已移除）
  *
- *   capability=NAME       能力名称，默认 main
- *   policy {fail_closed|continue}  (fail_closed) 授权失败策略
- *   group=NAME            可选的能力分组名称
- *
- *   zoneauth 是模块级 Pass。目标最终链接时必须使用 xollvm-zone-clang，
- *   并链接 zone_runtime、官方 Zone SDK 以及 curl、zlib、libssl、libcrypto。
- *   bundled 模式使用项目内置 archive；external 模式必须显式提供并校验
- *   四个外部 archive。卡密只在运行时输入，不能写入注解或编译器参数。
- *
- *   e.g.  OBF("zoneauth(capability=main, policy=fail_closed)")
- *   e.g.  OBF("zoneauth(capability=feature_x, policy=continue), vm")
+ *   Zone 授权功能已从编译器移除，运行时库已分离到 demo 项目独立维护。
+ *   编译器只保留纯静态混淆 Pass。如需 Zone 授权，请在最终项目中
+ *   自行集成 zone_runtime 源码。
  *--------------------------------------------------------------------------*/
 
 /*----------------------------------------------------------------------------
@@ -428,7 +418,7 @@
  *                            派生的偏移（合法值=0；过期/缺失/篡改时非 0），
  *                            直接叠加到 handler 表索引上。本地无任何范围/时效
  *                            校验，错误偏移使索引越界或落入陷阱，自然崩溃。
- *                            需要 zoneauth(capability=...) 与云端配合提供 V。
+ *                            需要最终项目自行集成 zone_runtime 提供云值 V。
  *                            默认关闭（关闭时不引用运行时符号，输出不变）。
  *   enginePoolSize   (1)     将函数分散到 N 个不同引擎
  *   perFnEngine      (0)     为此函数分配独立引擎
@@ -484,17 +474,7 @@
 |*    -obf-metrics-include-decls  同时输出函数声明的指标                      *|
 |*    -obf-vm-allow-antidebug-bypass  仅 CI/测试使用的 VM 反调试绕过开关        *|
 |*                                                                            *|
-|*  Zone 全局参数（通过 opt/clang 的 -mllvm 传入）：                          *|
-|*    -obf-zone-enable         启用 Zone 授权运行时                            *|
-|*    -obf-zone-software-id=ID 软件标识                                       *|
-|*    -obf-zone-version=版本  软件版本                                       *|
-|*    -obf-zone-algorithm=名称 云算法名称                                     *|
-|*    -obf-zone-link-mode=bundled|external  Zone 依赖链接模式                 *|
-|*    -obf-zone-heartbeat-period=N  心跳周期，单位秒                          *|
-|*    -obf-zone-offline-grace=N      离线宽限时间，单位秒                      *|
-|*    -obf-zone-shutdown-mode=auto|manual 退出清理归属                         *|
-|*    -obf-zone-encrypt-key=Key  客户端加密 Key（不要写入源码/脚本）            *|
-|*    -obf-zone-encrypt-iv=IV    客户端加密 IV（不要写入源码/脚本）              *|
+|*  （Zone 授权相关参数已从编译器移除，运行时库分离到 demo 项目）            *|
 |*                                                                            *|
 \*===----------------------------------------------------------------------===*/
 
