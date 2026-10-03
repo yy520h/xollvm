@@ -1,6 +1,5 @@
 import os
 import re
-import shutil
 import struct
 import subprocess
 from pathlib import Path
@@ -117,7 +116,11 @@ def executable_zero_runs(binary):
 
 def _tool(clang, name):
     sibling = Path(clang).with_name(name)
-    return str(sibling) if sibling.exists() else shutil.which(name) or name
+    if not sibling.is_file() or not os.access(sibling, os.X_OK):
+        raise FileNotFoundError(
+            f'{name} must be an executable next to XOLLVM_TEST_CLANG: {sibling}'
+        )
+    return str(sibling)
 
 
 @pytest.fixture(scope='module')
