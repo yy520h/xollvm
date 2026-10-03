@@ -237,12 +237,12 @@ zone_runtime 源码。
 
 ### 7.4 交付边界
 
-LLVM 工具链与 Zone runtime archive 是两个交付面：
+LLVM 工具链与最终项目自行集成的 Zone runtime 是两个交付面：
 
 - `clang`/`opt`/插件属于编译工具链。
-- `libxollvm_zone_sdk_private.a`（release）与 `libxollvm_zone_sdk_private_dbg.a`（调试）属于最终目标程序的链接依赖。
-- 主 LLVM 安装树不自动打包 Zone archive，需保留对应构建目录或单独打包。
-- 最终链接用 `zone_runtime/xollvm-zone-clang` 包装器按 IR 中的 `.xollvm.zone.link` marker 选择 bundled/external 依赖。
+- Zone runtime 源码、curl/zlib/OpenSSL 源码及其构建规则属于最终项目，不再由 XOLLVM 提供。
+- XOLLVM 不再打包 Zone archive，也不再提供 `zoneauth` 编译器参数或自动链接包装器。
+- `cloudDispatch` 需要的 `__zone_get_dispatch_offset()` 外部符号由最终项目自行集成的 runtime 提供。
 
 ## 8. 已发现问题与风险
 

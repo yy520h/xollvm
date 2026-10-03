@@ -28,9 +28,6 @@ run_regression.ps1
 *.dll
 *.pdb
 
-# Bundled Zone SDK static inputs are intentional source dependencies.
-!third_party/zone_sdk/**/*.a
-
 # Generated AES stub (produced by the aes_stub_inc target at build time)
 aes_stub.bc
 aes_stub_bc.inc
