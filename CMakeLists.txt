@@ -208,4 +208,16 @@ if(LLVM_INCLUDE_TESTS AND DEFINED LLVM_MAIN_SRC_DIR)
     target_link_libraries(VMRequirementsTests PRIVATE Obfuscator)
     llvm_config(VMRequirementsTests Linker BitReader TransformUtils Analysis ScalarOpts IPO)
   endif()
+
+  if(TARGET clang)
+    add_custom_target(SensitiveAttackBaselineTests
+      COMMAND "${CMAKE_COMMAND}" -E env
+              "XOLLVM_TEST_CLANG=$<TARGET_FILE:clang>"
+              "${Python3_EXECUTABLE}" -m pytest
+              utils/attack_gates/test_sensitive_attack_baseline.py -q
+      DEPENDS clang
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      USES_TERMINAL
+    )
+  endif()
 endif()
