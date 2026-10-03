@@ -12,7 +12,7 @@ const keyPair = crypto.generateKeyPairSync("ed25519");
 const privateKey = keyPair.privateKey.export({ type: "pkcs8", format: "pem" });
 const publicKey = keyPair.publicKey;
 const fixedTime = 1700000000;
-// 测试用小掩码，使云端搜索在毫秒级完成（生产默认 0xfffff）。
+// 生产默认掩码已是 12 bit（0xfff），与客户端 VM_DISPATCH_OFFSET_MASK 一致。
 CODE_CONFIG.dispatchOffsetMask = 0xfff;
 
 // 复现客户端 cloud_value_manager.cpp 的 offset 算法：

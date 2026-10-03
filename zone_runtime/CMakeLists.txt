@@ -140,34 +140,55 @@ if(XOLLVM_ZONE_SDK_INCLUDE)
   add_custom_target(xollvm_zone_ssl_private DEPENDS "${_ZONE_PRIVATE_SSL}")
   add_custom_target(xollvm_zone_crypto_private DEPENDS "${_ZONE_PRIVATE_CRYPTO}")
 
-  add_library(xollvm_zone_sdk STATIC
+  set(_ZONE_SDK_RUNTIME_SOURCES
     zone_wrapper.cpp capability_protocol.cpp capability_client.cpp
     vm_dispatch_value.cpp cloud_value_manager.cpp ${_ZONE_SDK_SOURCES})
-  target_include_directories(xollvm_zone_sdk PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}" "${_ZONE_SDK_ROOT}" "${_ZONE_SDK_CORE}"
-    "${_ZONE_SDK_ROOT}/curl_core/curl/include"
-    "${_ZONE_SDK_ROOT}/curl_core"
-    "${_ZONE_SDK_ROOT}/zlib_core"
-    "${_ZONE_SDK_ROOT}/openssl_core")
-  target_compile_features(xollvm_zone_sdk PRIVATE cxx_std_17)
-  target_compile_options(xollvm_zone_sdk PRIVATE -ffunction-sections -fdata-sections)
 
-  if(XOLLVM_ZONE_SDK_ARCHIVE)
-    target_link_libraries(xollvm_zone_sdk PUBLIC "${XOLLVM_ZONE_SDK_ARCHIVE}")
-  endif()
+  # 生成一个 zone SDK 静态库，并用前缀工具产出 private 版。
+  # 发布版不带调试打印；调试版额外定义 XOLLVM_ZONE_DEBUG_PKT（编译期把
+  # 数据包打印编进 ToWrite / capability 校验），供项目构建按需链接。
+  #   variant : "release" 或 "dbg"
+  #   file_suffix : 产物文件名后缀（"" 或 "_dbg"）
+  #   extra_defs  : 额外编译定义（发布为空）
+  function(_zone_add_sdk variant file_suffix extra_defs)
+    set(_tgt "xollvm_zone_sdk_${variant}")
+    add_library(${_tgt} STATIC ${_ZONE_SDK_RUNTIME_SOURCES})
+    target_include_directories(${_tgt} PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}" "${_ZONE_SDK_ROOT}" "${_ZONE_SDK_CORE}"
+      "${_ZONE_SDK_ROOT}/curl_core/curl/include"
+      "${_ZONE_SDK_ROOT}/curl_core"
+      "${_ZONE_SDK_ROOT}/zlib_core"
+      "${_ZONE_SDK_ROOT}/openssl_core")
+    target_compile_features(${_tgt} PRIVATE cxx_std_17)
+    target_compile_options(${_tgt} PRIVATE -ffunction-sections -fdata-sections)
+    if(extra_defs)
+      target_compile_definitions(${_tgt} PRIVATE ${extra_defs})
+    endif()
+    if(XOLLVM_ZONE_SDK_ARCHIVE)
+      target_link_libraries(${_tgt} PUBLIC "${XOLLVM_ZONE_SDK_ARCHIVE}")
+    endif()
+    set(_out "${_ZONE_PRIVATE_DIR}/libxollvm_zone_sdk_private${file_suffix}.a")
+    add_custom_command(OUTPUT "${_out}"
+      COMMAND ${Python3_EXECUTABLE} "${_ZONE_PREFIX_TOOL}" ${_ZONE_PREFIX_ARGS}
+        --runtime-source "$<TARGET_FILE:${_tgt}>"
+        "$<TARGET_FILE:${_tgt}>"
+        "${_ZONE_PRIVATE_CURL}" "${_ZONE_PRIVATE_ZLIB}"
+        "${_ZONE_PRIVATE_SSL}" "${_ZONE_PRIVATE_CRYPTO}"
+        --output "${_out}"
+      DEPENDS ${_tgt}
+        xollvm_zone_curl_private xollvm_zone_zlib_private
+        xollvm_zone_ssl_private xollvm_zone_crypto_private
+        "${_ZONE_PREFIX_TOOL}")
+    add_custom_target(xollvm_zone_sdk_private_${variant} DEPENDS "${_out}")
+  endfunction()
+
+  _zone_add_sdk(release "" "")
+  _zone_add_sdk(dbg "_dbg" XOLLVM_ZONE_DEBUG_PKT)
   set(_ZONE_PRIVATE_SDK "${_ZONE_PRIVATE_DIR}/libxollvm_zone_sdk_private.a")
-  add_custom_command(OUTPUT "${_ZONE_PRIVATE_SDK}"
-    COMMAND ${Python3_EXECUTABLE} "${_ZONE_PREFIX_TOOL}" ${_ZONE_PREFIX_ARGS}
-      --runtime-source "$<TARGET_FILE:xollvm_zone_sdk>"
-      "$<TARGET_FILE:xollvm_zone_sdk>"
-      "${_ZONE_PRIVATE_CURL}" "${_ZONE_PRIVATE_ZLIB}"
-      "${_ZONE_PRIVATE_SSL}" "${_ZONE_PRIVATE_CRYPTO}"
-      --output "${_ZONE_PRIVATE_SDK}"
-    DEPENDS xollvm_zone_sdk
-      xollvm_zone_curl_private xollvm_zone_zlib_private
-      xollvm_zone_ssl_private xollvm_zone_crypto_private
-      "${_ZONE_PREFIX_TOOL}")
-  add_custom_target(xollvm_zone_sdk_private DEPENDS "${_ZONE_PRIVATE_SDK}")
+  add_custom_target(xollvm_zone_sdk_private)
+  add_dependencies(xollvm_zone_sdk_private
+    xollvm_zone_sdk_private_release xollvm_zone_sdk_private_dbg)
+
   add_custom_command(OUTPUT "${_ZONE_PRIVATE_SDK}.audited"
     COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/zone_archive_audit.py"
       --prefix xollvm_zone_ "${_ZONE_PRIVATE_SDK}"
@@ -183,12 +204,12 @@ if(XOLLVM_ZONE_SDK_INCLUDE)
     "${CMAKE_CURRENT_SOURCE_DIR}")
   if(XOLLVM_ZONE_LINK_MODE STREQUAL "bundled")
     target_link_libraries(xollvm_zone_wrapper_link_smoke PRIVATE
-      "${_ZONE_PRIVATE_SDK}")
+      "${_ZONE_PRIVATE_DIR}/libxollvm_zone_sdk_private.a")
     add_dependencies(xollvm_zone_wrapper_link_smoke
       xollvm_zone_sdk_private xollvm_zone_sdk_audit)
   else()
     target_link_libraries(xollvm_zone_wrapper_link_smoke PRIVATE
-      xollvm_zone_sdk
+      xollvm_zone_sdk_release
       "${XOLLVM_ZONE_EXTERNAL_CURL}" "${XOLLVM_ZONE_EXTERNAL_ZLIB}"
       "${XOLLVM_ZONE_EXTERNAL_SSL}" "${XOLLVM_ZONE_EXTERNAL_CRYPTO}")
   endif()
@@ -204,7 +225,7 @@ if(XOLLVM_ZONE_SDK_INCLUDE)
       xollvm_zone_sdk_private xollvm_zone_sdk_audit)
   else()
     target_link_libraries(xollvm_zone_live_check PRIVATE
-      xollvm_zone_sdk
+      xollvm_zone_sdk_release
       "${XOLLVM_ZONE_EXTERNAL_CURL}" "${XOLLVM_ZONE_EXTERNAL_ZLIB}"
       "${XOLLVM_ZONE_EXTERNAL_SSL}" "${XOLLVM_ZONE_EXTERNAL_CRYPTO}")
   endif()

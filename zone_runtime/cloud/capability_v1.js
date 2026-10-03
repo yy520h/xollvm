@@ -14,9 +14,13 @@ MC4CAQAwBQYDK2VwBCIEIKYtg9+dXA9mqw8j15fMlppe2kvS/MjSyS5qSiVty8N/
   dispatchWindowSeconds: 60,
   // 云值驱动 dispatch 的偏移掩码。必须与客户端编译期 VM_DISPATCH_OFFSET_MASK
   // 一致。云端为每个 window 搜索一个 V，使客户端 HMAC(V, window) & mask == 0。
-  // 20-bit → 期望约 2^20 次 HMAC（每 window 只算一次，带缓存）。
-  dispatchOffsetMask: 0xfffff,
+  // 12-bit → 期望约 2^12 次 HMAC（毫秒级）。位宽越大越安全，但云端搜索越贵；
+  // 20-bit 会让每 window 搜索 ~2^20 次而超时（后端有执行时限）。
+  dispatchOffsetMask: 0xfff,
   policyVersion: 1,
+  // 排错用：为 true 时，在错误响应里附带 event 结构摘要（键名/长度），
+  // 不含敏感值。定位后端 event 形态后应保持 false。
+  debugEvent: false,
 };
 
 const REQUEST_FIELDS = [
@@ -108,29 +112,83 @@ function deriveDispatchV(serverKey, windowId, mask) {
   return null;
 }
 
-function capability_v1(event, context, callback) {
-  const finish = (result) => {
-    if (typeof callback === "function") callback(null, result);
-    return result;
+// 兼容入口：把后端可能传入的多种 event 形态归一化为业务请求对象。
+// 后端"云端部署代码执行"实际传入的形态并不统一，这里做尽可能强的解包：
+// - 直接业务 JSON 对象
+// - JSON 字符串（可能被多层转义/字符串化：'"{\"protocol\":...}"'）
+// - { body } / { req_arguments } / { arguments } / { data } / { event } 包装
+// - 上述包装再套字符串、或再套 { Result: ... }（函数测试回显结构）
+function looksLikeRequest(v) {
+  return v && typeof v === "object" && !Array.isArray(v) &&
+    (v.protocol !== undefined ||
+     (v.software_id !== undefined && v.operation !== undefined));
+}
+
+function normalizeEvent(event) {
+  let v = event;
+  // 反复解开“字符串里再套 JSON”，最多 8 层，防止畸形数据死循环。
+  for (let depth = 0; depth < 8; ++depth) {
+    if (typeof v === "string") {
+      try {
+        v = JSON.parse(v);
+        continue;
+      } catch (_) {
+        return null;
+      }
+    }
+    if (!v || typeof v !== "object" || Array.isArray(v)) return v;
+    if (looksLikeRequest(v)) return v;
+    const next =
+      v.req_arguments !== undefined ? v.req_arguments :
+      v.body !== undefined ? v.body :
+      v.arguments !== undefined ? v.arguments :
+      v.Result !== undefined ? v.Result :
+      v.data !== undefined ? v.data :
+      v.event !== undefined ? v.event :
+      v.payload !== undefined && typeof v.payload === "object" ? v.payload :
+      undefined;
+    if (next === undefined) return v;   // 没有已知包装字段，原样返回
+    v = next;
+  }
+  return v;
+}
+
+// 只用于排错：给出 event 的结构摘要（键名/类型/长度），不含敏感值。
+function describeEvent(event) {
+  const seen = [];
+  const walk = (v, path, depth) => {
+    if (seen.length > 40 || depth > 4) return;
+    if (typeof v === "string") {
+      seen.push(`${path}: string(len=${v.length})`);
+      return;
+    }
+    if (v === null) { seen.push(`${path}: null`); return; }
+    if (typeof v !== "object") { seen.push(`${path}: ${typeof v}`); return; }
+    if (Array.isArray(v)) { seen.push(`${path}: array(len=${v.length})`); return; }
+    for (const k of Object.keys(v)) walk(v[k], path ? `${path}.${k}` : k, depth + 1);
   };
+  walk(event, "", 0);
+  return seen.join(" | ");
+}
+
+function buildCapabilityResponse(event, context) {
   let request;
-  const body = event && event.body;
-  const argumentsValue = event && event.req_arguments;
   try {
-    request = typeof body === "string"
-      ? JSON.parse(body)
-      : body && typeof body === "object"
-        ? body
-        : typeof argumentsValue === "string"
-          ? JSON.parse(argumentsValue)
-          : argumentsValue && typeof argumentsValue === "object"
-            ? argumentsValue
-            : event;
+    request = normalizeEvent(event);
   } catch (_) {
-    return finish(JSON.stringify({ ok: false, error: "malformed_request" }));
+    const out = { ok: false, error: "malformed_request" };
+    if (CODE_CONFIG.debugEvent) out.event_shape = describeEvent(event);
+    return JSON.stringify(out);
   }
   if (!validRequest(request)) {
-    return finish(JSON.stringify({ ok: false, error: requestError(request) }));
+    const out = { ok: false, error: requestError(request) };
+    if (CODE_CONFIG.debugEvent) {
+      out.request_type = typeof request;
+      out.request_keys = request && typeof request === "object"
+        ? Object.keys(request).slice(0, 32) : [];
+      out.event_shape = describeEvent(event);
+    }
+    return JSON.stringify(out);
   }
 
   const serverKey = CODE_CONFIG.kServer;
@@ -138,7 +196,7 @@ function capability_v1(event, context, callback) {
   const keyId = CODE_CONFIG.keyId;
   if (!serverKey || !privateKey || !keyId ||
       serverKey.startsWith("REPLACE_WITH_") || privateKey.includes("REPLACE_WITH_")) {
-    return finish(JSON.stringify({ ok: false, error: "not_configured" }));
+    return JSON.stringify({ ok: false, error: "not_configured" });
   }
   const serverTime = context && Number.isSafeInteger(context.serverTime)
     ? context.serverTime : Math.floor(Date.now() / 1000);
@@ -174,11 +232,26 @@ function capability_v1(event, context, callback) {
     dispatch_v: dispatchV ? dispatchV.toString("base64") : "",
   };
   response.signature = crypto.sign(null, Buffer.from(canonicalizeResponse(response)), privateKey).toString("base64");
-  return finish(JSON.stringify(response));
+  return JSON.stringify(response);
+}
+
+// 云端部署代码执行的入口约定：exports.<函数名> = async (event, context) => {...}
+// 执行路径形如 "capability_v1.capability_v1"，后端返回该字符串给客户端。
+exports.capability_v1 = async (event, context) => {
+  return buildCapabilityResponse(event, context);
+};
+
+// 兼容旧式 (event, context, callback) / module.exports 引用（本地单测用）。
+function capability_v1(event, context, callback) {
+  const result = buildCapabilityResponse(event, context);
+  if (typeof callback === "function") callback(null, result);
+  return result;
 }
 
 module.exports = {
   capability_v1,
+  buildCapabilityResponse,
+  normalizeEvent,
   canonicalizeRequest,
   canonicalizeResponse,
   CODE_CONFIG,

@@ -120,6 +120,17 @@ uint64_t CloudValueManager::computeDispatchOffset() {
     // 惰性启动预取线程：首次进入 dispatch 时立即拉取当前 window 的 V
     std::call_once(m_init_once, [this]() { initialize(); });
 
+    // 首次 dispatch 若预取线程尚未拿到 V（fetch_time==0），同步拉取一次，
+    // 避免用初始全零 V 算出非 0 offset 而首跑必然崩溃。同步失败则退回异步线程。
+    if (m_V.fetch_time.load(std::memory_order_acquire) == 0) {
+        uint64_t window = getWindowId();
+        uint8_t new_V[V_SIZE];
+        if (fetchVFromCloud(window, new_V)) {
+            std::memcpy(m_V.data, new_V, V_SIZE);
+            m_V.fetch_time.store(getSyncedTimestamp(), std::memory_order_release);
+        }
+    }
+
     uint8_t V_snapshot[V_SIZE];
     std::memcpy(V_snapshot, m_V.data, V_SIZE);
 

@@ -69,6 +69,21 @@ constexpr const char* kDemoCapabilityPublicKey =
 	"MCowBQYDK2VwAyEArrhx5s0tAMNxS8kBQyV9H4299tELRzP6mwVi4GrpXfw=\n"
 	"-----END PUBLIC KEY-----\n";
 
+// capability 状态文件的默认路径：优先选一个可写目录。
+// `/data/local/tmp` 在 Termux 下不可写，会导致第一次验证写状态失败。
+const std::string& defaultCapabilityStatePath() {
+	static const std::string path = []() -> std::string {
+		const char* home = std::getenv("HOME");
+		if (home && home[0])
+			return std::string(home) + "/xollvm_zone_capability.state";
+		const char* tmp = std::getenv("TMPDIR");
+		if (tmp && tmp[0])
+			return std::string(tmp) + "/xollvm_zone_capability.state";
+		return "/data/local/tmp/xollvm_zone_capability.state";
+	}();
+	return path;
+}
+
 ZoneState& state() {
 	static ZoneState value;
 	return value;
@@ -318,7 +333,7 @@ extern "C" int xollvm_zone_initialize(const char* software_id,
 		capabilityPublicKey = capabilityPublicKey && capabilityPublicKey[0]
 			? capabilityPublicKey : kDemoCapabilityPublicKey;
 		capabilityStatePath = capabilityStatePath && capabilityStatePath[0]
-			? capabilityStatePath : "/data/local/tmp/xollvm_zone_capability.state";
+			? capabilityStatePath : defaultCapabilityStatePath().c_str();
 		capabilityBuildId = capabilityBuildId && capabilityBuildId[0]
 			? capabilityBuildId : "demo-build-v1";
 		capabilityDeviceId = capabilityDeviceId && capabilityDeviceId[0]
@@ -570,6 +585,11 @@ extern "C" int xollvm_zone_capability_begin(const char* operation, const char* p
 		capabilityResponse.policy_version = json.at("policy_version").get<uint32_t>();
 		capabilityResponse.key_id = json.at("key_id").get<std::string>();
 		capabilityResponse.signature = json.at("signature").get<std::string>();
+		// 云值驱动 dispatch 字段：必须参与签名 canonicalization，漏掉会让
+		// 客户端重算的规范化串与云端签名时不一致 -> 验签失败。
+		capabilityResponse.window_id = json.value("window_id", std::string());
+		capabilityResponse.dispatch_blob = json.value("dispatch_blob", std::string());
+		capabilityResponse.dispatch_v = json.value("dispatch_v", std::string());
 		if (capabilityResponse.request_hash.empty()) {
 			std::cerr << "Zone capability rejected: empty request_hash\n";
 			return 0;
@@ -648,13 +668,22 @@ extern "C" int xollvm_zone_vm_dispatch_refresh(void) {
 	lock.unlock();
 	ApiResponse response;
 	std::string requestNonce;
-	if (helper->GetAntiAlgorithmValue(response, "capability_v1",
-			buildDispatchRequestJson(operation, snapshot, &requestNonce)) != 1 ||
-		response.Data.value.empty())
+	int gav = helper->GetAntiAlgorithmValue(response, "capability_v1",
+			buildDispatchRequestJson(operation, snapshot, &requestNonce));
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+	std::fprintf(stderr, "[Zone][vmdisp] GetAntiAlgorithmValue rc=%d value.size=%zu\n",
+		gav, response.Data.value.size());
+	std::fprintf(stderr, "[Zone][vmdisp] raw value:\n%s\n", response.Data.value.c_str());
+#endif
+	if (gav != 1 || response.Data.value.empty())
 		return 0;
 	const std::string signedBlob = extractJsonString(response.Data.value, "dispatch_blob");
 	const std::string windowId = extractJsonString(response.Data.value, "window_id");
 	const std::string vB64 = extractJsonString(response.Data.value, "dispatch_v");
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+	std::fprintf(stderr, "[Zone][vmdisp] parsed window_id='%s' vB64.len=%zu blob.len=%zu\n",
+		windowId.c_str(), vB64.size(), signedBlob.size());
+#endif
 	// 新模型：云端返回 dispatch_v（32B base64，已搜索使 offset==0）；
 	// 旧模型：返回 dispatch_blob（Ed25519 签名，供 body key 派生）。二者可并存。
 	if (windowId.empty() || (signedBlob.empty() && vB64.empty()))

@@ -3,6 +3,7 @@
 #include "JsonCompat.h"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 namespace {
 
@@ -2150,6 +2151,12 @@ bool ZoneHelperCore::ToWrite(std::string requestData, std::string time, ApiRespo
 		EncodeMachineNamesForWire(requestData);
 		std::string packed_data = ToPackPostData(requestData);
 		std::string response_json = "";
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+		std::cerr << "[Zone][pkt] >>> POST " << apiUrl << "\n"
+			<< "[Zone][pkt] >>> plain request:\n" << requestData << "\n"
+			<< "[Zone][pkt] >>> packed request(size=" << packed_data.size() << "):\n"
+			<< packed_data << "\n";
+#endif
 		if (Z_AgreementType == eum_AgreementType::SOCKET)
 		{
 			// response_json = SendPostRequest(apiUrl, packed_data);
@@ -2168,11 +2175,28 @@ bool ZoneHelperCore::ToWrite(std::string requestData, std::string time, ApiRespo
 			response_json = SendPostRequest(apiUrl, packed_data);
 		}
 
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+		std::cerr << "[Zone][pkt] <<< raw response(size=" << response_json.size() << "):\n"
+			<< response_json << "\n";
+#endif
+
 		const std::string unpacked = ToUnPackPostData(response_json);
-		if (unpacked.empty())
+		if (unpacked.empty()) {
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+			std::cerr << "[Zone][pkt] !! unpack failed (empty) -- see [Zone] lines above for the exact stage\n";
+#endif
 			return false;
-		if (!DeserializeJson(unpacked, response))
+		}
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+		std::cerr << "[Zone][pkt] <<< unpacked(size=" << unpacked.size() << "):\n"
+			<< unpacked << "\n";
+#endif
+		if (!DeserializeJson(unpacked, response)) {
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+			std::cerr << "[Zone][pkt] !! DeserializeJson failed on unpacked payload\n";
+#endif
 			return false;
+		}
 
 		if ("success" == response.Data.Run_status && "" != response.Data.Token)
 		{

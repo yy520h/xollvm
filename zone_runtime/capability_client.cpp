@@ -4,6 +4,7 @@
 #include <openssl/pem.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -41,9 +42,16 @@ bool verify(EVP_PKEY* key, const CapabilityResponse& response) {
   EvpMdCtx ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
   if (!ctx || EVP_DigestVerifyInit(ctx.get(), nullptr, nullptr, nullptr, key) != 1)
     return false;
-  return EVP_DigestVerify(ctx.get(), signature.data(), static_cast<size_t>(signatureLength),
-                          reinterpret_cast<const unsigned char*>(responseBytes(response).data()),
-                          responseBytes(response).size()) == 1;
+  const std::string payload = responseBytes(response);
+  const int rc = EVP_DigestVerify(ctx.get(), signature.data(), static_cast<size_t>(signatureLength),
+                          reinterpret_cast<const unsigned char*>(payload.data()),
+                          payload.size());
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+  std::fprintf(stderr, "[Zone][ver] canonical(len=%zu):\n%s", payload.size(), payload.c_str());
+  std::fprintf(stderr, "[Zone][ver] signature(b64)=%s\n", encoded.c_str());
+  std::fprintf(stderr, "[Zone][ver] EVP_DigestVerify rc=%d\n", rc);
+#endif
+  return rc == 1;
 }
 
 }  // namespace
@@ -59,18 +67,36 @@ bool CapabilityClient::verifySignature(const CapabilityResponse& response) const
 }
 
 bool CapabilityClient::writeState(const CapabilityResponse& response) {
-  if (config_.state_path.empty()) return false;
+  if (config_.state_path.empty()) {
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+    std::fprintf(stderr, "[Zone][ver] writeState FAIL: state_path empty\n");
+#endif
+    return false;
+  }
   const std::string temporary = config_.state_path + ".tmp";
   {
     std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-    if (!file) return false;
+    if (!file) {
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+      std::fprintf(stderr, "[Zone][ver] writeState FAIL: cannot open %s\n", temporary.c_str());
+#endif
+      return false;
+    }
     file << response.next_state << '\n' << response.operation << '\n'
          << response.expires_at << '\n';
     file.flush();
-    if (!file) return false;
+    if (!file) {
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+      std::fprintf(stderr, "[Zone][ver] writeState FAIL: write error on %s\n", temporary.c_str());
+#endif
+      return false;
+    }
   }
   chmod(temporary.c_str(), 0600);
   if (std::rename(temporary.c_str(), config_.state_path.c_str()) != 0) {
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+    std::fprintf(stderr, "[Zone][ver] writeState FAIL: rename %s -> %s\n", temporary.c_str(), config_.state_path.c_str());
+#endif
     std::remove(temporary.c_str());
     return false;
   }
@@ -96,10 +122,29 @@ bool CapabilityClient::acceptResponse(const CapabilityResponse& response,
                                       const std::string& expected_request_hash,
                                       const std::string& expected_device_id_hash) {
   const uint64_t now = config_.server_time;
-  if (!validateCapabilityResponse(response) || response.key_id != config_.key_id ||
+  bool valid = validateCapabilityResponse(response);
+  bool sig = verifySignature(response);
+#ifdef XOLLVM_ZONE_DEBUG_PKT
+  {
+    auto dbgline = [&](const char* name, bool ok, const std::string& detail) {
+      std::fprintf(stderr, "[Zone][ver] %-22s %s  %s\n", name, ok ? "ok" : "FAIL", detail.c_str());
+    };
+    dbgline("validate", valid, "");
+    dbgline("key_id", response.key_id == config_.key_id, response.key_id + " vs " + config_.key_id);
+    dbgline("operation", response.operation == config_.operation, response.operation + " vs " + config_.operation);
+    dbgline("request_hash", response.request_hash == expected_request_hash, response.request_hash.substr(0,16)+" vs "+expected_request_hash.substr(0,16));
+    dbgline("device_id_hash", expected_device_id_hash.empty() || response.device_id_hash == expected_device_id_hash, "");
+    dbgline("policy_version", response.policy_version == config_.policy_version, std::to_string(response.policy_version)+" vs "+std::to_string(config_.policy_version));
+    dbgline("signature", sig, sig ? "" : "public_key/private_key 不匹配或 canonical 不一致");
+    dbgline("issued<=now+skew", response.issued_at <= now + config_.clock_skew_seconds, std::to_string(response.issued_at)+" vs now="+std::to_string(now));
+    dbgline("expires+skew>=now", response.expires_at + config_.clock_skew_seconds >= now, std::to_string(response.expires_at)+" + "+std::to_string(config_.clock_skew_seconds)+" vs now="+std::to_string(now));
+    dbgline("expires>issued", response.expires_at > response.issued_at, "");
+  }
+#endif
+  if (!valid || response.key_id != config_.key_id ||
       response.operation != config_.operation || response.request_hash != expected_request_hash ||
       (!expected_device_id_hash.empty() && response.device_id_hash != expected_device_id_hash) ||
-      response.policy_version != config_.policy_version || !verifySignature(response) ||
+      response.policy_version != config_.policy_version || !sig ||
       response.issued_at > now + config_.clock_skew_seconds ||
       response.expires_at + config_.clock_skew_seconds < now ||
       response.expires_at <= response.issued_at)

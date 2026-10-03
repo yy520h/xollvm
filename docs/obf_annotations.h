@@ -288,6 +288,41 @@
  *--------------------------------------------------------------------------*/
 
 /*----------------------------------------------------------------------------
+ * 云值驱动 VM dispatch（cloudDispatch）端到端说明
+ *
+ *   作用：让每个被虚拟化函数的 handler 分发依赖一个云端临时值 V。V 缺失、
+ *   过期或被篡改时，dispatch 偏移非 0，索引越界/命中陷阱自然崩溃；本地没有
+ *   任何 "if (有效)/if (未过期)" 判断可被 NOP。
+ *
+ *   编译期（客户端）：
+ *     vm(cloudDispatch=1) 让 VM 在两处 dispatch（中央与 threaded）注入对
+ *     __zone_get_dispatch_offset() 的调用；该符号由 zone_runtime 的
+ *     cloud_value_manager 提供。客户端编译期只需 VM_DISPATCH_OFFSET_MASK，
+ *     不需要预知运行时 V。默认关闭时输出与非云构建一致。
+ *
+ *   运行时（客户端）：
+ *     cloud_value_manager 首次 dispatch 时同步拉取当前 window 的 V（避免首跑
+ *     用全零 V 必崩），之后按 VM_DISPATCH_PREFETCH_SEC 异步预取；按
+ *     window_id 分桶，用 HMAC-SHA256(V, window_le64) 取低 VM_DISPATCH_OFFSET_MASK
+ *     位作为偏移。V 通过 zone_wrapper 的既有登录/租约/capability 线路取得。
+ *
+ *   云端：
+ *     持有固定密钥 k，为每个 window 搜索一个 V 使 HMAC(V, window) & MASK == 0，
+ *     随 capability 响应下发 dispatch_v（32B base64）与 window_id。
+ *     参考实现 zone_runtime/cloud/capability_v1.js。
+ *
+ *   约定（两端必须一致）：
+ *     VM_DISPATCH_OFFSET_MASK（客户端 cloud_value_manager.h）== 云端
+ *     dispatchOffsetMask。12-bit(0xFFF) 云端约 2^12 次 HMAC（毫秒级）；
+ *     位宽越大越安全但云端搜索越贵，过大会超时。
+ *
+ *   排错：
+ *     编译期调试打印默认关闭。仅本地排错时，链接调试版 zone SDK
+ *     （ndk-build XOLLVM_ZONE_DEBUG_PKT=1）可打印收发数据包（含明文请求/
+ *     响应），发布构建绝不包含这些代码。
+ *--------------------------------------------------------------------------*/
+
+/*----------------------------------------------------------------------------
  * aes_stub                                               AES 运行时存根
  *   链接共享的 AES-CTR 运行时存根。这是模块级能力，通常在 strenc/vm 需要
  *   AES 时自动引入，很少需要单独添加注解。
@@ -388,6 +423,13 @@
  *   superOps         (0)     fuse mul+add / shl+add / icmp+select /
  *                            and+icmp==0 chains into single super-op opcodes
  *   randISA          (0)     每次构建随机排列操作数字段编码
+ *   cloudDispatch    (0)     云值驱动的动态 dispatch 偏移：运行时由
+ *                            __zone_get_dispatch_offset() 返回一个由云值 V
+ *                            派生的偏移（合法值=0；过期/缺失/篡改时非 0），
+ *                            直接叠加到 handler 表索引上。本地无任何范围/时效
+ *                            校验，错误偏移使索引越界或落入陷阱，自然崩溃。
+ *                            需要 zoneauth(capability=...) 与云端配合提供 V。
+ *                            默认关闭（关闭时不引用运行时符号，输出不变）。
  *   enginePoolSize   (1)     将函数分散到 N 个不同引擎
  *   perFnEngine      (0)     为此函数分配独立引擎
  *   metamorphicEngines (0)   使每个引擎的 handler 体多样化

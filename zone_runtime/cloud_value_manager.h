@@ -21,8 +21,10 @@ namespace xollvm {
 // 期望搜索次数为 2^bits（见 MASK 位宽），每次一个 HMAC。
 
 // 偏移掩码：错误 offset 的取值范围。位宽越大越保证越界崩溃，但云端搜索越贵。
+// 12 bit：云端期望 ~2^12=4096 次 HMAC（毫秒级）；20 bit 会让云端每 window
+// 搜索 ~2^20 次而超时，因此两端必须同时使用 12 bit。
 #ifndef VM_DISPATCH_OFFSET_MASK
-#define VM_DISPATCH_OFFSET_MASK 0x000FFFFFu   // 20 bit，云端期望 ~2^20 次 HMAC
+#define VM_DISPATCH_OFFSET_MASK 0x00000FFFu   // 12 bit，云端期望 ~2^12 次 HMAC
 #endif
 
 // 云值时效窗口（秒）

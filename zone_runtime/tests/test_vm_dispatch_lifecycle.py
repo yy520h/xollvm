@@ -26,10 +26,11 @@ def test_dispatch_state_caches_key_and_tick():
 
 def test_vm_dispatch_value_cpp_is_in_cmake_source_list():
     cmake = (ROOT / "zone_runtime/CMakeLists.txt").read_text()
-    library_block = cmake[cmake.index("add_library(xollvm_zone_sdk STATIC"):]
-    library_block = library_block[: library_block.index(")")]
-    assert "vm_dispatch_value.cpp" in library_block, \
-        "vm_dispatch_value.cpp must be in the xollvm_zone_sdk STATIC sources"
+    # 源列表抽成 _ZONE_SDK_RUNTIME_SOURCES 变量后被两个 SDK 库（发布/调试）复用。
+    block = cmake[cmake.index("set(_ZONE_SDK_RUNTIME_SOURCES"):]
+    block = block[: block.index(")")]
+    assert "vm_dispatch_value.cpp" in block, \
+        "vm_dispatch_value.cpp must be in the zone SDK runtime sources"
 
 
 def test_unwrap_helper_is_single_shared_function():
