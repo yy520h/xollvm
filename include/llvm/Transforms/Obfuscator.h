@@ -21,6 +21,7 @@
 #include "llvm/Transforms/Obfuscator/ObfuscationAnnotationAnalysis.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationPipeline.h"
+#include "llvm/Transforms/Obfuscator/ElfIntegrity.h"
 #include "llvm/Transforms/Obfuscator/SensitiveDecision.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
 #include "llvm/Transforms/Obfuscator/PassIds.h"
@@ -668,6 +669,12 @@ namespace llvm {
 				report_fatal_error(
 					"obfuscator: sensitive post-validation failed",
 					/*gen_crash_diag=*/false);
+			// Task 8: emit the ELF integrity manifest placeholder + runtime
+			// checker for modules with a strict sensitive region.
+			{
+				ModuleAnalysisManager& MAMRef = MAM;
+				ElfIntegrityPass().run(M, MAMRef);
+			}
 
 			// Emit JSON report at end of module pipeline (if configured).
 			if (llvm::obf::isReportEnabled()) {

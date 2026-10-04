@@ -16,11 +16,14 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -31,8 +34,19 @@ namespace {
 
 	enum ExitCode { Ok = 0, Malformed = 2, PolicyViolation = 3 };
 
-	cl::opt<std::string> Command(cl::Positional, cl::desc("<audit>"), cl::Required);
+	// Manifest layout (must match ElfIntegrity.h).
+	constexpr uint64_t kManifestSize = 184;
+	constexpr uint64_t kManifestRangeCountOff = 12;
+	constexpr uint64_t kManifestVAOff = 16;
+	constexpr uint64_t kManifestRangesOff = 24;
+	constexpr uint64_t kManifestDigestOff = 152;
+	constexpr unsigned kMaxRanges = 8;
+
+	cl::opt<std::string> Command(cl::Positional,
+		cl::desc("<audit|seal|verify>"), cl::Required);
 	cl::opt<std::string> Input("input", cl::desc("ELF input path"), cl::Required);
+	cl::opt<std::string> Output("output", cl::desc("sealed ELF output path"),
+		cl::init(""));
 	cl::opt<uint64_t> ZeroThreshold("zero-threshold",
 		cl::desc("minimum zero-run size to report (inclusive)"), cl::init(512));
 	cl::list<std::string> AllowSections("allow-section",
@@ -101,8 +115,9 @@ namespace {
 int main(int argc, char** argv) {
 	cl::ParseCommandLineOptions(argc, argv, "xollvm ELF hardener\n");
 
-	if (Command != "audit") {
-		errs() << "error: unknown command '" << Command << "' (expected audit)\n";
+	if (Command != "audit" && Command != "seal" && Command != "verify") {
+		errs() << "error: unknown command '" << Command
+			<< "' (expected audit|seal|verify)\n";
 		return Malformed;
 	}
 
@@ -189,6 +204,193 @@ int main(int argc, char** argv) {
 				R.Name = std::string(ShStr + Shdr->sh_name);
 			Sections.push_back(std::move(R));
 		}
+	}
+
+	// ---- seal / verify -----------------------------------------------------
+	if (Command == "seal" || Command == "verify") {
+		// Locate the manifest. It lives in .text.xollvm.integrity (merged into
+		// .text, the executable load). Accept the legacy bare name too.
+		auto isManifestName = [](const char* N) {
+			return std::strcmp(N, ".text.xollvm.integrity") == 0 ||
+				std::strcmp(N, ".xollvm.integrity") == 0;
+		};
+		uint64_t ManOff = 0, ManAddr = 0;
+		bool ManFound = false;
+		// (a) A dedicated section survives only if lld keeps it separate.
+		for (uint64_t I = 0; I != ShNum; ++I) {
+			const auto* Shdr = reinterpret_cast<const ELF::Elf64_Shdr*>(
+				Data.data() + ShOff + I * ShEnt);
+			if (!ShStr || Shdr->sh_name >= ShStrSize) continue;
+			if (!isManifestName(ShStr + Shdr->sh_name)) continue;
+			ManOff = Shdr->sh_offset;
+			ManAddr = Shdr->sh_addr;
+			ManFound = Shdr->sh_size >= kManifestSize;
+			break;
+		}
+		// (b) Fallback: find the manifest symbol in .symtab/.dynsym and map its
+		// vaddr back to a file offset via PT_LOAD. Robust against lld merging
+		// `.text.*` sections into `.text`.
+		if (!ManFound) {
+			for (uint64_t I = 0; I != ShNum && !ManFound; ++I) {
+				const auto* Shdr = reinterpret_cast<const ELF::Elf64_Shdr*>(
+					Data.data() + ShOff + I * ShEnt);
+				if (Shdr->sh_type != ELF::SHT_SYMTAB && Shdr->sh_type != ELF::SHT_DYNSYM)
+					continue;
+				if (Shdr->sh_entsize < sizeof(ELF::Elf64_Sym)) continue;
+				const char* StrTab = nullptr;
+				if (Shdr->sh_link < ShNum) {
+					const auto* StrHdr = reinterpret_cast<const ELF::Elf64_Shdr*>(
+						Data.data() + ShOff + Shdr->sh_link * ShEnt);
+					if (StrHdr->sh_offset + StrHdr->sh_size <= Data.size())
+						StrTab = reinterpret_cast<const char*>(Data.data() + StrHdr->sh_offset);
+				}
+				uint64_t Count = Shdr->sh_size / Shdr->sh_entsize;
+				for (uint64_t K = 0; K != Count; ++K) {
+					const auto* Sym = reinterpret_cast<const ELF::Elf64_Sym*>(
+						Data.data() + Shdr->sh_offset + K * Shdr->sh_entsize);
+					if (Sym->st_name == 0 || !StrTab) continue;
+					if (std::strcmp(StrTab + Sym->st_name,
+						"__xollvm_elf_integrity_manifest") != 0)
+						continue;
+					if (Sym->st_size < kManifestSize) continue;
+					ManAddr = Sym->st_value;
+					// Map vaddr -> file offset through PT_LOAD.
+					for (uint64_t P = 0; P != PhNum; ++P) {
+						const auto* Phdr = reinterpret_cast<const ELF::Elf64_Phdr*>(
+							Data.data() + PhOff + P * PhEnt);
+						if (Phdr->p_type != ELF::PT_LOAD) continue;
+						if (ManAddr >= Phdr->p_vaddr &&
+							ManAddr + kManifestSize <= Phdr->p_vaddr + Phdr->p_filesz) {
+							ManOff = Phdr->p_offset + (ManAddr - Phdr->p_vaddr);
+							ManFound = true;
+							break;
+						}
+					}
+					if (ManFound) break;
+				}
+			}
+		}
+		if (!ManFound) {
+			errs() << "error: no xollvm integrity manifest found\n";
+			return Malformed;
+		}
+
+		// Reject dynamic relocation targets inside any PF_X PT_LOAD.
+		// Enumerate RELA/REL from section headers.
+		for (uint64_t I = 0; I != ShNum; ++I) {
+			const auto* Shdr = reinterpret_cast<const ELF::Elf64_Shdr*>(
+				Data.data() + ShOff + I * ShEnt);
+			bool IsRela = Shdr->sh_type == ELF::SHT_RELA;
+			bool IsRel = Shdr->sh_type == ELF::SHT_REL;
+			if (!IsRela && !IsRel) continue;
+			uint64_t Ent = IsRela ? sizeof(ELF::Elf64_Rela) : sizeof(ELF::Elf64_Rel);
+			if (Ent == 0) continue;
+			uint64_t Count = Shdr->sh_size / Ent;
+			for (uint64_t K = 0; K != Count; ++K) {
+				const uint8_t* EP = Data.data() + Shdr->sh_offset + K * Ent;
+				uint64_t Target;
+				if (IsRela) Target = reinterpret_cast<const ELF::Elf64_Rela*>(EP)->r_offset;
+				else Target = reinterpret_cast<const ELF::Elf64_Rel*>(EP)->r_offset;
+				for (uint64_t P = 0; P != PhNum; ++P) {
+					const auto* Phdr = reinterpret_cast<const ELF::Elf64_Phdr*>(
+						Data.data() + PhOff + P * PhEnt);
+					if (Phdr->p_type != ELF::PT_LOAD || !(Phdr->p_flags & ELF::PF_X))
+						continue;
+					if (Target >= Phdr->p_vaddr && Target < Phdr->p_vaddr + Phdr->p_filesz) {
+						errs() << "error: dynamic relocation target 0x"
+							<< Twine::utohexstr(Target) << " lies in executable segment "
+							<< P << "\n";
+						return PolicyViolation;
+					}
+				}
+			}
+		}
+
+		// Canonical hash: the file-backed bytes of the executable PT_LOAD that
+		// contains the manifest, with the manifest bytes zeroed. This matches
+		// the runtime checker, which maps that same range and hashes it in
+		// place. Private copy so `verify` never mutates the input.
+		auto put64 = [&](std::vector<uint8_t>& V, uint64_t Off, uint64_t Val) {
+			for (int J = 0; J < 8; ++J) V[Off + J] = (uint8_t)(Val >> (J * 8));
+		};
+
+		// The canonical range is exactly the executable PT_LOAD that contains
+		// the manifest: the runtime recovers the module base from the manifest
+		// address, so range[0] must be that same load for both sides to hash
+		// identical bytes.
+		uint64_t SegOff = 0, SegSize = 0, R0Vaddr = 0, R0Size = 0;
+		bool HaveSeg = false;
+		for (uint64_t P = 0; P != PhNum; ++P) {
+			const auto* Phdr = reinterpret_cast<const ELF::Elf64_Phdr*>(
+				Data.data() + PhOff + P * PhEnt);
+			if (Phdr->p_type != ELF::PT_LOAD || !(Phdr->p_flags & ELF::PF_X)) continue;
+			if (Phdr->p_filesz == 0) continue;
+			if (ManAddr >= Phdr->p_vaddr &&
+				ManAddr + kManifestSize <= Phdr->p_vaddr + Phdr->p_filesz) {
+				SegOff = Phdr->p_offset; SegSize = Phdr->p_filesz;
+				R0Vaddr = Phdr->p_vaddr; R0Size = Phdr->p_filesz;
+				HaveSeg = true;
+				break;
+			}
+		}
+		if (!HaveSeg) {
+			errs() << "error: manifest is not inside an executable PT_LOAD\n";
+			return Malformed;
+		}
+
+		std::vector<uint8_t> Out(Data.begin(), Data.end());
+		// Stamp ManifestVirtualAddress (offset 16) for the runtime base calc.
+		if (Command == "seal") put64(Out, ManOff + kManifestVAOff, ManAddr);
+		// Range[0] = the manifest-carrying executable range.
+		if (Command == "seal") {
+			put64(Out, ManOff + kManifestRangeCountOff, 1);
+			put64(Out, ManOff + kManifestRangesOff + 0, R0Vaddr);
+			put64(Out, ManOff + kManifestRangesOff + 8, R0Size);
+		}
+		// Hash the executable range with the manifest bytes zeroed (both the
+		// seal-time stamp and the digest live inside this zeroed window, so the
+		// hash is stable across seal and runtime). Also bind the canonical
+		// program-header table region: the [EHDR .. end of phdrs) file bytes
+		// live outside every range but describe the load layout.
+		for (uint64_t J = 0; J < kManifestSize; ++J)
+			Out[ManOff + J] = 0;
+		SHA256 Hasher;
+		// Canonical ELF header + program header table region.
+		uint64_t HdrEnd = PhOff + PhEnt * PhNum;
+		if (HdrEnd > Data.size()) HdrEnd = Data.size();
+		Hasher.update(ArrayRef<uint8_t>(Out.data(), HdrEnd));
+		// The manifest-carrying executable range, manifest window zeroed.
+		Hasher.update(ArrayRef<uint8_t>(Out.data() + SegOff, SegSize));
+		auto Hash = Hasher.final();
+		ArrayRef<uint8_t> DigestBytes(Hash.data(), 32);
+
+		if (Command == "verify") {
+			ArrayRef<uint8_t> Stored(Data.data() + ManOff + kManifestDigestOff, 32);
+			if (DigestBytes != Stored) {
+				errs() << "error: integrity digest mismatch\n";
+				return PolicyViolation;
+			}
+			errs() << "verify: digest matches\n";
+			return Ok;
+		}
+
+		// seal: write the digest (into the previously-zeroed window).
+		if (Output.empty()) {
+			errs() << "error: seal requires --output\n";
+			return Malformed;
+		}
+		for (uint64_t J = 0; J < 32; ++J) Out[ManOff + kManifestDigestOff + J] = DigestBytes[J];
+
+		std::error_code EC;
+		raw_fd_ostream OS(Output, EC, sys::fs::OF_None);
+		if (EC) {
+			errs() << "error: cannot write '" << Output << "': " << EC.message() << "\n";
+			return Malformed;
+		}
+		OS.write(reinterpret_cast<const char*>(Out.data()), Out.size());
+		errs() << "seal: wrote " << Output << " (range vaddr 0x"
+			<< Twine::utohexstr(R0Vaddr) << " size " << R0Size << ")\n";
+		return Ok;
 	}
 
 	std::vector<std::string> Allowed(AllowSections.begin(), AllowSections.end());

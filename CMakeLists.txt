@@ -66,6 +66,7 @@ endif()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_subdirectory(aes_stub)
+add_subdirectory(integrity_stub)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +128,7 @@ set(OBF_SOURCES
   ObfuscationOptions.cpp
   ObfuscationConfig.cpp
   SensitiveDecision.cpp
+  ElfIntegrity.cpp
 
 
   # Registration entry point (getObfuscatorPluginInfo / llvmGetPassPluginInfo).
@@ -150,6 +152,7 @@ include_directories(
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
   "${CMAKE_CURRENT_BINARY_DIR}/aes_stub"
+  "${CMAKE_CURRENT_BINARY_DIR}/integrity_stub"
 )
 
 # intrinsics_gen only exists inside an LLVM build tree.
@@ -190,9 +193,9 @@ add_llvm_pass_plugin(Obfuscator
 # The AES stub .inc must be generated before any obfuscator source that
 # includes it is compiled. Under LINK_INTO_TOOLS add_llvm_pass_plugin compiles
 # into obj.Obfuscator (not Obfuscator), so depend on both targets.
-add_dependencies(Obfuscator aes_stub_inc)
+add_dependencies(Obfuscator aes_stub_inc integrity_stub_inc)
 if(TARGET obj.Obfuscator)
-  add_dependencies(obj.Obfuscator aes_stub_inc)
+  add_dependencies(obj.Obfuscator aes_stub_inc integrity_stub_inc)
 endif()
 
 # 生成当前 LLVM 的类型表，避免回落到系统安装版本的 GenVT.inc。
