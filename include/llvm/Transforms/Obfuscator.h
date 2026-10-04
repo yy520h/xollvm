@@ -21,6 +21,7 @@
 #include "llvm/Transforms/Obfuscator/ObfuscationAnnotationAnalysis.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationPipeline.h"
+#include "llvm/Transforms/Obfuscator/SensitiveDecision.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
 #include "llvm/Transforms/Obfuscator/PassIds.h"
 #include "llvm/Transforms/Obfuscator/PassRng.h"
@@ -656,8 +657,17 @@ namespace llvm {
 			VMPlanCoordinator* PreviousCoordinator = VMPlanCoordinator::setActive(&Coordinator);
 			PreservedAnalyses PA = MPM.run(M, MAM);
 			VMPlanCoordinator::setActive(PreviousCoordinator);
+			// Task 4: a strict sensitive candidate that never prepared must fail
+			// the build before commit, not silently vanish.
+			Coordinator.verifyRequiredCandidates();
 			if (!Coordinator.freeze() || !Coordinator.commit())
 				return PreservedAnalyses::none();
+			Coordinator.verifySensitiveCommits();
+			// Task 5: post-commit structural proof over the final module.
+			if (!verifyCommittedSensitiveRegions(M, errs()))
+				report_fatal_error(
+					"obfuscator: sensitive post-validation failed",
+					/*gen_crash_diag=*/false);
 
 			// Emit JSON report at end of module pipeline (if configured).
 			if (llvm::obf::isReportEnabled()) {

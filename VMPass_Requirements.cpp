@@ -209,11 +209,12 @@ void VMRequirementSet::closeDependencies(const VMPassConfig &Cfg) {
 		if (!Opcodes.test(I)) continue;
 		switch (static_cast<VMOp>(I)) {
 		case OP_LOADI: case OP_MOVR: case OP_BINOP: case OP_ICMP: case OP_CAST:
-		case OP_JMPC: case OP_RET_INT: case OP_SWITCH: case OP_CALL_INT:
+		case OP_JMPC: case OP_SWITCH: case OP_CALL_INT:
 			NeedsRegFile[0] = true; break;
 		case OP_LOADI64: case OP_BINOP64: case OP_CALL_INT64:
 			NeedsRegFile[1] = true; break;
-		case OP_CAST64: case OP_ICMP64:
+		// OP_RET_INT 按调用参数选择 i32/i64，两种寄存器文件都可能被读取。
+		case OP_RET_INT: case OP_CAST64: case OP_ICMP64:
 			NeedsRegFile[0] = NeedsRegFile[1] = true; break;
 		case OP_PTRTOINT: case OP_INTTOPTR: case OP_LOAD32: case OP_STORE32:
 		case OP_LOAD8: case OP_STORE8: case OP_LOAD16: case OP_STORE16: case OP_GEP:

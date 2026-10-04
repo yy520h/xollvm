@@ -87,6 +87,7 @@ namespace llvm {
 	[[maybe_unused]] static bool isVMEligible(Function& F, const FunctionObfContext& FOC,
 		const VMPassConfig& Cfg, raw_ostream* R = nullptr) {
 		if (FOC.HasEHPad || FOC.HasInvoke) { if (R)*R << "EH/invoke"; return false; }
+		if (FOC.HasMustTail) { if (R)*R << "musttail"; return false; }
 		if (FOC.HasCallBr) { if (R)*R << "callbr";  return false; }
 		if (FOC.HasIndirectBr) { if (R)*R << "indirectbr already"; return false; }
 		if (FOC.HasNaked) { if (R)*R << "naked";   return false; }
@@ -97,19 +98,6 @@ namespace llvm {
 		if (Cfg.maxBlocks > 0 && FOC.NumNormalBlocks > Cfg.maxBlocks) {
 			if (R)*R << "too many blocks(" << FOC.NumNormalBlocks << ">" << Cfg.maxBlocks << ")";
 			return false;
-		}
-		// Multi-value-return functions are unsafe: computeReturnInfo()/buildWrapper()
-		// read the return value from ONE fixed register-file slot (the first
-		// ReturnInst's), so any function with >1 value-returning ret can miscompute
-		// on non-first return paths. Bail conservatively.
-		{
-			unsigned ValueReturns = 0;
-			for (BasicBlock& BB : F) {
-				if (!llvm::obf::hasTerminatorCompat(&BB)) continue;
-				if (auto* RI = dyn_cast<ReturnInst>(BB.getTerminator()))
-					if (RI->getReturnValue()) ++ValueReturns;
-			}
-			if (ValueReturns > 1) { if (R) *R << "multi-value-return"; return false; }
 		}
 		return true;
 	}
@@ -126,6 +114,8 @@ namespace llvm {
 	// vm_engine with per-function context (bytecode, register files, handler
 	// table).
 	// ========================================================================
+	enum class VMReturnKind : uint32_t { Void = 0, I32 = 1, I64 = 2, Ptr = 3, F64 = 4 };
+
 	namespace VMEngine {
 
 		// ── Parameter indices for vm_engine() ──────────────────────────────────
@@ -147,6 +137,10 @@ namespace llvm {
 		//      ptr  %regkeys,      // 14  Step 05: per-slot i32 XOR keys (null = off)
 		//      ptr  %reg64keys,    // 15  Step 05: per-slot i64 XOR keys (null = off)
 		//      ptr  %fregkeys,     // 16  Step 05: per-slot i64 XOR keys for f64 (null = off)
+		//      i64  %callee_mask,  // 17
+		//      ptr  %ret_storage,  // 18  wrapper 独立分配的返回值存储
+		//      i32  %ret_kind,     // 19  VMReturnKind
+		//      ptr  %lazyctx       // 20  仅 lazyDecrypt 引擎携带
 		//  )
 
 		static constexpr unsigned kParamBC = 0;
@@ -167,11 +161,10 @@ namespace llvm {
 		static constexpr unsigned kParamReg64Keys = 15;
 		static constexpr unsigned kParamFRegKeys = 16;
 		static constexpr unsigned kParamCalleeMask = 17;
-		static constexpr unsigned kNumParams = 18;
-		// Present only when the engine was built with lazyDecrypt=1 (one extra
-		// trailing ptr param). kNumParams above is unchanged so the non-lazy
-		// signature — and therefore all output when the feature is off — is
-		// byte-identical to before this param was added.
+		static constexpr unsigned kParamRetStorage = 18;
+		static constexpr unsigned kParamRetKind = 19;
+		static constexpr unsigned kNumParams = 20;
+		// lazy context 始终位于固定参数之后，避免返回类型影响参数索引。
 		static constexpr unsigned kParamLazyCtx = kNumParams;
 
 		// Layout of the per-call lazy-decrypt context block (a flat byte buffer
@@ -220,8 +213,7 @@ namespace llvm {
 		}
 
 		/// Return the canonical FunctionType for vm_engine. `lazy` appends the
-		/// trailing lazyctx ptr param; false (default) reproduces the exact
-		/// pre-existing signature.
+		/// trailing lazyctx ptr param after the fixed return-storage ABI.
 		inline FunctionType* getVMEngineFunctionType(LLVMContext& Ctx, bool lazy = false) {
 			Type* PtrTy = PointerType::getUnqual(Ctx);
 			Type* I32Ty = Type::getInt32Ty(Ctx);
@@ -233,6 +225,7 @@ namespace llvm {
 				PtrTy, PtrTy,
 				PtrTy, PtrTy, PtrTy,   // regkeys, reg64keys, fregkeys
 				I64Ty,                 // callee_mask
+				PtrTy, I32Ty,          // ret_storage, ret_kind
 				PtrTy,                 // lazyctx (only present when lazy)
 			};
 			unsigned N = lazy ? (kNumParams + 1) : kNumParams;
@@ -428,7 +421,7 @@ namespace llvm {
 		// per-slot XOR keys for register value encryption 
 		// Generated from a forked RNG after register file sizes are known.
 		// Consumed by ldVR/stVR/ldVR64/stVR64/ldFR/stFR in the engine handlers
-		// and by buildWrapper() for pre-load encryption + return decryption.
+		// and by buildWrapper() for pre-load encryption.
 		SmallVector<uint32_t, 64> RegKeys;     // [NVRAlloc]   i32 XOR keys
 		SmallVector<uint64_t, 64> Reg64Keys;   // [NVR64Alloc] i64 XOR keys
 		SmallVector<uint64_t, 64> FRegKeys;    // [NFRAlloc]   i64 XOR keys (bitcast on f64)
@@ -479,6 +472,8 @@ namespace llvm {
 		Value* EffFTyIndices = nullptr;// FTy index table base
 		Value* EffHandlers = nullptr;  // handler table base
 		Value* EffCalleeMask = nullptr;// callee XOR mask (i64, null when off)
+		Value* EffRetStorage = nullptr;// wrapper 提供的独立返回存储
+		Value* EffRetKind = nullptr;   // 每次调用的返回类型，不能取 founding function 的类型
 		Value* EffLazyCtx = nullptr;   // lazy-decrypt context block ptr (null unless LazyDecrypt)
 		Value* MaskVR = nullptr;       // i32 mask values
 		Value* MaskVR64 = nullptr;
@@ -490,8 +485,7 @@ namespace llvm {
 		bool      SharedEngineMode = false;
 
 		// return value info for thin wrapper
-		int       WrapRetSlot = -1;       // register file slot of return value (-1 = void)
-		VMEngine::RetKind2 WrapRetKind = VMEngine::RK2_VOID;
+		VMReturnKind WrapRetKind = VMReturnKind::Void;
 
 
 		BasicBlock* OpcBB[OP_COUNT][kMaxHandlerVariants] = {};
@@ -1018,7 +1012,7 @@ namespace llvm {
 		void setupEffLocal();         // point Eff* at per-function state
 		void populateVMEngine();      // build handlers in shared vm_engine
 		void ensureCallFTyCases();    // extend CALL switches for new FTys
-		void computeReturnInfo(Function &Body);
+		void computeReturnInfo();
 		void buildWrapper();          // thin wrapper that tail-calls vm_engine
 		void hardenWrapper();         // split + junk + opaque preds
 		void mbaHardenWrapper();      // MBA on wrapper arithmetic

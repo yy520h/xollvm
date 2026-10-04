@@ -71,6 +71,42 @@ void AntiDebugConfig::mergeCompatibility(const VMPassConfig& VM) {
 }
 
 // ============================================================================
+// Sensitive decision
+// ============================================================================
+
+SensitiveDecisionConfig SensitiveDecisionConfig::fromPassConfig(const PassConfig& PC) {
+	SensitiveDecisionConfig C;
+	C.enable = PC.enabled;
+	auto It = PC.params.find("region");
+	if (It != PC.params.end()) C.region = It->second;
+	auto StrictIt = PC.params.find("strict");
+	if (StrictIt != PC.params.end())
+		C.strict = StrictIt->second != "0" && StrictIt->second != "false";
+
+	// Unknown knobs are almost always typos (region=/strict= only).
+	for (const auto& KV : PC.params) {
+		if (KV.first != "region" && KV.first != "strict") {
+			C.unknownParam = KV.first;
+			break;
+		}
+	}
+	return C;
+}
+
+bool SensitiveDecisionConfig::validate(std::string* Reason) const {
+	if (!enable) return true;
+	if (!unknownParam.empty()) {
+		if (Reason) *Reason = "sensitive: unknown parameter '" + unknownParam + "'";
+		return false;
+	}
+	if (region.empty()) {
+		if (Reason) *Reason = "sensitive requires a non-empty region";
+		return false;
+	}
+	return true;
+}
+
+// ============================================================================
 // ObfuscationConfig 
 // ============================================================================
 

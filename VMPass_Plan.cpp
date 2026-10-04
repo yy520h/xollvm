@@ -1,7 +1,11 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
+#include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/Function.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <set>
 
@@ -23,6 +27,39 @@ VMPreparedCandidate* VMPlanCoordinator::addCandidate(Function& Fn,
 	Candidate->Emitter = std::move(Emitter);
 	Candidate->Requirements = Requirements;
 	Candidate->Accepted = true;
+	VMPreparedCandidate* Result = Candidate.get();
+	Candidates.push_back(std::move(Candidate));
+	return Result;
+}
+
+VMPreparedCandidate* VMPlanCoordinator::addRequired(Function& Fn,
+	const std::string& Region, bool Strict,
+	const SmallVectorImpl<Function*>& Callees,
+	const VMPassConfig& Config, const EngineConfigKey& Key,
+	BytecodeEmitter&& Emitter, const VMRequirementSet& Requirements) {
+	if (Frozen) return nullptr;
+	// A prior addCandidate() for the same function (e.g. it also carries
+	// vm(...)) is upgraded in place rather than duplicated.
+	for (auto& C : Candidates) {
+		if (C->Fn == &Fn) {
+			C->Required = true;
+			C->SensitiveStrict = Strict;
+			C->Region = Region;
+			C->SensitiveCallees.assign(Callees.begin(), Callees.end());
+			return C.get();
+		}
+	}
+	auto Candidate = std::make_unique<VMPreparedCandidate>();
+	Candidate->Fn = &Fn;
+	Candidate->Config = Config;
+	Candidate->Key = Key;
+	Candidate->Emitter = std::move(Emitter);
+	Candidate->Requirements = Requirements;
+	Candidate->Accepted = false;  // stays false until prepare() succeeds
+	Candidate->Required = true;
+	Candidate->SensitiveStrict = Strict;
+	Candidate->Region = Region;
+	Candidate->SensitiveCallees.assign(Callees.begin(), Callees.end());
 	VMPreparedCandidate* Result = Candidate.get();
 	Candidates.push_back(std::move(Candidate));
 	return Result;
@@ -64,6 +101,12 @@ bool VMPlanCoordinator::freeze() {
 	{
 		std::set<unsigned> Used;
 		for (auto& Group : Groups) {
+			// addCandidate() 创建的候选没有 VMImpl 对象（仅用于分组/需求合并），
+			// 跳过 engine-id 冲突检测；它们不会被 commit。
+			if (!Group.Candidates.front()->Impl) {
+				Group.Plan.EngineId = 0;
+				continue;
+			}
 			unsigned Base = Group.Candidates.front()->Impl->EngineId;
 			if (Used.insert(Base).second) {
 				Group.Plan.EngineId = Base;
@@ -104,7 +147,13 @@ bool VMPlanCoordinator::commit() {
 	for (auto& Candidate : Candidates) {
 		if (!Candidate->Accepted || !Candidate->Impl) continue;
 		const VMEnginePlan* Plan = planFor(Candidate->Key);
-		if (!Plan) return false;
+		if (!Plan) {
+			if (Candidate->Required && Candidate->SensitiveStrict)
+				report_fatal_error(Twine("obfuscator: sensitive region '") +
+					Candidate->Region + "': no engine plan for candidate '" +
+					Candidate->Fn->getName() + "'", /*gen_crash_diag=*/false);
+			return false;
+		}
 		// Apply the group's (possibly reassigned) engine id. prepare() does not
 		// bind EngineId; the engine function/state are built here in commit().
 		Candidate->Impl->EngineId = Plan->EngineId;
@@ -115,9 +164,66 @@ bool VMPlanCoordinator::commit() {
 			Candidate->Impl->setFullHandlerRequirements();
 		else
 			Candidate->Impl->setHandlerRequirements(Plan->Requirements);
-		if (!Candidate->Impl->commit()) return false;
+		if (!Candidate->Impl->commit()) {
+			if (Candidate->Required && Candidate->SensitiveStrict)
+				report_fatal_error(Twine("obfuscator: sensitive region '") +
+					Candidate->Region + "': VM commit failed for '" +
+					Candidate->Fn->getName() + "': " +
+					(Candidate->Impl->FailReason.empty()
+						? StringRef("unknown") : StringRef(Candidate->Impl->FailReason)),
+					/*gen_crash_diag=*/false);
+			return false;
+		}
+		// Post-commit proof: the wrapper body now exists and carries a sensitive
+		// region marker so post-validation can require it.
+		Function* Committed = Candidate->Impl->F.getParent()
+			? &Candidate->Impl->F : Candidate->Fn;
+		if (Candidate->Required && Committed) {
+			LLVMContext& C = Committed->getContext();
+			Committed->setMetadata("obf.sensitive.committed",
+				MDNode::get(C, { MDString::get(C, Candidate->Region) }));
+		}
 	}
 	return true;
+}
+
+bool VMPlanCoordinator::verifyRequiredCandidates() const {
+	bool AllOk = true;
+	for (const auto& Candidate : Candidates) {
+		if (!Candidate->Required) continue;
+		bool PreparedOk = Candidate->Accepted && Candidate->Impl != nullptr;
+		if (PreparedOk) continue;
+		std::string Reason = Candidate->SkipReason.empty()
+			? std::string("not prepared") : Candidate->SkipReason;
+		if (Candidate->SensitiveStrict) {
+			report_fatal_error(Twine("obfuscator: sensitive region '") +
+				Candidate->Region + "': function '" +
+				Candidate->Fn->getName() + "' could not be virtualized: " + Reason,
+				/*gen_crash_diag=*/false);
+		}
+		errs() << "obfuscator: sensitive region '" << Candidate->Region
+			<< "' (non-strict): function '" << Candidate->Fn->getName()
+			<< "' skipped: " << Reason << "\n";
+		AllOk = false;
+	}
+	return AllOk;
+}
+
+bool VMPlanCoordinator::verifySensitiveCommits() const {
+	bool AllOk = true;
+	for (const auto& Candidate : Candidates) {
+		if (!Candidate->Required || !Candidate->SensitiveStrict) continue;
+		bool Committed = Candidate->Impl && Candidate->Impl->Committed;
+		bool Metadata = Candidate->Fn &&
+			Candidate->Fn->getMetadata("obf.sensitive.committed") != nullptr;
+		if (Committed && Metadata) continue;
+		report_fatal_error(Twine("obfuscator: sensitive region '") +
+			Candidate->Region + "': function '" + Candidate->Fn->getName() +
+			"' was not committed with proof metadata",
+			/*gen_crash_diag=*/false);
+		AllOk = false;
+	}
+	return AllOk;
 }
 
 VMPlanCoordinator* VMPlanCoordinator::active() { return ActiveCoordinator; }

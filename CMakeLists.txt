@@ -126,6 +126,7 @@ set(OBF_SOURCES
   ObfuscationAnnotationAnalysis.cpp
   ObfuscationOptions.cpp
   ObfuscationConfig.cpp
+  SensitiveDecision.cpp
 
 
   # Registration entry point (getObfuscatorPluginInfo / llvmGetPassPluginInfo).
@@ -192,6 +193,14 @@ add_llvm_pass_plugin(Obfuscator
 add_dependencies(Obfuscator aes_stub_inc)
 if(TARGET obj.Obfuscator)
   add_dependencies(obj.Obfuscator aes_stub_inc)
+endif()
+
+# 生成当前 LLVM 的类型表，避免回落到系统安装版本的 GenVT.inc。
+if(TARGET vt_gen)
+  add_dependencies(Obfuscator vt_gen)
+  if(TARGET obj.Obfuscator)
+    add_dependencies(obj.Obfuscator vt_gen)
+  endif()
 endif()
 
 if(LLVM_INCLUDE_TESTS AND DEFINED LLVM_MAIN_SRC_DIR)

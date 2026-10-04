@@ -146,54 +146,14 @@ void VMImpl::buildVMEntry()
 
 
 
-// computeReturnInfo: scan F for ReturnInst before stripBody 
-// Records which register file slot the return value occupies so
-// buildWrapper() can extract it after vm_engine returns.
-
-void VMImpl::computeReturnInfo(Function &Body) {
-	WrapRetSlot = -1;
-	WrapRetKind = VMEngine::RK2_VOID;
-
-	for (BasicBlock& BB : Body) {
-		auto* RI = dyn_cast<ReturnInst>(BB.getTerminator());
-		if (!RI) continue;
-		Value* RV = RI->getReturnValue();
-		if (!RV) {
-			WrapRetKind = VMEngine::RK2_VOID;
-			WrapRetSlot = -1;
-			return;  // void
-		}
-		Type* RT = RV->getType();
-		if (RT->isPointerTy()) {
-			auto It = E.PR.find(RV);
-			if (It != E.PR.end()) {
-				WrapRetKind = VMEngine::RK2_PTR;
-				WrapRetSlot = (int)It->second;
-			}
-		}
-		else if (RT->isIntegerTy(64)) {
-			auto It = E.VR64.find(RV);
-			if (It != E.VR64.end()) {
-				WrapRetKind = VMEngine::RK2_I64;
-				WrapRetSlot = (int)It->second;
-			}
-		}
-		else if (RT->isFloatTy() || RT->isDoubleTy()) {
-			auto It = E.FR.find(RV);
-			if (It != E.FR.end()) {
-				WrapRetKind = VMEngine::RK2_F64;
-				WrapRetSlot = (int)It->second;
-			}
-		}
-		else if (RT->isIntegerTy()) {
-			auto It = E.VR.find(RV);
-			if (It != E.VR.end()) {
-				WrapRetKind = VMEngine::RK2_I32;
-				WrapRetSlot = (int)It->second;
-			}
-		}
-		return;  // first ReturnInst is enough
-	}
+// 所有出口写同一个独立存储；wrapper 无需知道任何返回操作数的寄存器槽。
+void VMImpl::computeReturnInfo() {
+	Type* RT = F.getReturnType();
+	if (RT->isVoidTy()) WrapRetKind = VMReturnKind::Void;
+	else if (RT->isPointerTy()) WrapRetKind = VMReturnKind::Ptr;
+	else if (RT->isIntegerTy(64)) WrapRetKind = VMReturnKind::I64;
+	else if (RT->isFloatTy() || RT->isDoubleTy()) WrapRetKind = VMReturnKind::F64;
+	else WrapRetKind = VMReturnKind::I32;
 }
 
 
@@ -202,12 +162,15 @@ void VMImpl::computeReturnInfo(Function &Body) {
 //   1. Stack-allocate register files
 //   2. Pre-load arguments + constants into register files
 //   3. Call @__vm_engine(bc, bc_len, regs, ..., handlers, fty_indices)
-//   4. Extract return value from register file
+//   4. Load the result written by the executed return handler
 //   5. Return
 
 void VMImpl::buildWrapper() {
 	Entry = BasicBlock::Create(Ctx, "vm.entry", &F);
 	IRBuilder<> B(Entry);
+	AllocaInst* RetStorage = B.CreateAlloca(ArrayType::get(I8Ty, 16), nullptr,
+		"vm.ret.storage");
+	RetStorage->setAlignment(Align(8));
 
 	// constant blinding helpers 
 	// When hardened=1, security-sensitive constants (salt, masks, register
@@ -603,6 +566,8 @@ void VMImpl::buildWrapper() {
 			: ConstantPointerNull::get(cast<PointerType>(PtrTy)),
 		// per-function callee XOR mask (0 when unhardened)
 		Cfg.hardened ? blindI64(CalleeMask) : B.getInt64(0),       // callee_mask
+		RetStorage,
+		B.getInt32(static_cast<uint32_t>(WrapRetKind)),
 	};
 	if (AntiDebug.enabled) {
 		if (auto* Response = M.getGlobalVariable("__obf_antidebug_response", true)) {
@@ -631,72 +596,32 @@ void VMImpl::buildWrapper() {
 
 	// Extract return value and return
 	Type* RT = F.getReturnType();
-	if (RT->isVoidTy()) {
+	switch (WrapRetKind) {
+	case VMReturnKind::Void:
 		B.CreateRetVoid();
+		break;
+	case VMReturnKind::I32: {
+		Value* V = B.CreateLoad(I32Ty, RetStorage, "vm.ret.v");
+		if (RT != I32Ty) V = B.CreateTrunc(V, RT, "vm.ret.tr");
+		B.CreateRet(V);
+		break;
 	}
-	else if (WrapRetSlot >= 0) {
-		Value* SlotIdx = B.getInt32(WrapRetSlot);
-		switch (WrapRetKind) {
-		case VMEngine::RK2_I32: {
-			Value* V = B.CreateLoad(I32Ty, B.CreateGEP(I32Ty, WRegs, SlotIdx), "vm.ret.v");
-			if (DoRegEncrypt) {
-				if (RollingRegKey)
-					V = B.CreateXor(V, B.CreateLoad(I32Ty,
-						B.CreateGEP(I32Ty, WRegKeys, SlotIdx), "vm.ret.rk"), "vm.ret.dec");
-				else
-					V = B.CreateXor(V, blindI32(RegKeys[WrapRetSlot]), "vm.ret.dec");
-			}
-			if (RT != I32Ty && RT->isIntegerTy())
-				V = B.CreateTrunc(V, RT, "vm.ret.tr");
-			B.CreateRet(V);
-			break;
-		}
-		case VMEngine::RK2_I64: {
-			Value* V = B.CreateLoad(I64Ty, B.CreateGEP(I64Ty, WRegs64, SlotIdx), "vm.ret.v64");
-			if (DoRegEncrypt) {
-				if (RollingRegKey)
-					V = B.CreateXor(V, B.CreateLoad(I64Ty,
-						B.CreateGEP(I64Ty, WReg64Keys, SlotIdx), "vm.ret.rk64"), "vm.ret.dec64");
-				else
-					V = B.CreateXor(V, blindI64(Reg64Keys[WrapRetSlot]), "vm.ret.dec64");
-			}
-			B.CreateRet(V);
-			break;
-		}
-		case VMEngine::RK2_PTR: {
-			Value* V = B.CreateLoad(PtrTy, B.CreateGEP(PtrTy, WPregs, SlotIdx), "vm.ret.vp");
-			B.CreateRet(V);
-			break;
-		}
-		case VMEngine::RK2_F64: {
-			Value* V = B.CreateLoad(DoubleTy, B.CreateGEP(DoubleTy, WFregs, SlotIdx), "vm.ret.vf");
-			if (DoRegEncrypt) {
-				Value* Bits = B.CreateBitCast(V, I64Ty, "vm.ret.fbits");
-				if (RollingRegKey)
-					Bits = B.CreateXor(Bits, B.CreateLoad(I64Ty,
-						B.CreateGEP(I64Ty, WFRegKeys, SlotIdx), "vm.ret.rkf"), "vm.ret.fdec");
-				else
-					Bits = B.CreateXor(Bits, blindI64(FRegKeys[WrapRetSlot]), "vm.ret.fdec");
-				V = B.CreateBitCast(Bits, DoubleTy, "vm.ret.fval");
-			}
-			if (RT->isFloatTy())
-				V = B.CreateFPTrunc(V, RT, "vm.ret.ftr");
-			B.CreateRet(V);
-			break;
-		}
-		default:
-			B.CreateUnreachable();
-			break;
-		}
+	case VMReturnKind::I64:
+		B.CreateRet(B.CreateLoad(I64Ty, RetStorage, "vm.ret.v64"));
+		break;
+	case VMReturnKind::Ptr:
+		B.CreateRet(B.CreateLoad(RT, RetStorage, "vm.ret.vp"));
+		break;
+	case VMReturnKind::F64: {
+		Value* V = B.CreateLoad(DoubleTy, RetStorage, "vm.ret.vf");
+		if (RT->isFloatTy()) V = B.CreateFPTrunc(V, RT, "vm.ret.ftr");
+		B.CreateRet(V);
+		break;
 	}
-	else {
-		// RetSlot unknown — should not happen for non-void functions
-		B.CreateUnreachable();
 	}
 
 	LLVM_DEBUG(dbgs() << "[vm] built thin wrapper for '" << F.getName()
 		<< "' [retKind=" << (int)WrapRetKind
-		<< " retSlot=" << WrapRetSlot
 		<< " engMask=0x" << Twine::utohexstr(EngineMask) << "]\n");
 }
 

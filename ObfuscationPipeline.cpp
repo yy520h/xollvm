@@ -15,6 +15,7 @@
 #include "llvm/Transforms/Obfuscator/VirtualCall.h"
 #include "llvm/Transforms/Obfuscator/ObfRepairSSA.h"
 #include "llvm/Transforms/Obfuscator/VMPass.h"
+#include "llvm/Transforms/Obfuscator/SensitiveDecision.h"
 #include "llvm/Transforms/Obfuscator/AntiDebug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
@@ -133,6 +134,15 @@ ObfuscationPipeline::getOrderingRules() {
 		{}
 	};
 
+	// sensitive runs first: it validates the untouched body (direct external
+	// calls, branch on the verifier result) before VM or CFG obfuscation can
+	// rewrite it. It is not a post-VM pass.
+	rules["sensitive"] = PassOrderingRules{
+		/*before=*/ {},
+		/*after=*/  {"vm", "bcf", "flattening"},
+		/*conflicts=*/ {}
+	};
+
 	rules["vm"] = PassOrderingRules{
 		// vm rewrites the function body into a bytecode interpreter and
 		// builds a static callee table. It must run *before* vcall —
@@ -140,11 +150,10 @@ ObfuscationPipeline::getOrderingRules() {
 		// which vm cannot emit into its constant CalleeTab.
 		/*before=*/ {"mba", "substitution", "split", "sdiff", "bcf"},
 		// antidebug must run *after* vm: the standalone AntiDebugPass injects
-		// an entry guard whose fail path adds a second value-returning ret,
-		// which isVMEligible() rejects ("multi-value-return"). The VM pass
-		// consumes the same antidebug config itself and builds the detection
-		// gates into the shared engine, so the wrapper is the right place for
-		// the standalone pass's response-corrupt guard.
+		// an entry guard whose fail path adds a second value-returning ret.
+		// VM itself handles multiple value returns through dedicated shared return
+		// storage, but the detection response must be folded into the engine's
+		// salt before the standalone guard can add its own exit branch.
 		/*after=*/  {"vcall", "shield", "adec", "antidebug"},
 		/*conflicts=*/ {"flattening"},  // both restructure the whole CFG
     };
@@ -421,6 +430,9 @@ void ObfuscationPipeline::buildPipeline(FunctionPassManager& FPM,
 		else if (passName == "antidebug") {
 			add(AntiDebugPass(), passName, false);
 		}
+		else if (passName == "sensitive") {
+			add(SensitiveDecisionPass(), passName, false);
+		}
 	}
 
 	if (ObfVerify)
@@ -511,6 +523,11 @@ std::vector<ObfPassEntry> ObfuscationPipeline::getPassEntries(
 		else if (passName == "antidebug") {
 			E.Run = [](Function& F, FunctionAnalysisManager& AM) {
 				return AntiDebugPass().run(F, AM);
+			};
+		}
+		else if (passName == "sensitive") {
+			E.Run = [](Function& F, FunctionAnalysisManager& AM) {
+				return SensitiveDecisionPass().run(F, AM);
 			};
 		}
 		else {

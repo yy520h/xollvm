@@ -301,8 +301,8 @@ bool VMImpl::prepare() {
 	}
 
 
-	// Record return slot before stripping body
-	computeReturnInfo(F);
+	// 返回 ABI 仅由原函数签名决定，与暂存副本的寄存器槽无关。
+	computeReturnInfo();
 
 	// wrapper 使用原函数的参数；局部值仍由暂存副本持有，递归调用保持原符号。
 	for (Argument &A : this->F.args()) {

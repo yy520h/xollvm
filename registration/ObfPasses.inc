@@ -33,6 +33,7 @@ OBF_MODULE_ANALYSIS("obf-annotations", ObfuscationAnnotationAnalysis())
 OBF_MODULE_ANALYSIS("obf-report", ObfReportAnalysis())
 
 OBF_FUNCTION_ANALYSIS("function-obf-context", FunctionObfContextAnalysis())
+OBF_FUNCTION_ANALYSIS("sensitive-decision", SensitiveDecisionAnalysis())
 
 OBF_MODULE_PASS("obfuscation", ObfuscationModulePass())
 OBF_MODULE_PASS("obf-dump-config", ObfDumpConfigPass())

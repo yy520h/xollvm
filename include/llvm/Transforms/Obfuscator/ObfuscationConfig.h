@@ -300,6 +300,22 @@ namespace llvm {
 		bool validate() const;
 	};
 
+	// Sensitive decision boundary policy. Parsed from
+	//   sensitive(region=<identifier>, strict=<bool>)
+	// This is policy metadata consumed by the SensitiveDecision pass; it does
+	// not name any external API and does not itself virtualize anything.
+	struct SensitiveDecisionConfig {
+		bool enable = false;
+		bool strict = true;
+		std::string region;
+		// First unrecognized parameter name (empty when none). Populated by
+		// fromPassConfig so validate() can reject misspelled knobs.
+		std::string unknownParam;
+
+		static SensitiveDecisionConfig fromPassConfig(const PassConfig& PC);
+		bool validate(std::string* Reason = nullptr) const;
+	};
+
 	struct AntiDebugConfig {
 		bool enabled = false;
 		bool tracerPid = false;

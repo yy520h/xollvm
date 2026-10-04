@@ -23,7 +23,11 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscator/FunctionObfContextAnalysis.h"
+#include "llvm/Transforms/Obfuscator/SensitiveDecision.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
+
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Metadata.h"
 
 using namespace llvm;
 
@@ -174,14 +178,58 @@ PreservedAnalyses VMPass::run(Function& F, FunctionAnalysisManager& AM) {
 	VMCtx VCtx(F, AM);
 	if (!VCtx.Cfg.enable) return PreservedAnalyses::all();
 
+	// Task 4: a sensitive(strict=1) region's function is registered before
+	// eligibility so it cannot silently disappear. Provenance (declaration
+	// callees) is captured now, while the original body still exists.
+	bool SensitiveRequired = false;
+	bool SensitiveStrict = true;
+	std::string SensitiveRegion;
+	SmallVector<Function*, 4> SensitiveCallees;
+	if (auto* SD = AM.getCachedResult<SensitiveDecisionAnalysis>(F); SD && SD->Enabled) {
+		SensitiveRequired = true;
+		SensitiveStrict = SD->Strict;
+		SensitiveRegion = SD->Region;
+		SensitiveCallees.assign(SD->Callees.begin(), SD->Callees.end());
+	}
+	else {
+		// The analysis isn't cached when the sensitive pass didn't run for this
+		// function; fall back to the validated metadata it would have attached.
+		if (MDNode* MD = F.getMetadata("obf.sensitive.validated")) {
+			if (MD->getNumOperands() == 2) {
+				if (auto* S = dyn_cast<MDString>(MD->getOperand(0)))
+					SensitiveRegion = S->getString().str();
+				if (auto* C = dyn_cast<ConstantAsMetadata>(MD->getOperand(1)))
+					if (auto* CI = dyn_cast<ConstantInt>(C->getValue()))
+						SensitiveStrict = CI->isOne();
+				SensitiveRequired = !SensitiveRegion.empty();
+			}
+		}
+	}
+
+	auto registerRequired = [&](VMPreparedCandidate* C, StringRef Reason) {
+		if (!C) return;
+		C->Required = SensitiveRequired;
+		C->SensitiveStrict = SensitiveStrict;
+		C->Region = SensitiveRegion;
+		C->SensitiveCallees.assign(SensitiveCallees.begin(), SensitiveCallees.end());
+		C->SkipReason = Reason.str();
+	};
+
 	{
 		std::string Reason; raw_string_ostream RS(Reason);
 		if (!isVMEligible(F, VCtx.FOC, VCtx.Cfg, &RS)) {
 			LLVM_DEBUG(dbgs() << "[vm] skip '" << F.getName() << "': " << RS.str() << "\n");
 			if (ObfVerbose) errs() << "[vm] skip '" << F.getName() << "': " << Reason << "\n";
 			auto& MutFOC = *AM.getResult<FunctionObfContextAnalysis>(F);
-			llvm::obf::recordObfPassSkip(MutFOC, "vm",
-				Reason.empty() ? "ineligible" : Reason);
+			std::string R = Reason.empty() ? "ineligible" : Reason;
+			llvm::obf::recordObfPassSkip(MutFOC, "vm", R);
+			if (SensitiveRequired) {
+				if (auto* Coordinator = VMPlanCoordinator::active()) {
+					if (auto* C = Coordinator->addCandidate(F, VCtx.Cfg,
+						EngineConfigKey::fromConfig(VCtx.Cfg, 0, 0), BytecodeEmitter{}, {}))
+						registerRequired(C, R);
+				}
+			}
 			return PreservedAnalyses::all();
 		}
 	}
@@ -192,15 +240,29 @@ PreservedAnalyses VMPass::run(Function& F, FunctionAnalysisManager& AM) {
 	Impl->AntiDebug.mergeCompatibility(VCtx.Cfg);
 	if (auto* Coordinator = VMPlanCoordinator::active()) {
 		if (!Impl->prepare()) {
+			std::string R = Impl->FailReason.empty() ? "impl_failed" : Impl->FailReason;
 			auto& MutFOC = *AM.getResult<FunctionObfContextAnalysis>(F);
-			llvm::obf::recordObfPassSkip(MutFOC, "vm",
-				Impl->FailReason.empty() ? "impl_failed" : Impl->FailReason);
+			llvm::obf::recordObfPassSkip(MutFOC, "vm", R);
+			if (SensitiveRequired) {
+				if (auto* C = Coordinator->addCandidate(F, VCtx.Cfg,
+					EngineConfigKey::fromConfig(VCtx.Cfg, 0, 0), BytecodeEmitter{}, {}))
+					registerRequired(C, R);
+			}
 			return PreservedAnalyses::all();
 		}
 		EngineConfigKey Key = EngineConfigKey::fromConfig(VCtx.Cfg,
 			VMEngine::enginePoolOf(Impl->EngineId), Impl->EngineId, VCtx.MasterSeed,
 			&Impl->AntiDebug);
-		Coordinator->addPrepared(std::move(Impl), VCtx.Cfg, Key);
+		VMImpl* Raw = Impl.get();
+		if (auto* C = Coordinator->addPrepared(std::move(Impl), VCtx.Cfg, Key)) {
+			if (SensitiveRequired) {
+				C->Required = true;
+				C->SensitiveStrict = SensitiveStrict;
+				C->Region = SensitiveRegion;
+				C->SensitiveCallees.assign(SensitiveCallees.begin(), SensitiveCallees.end());
+			}
+		}
+		(void)Raw;
 		// Tag the caller so the report can attach a VM witness to it (the full
 		// engine witness is finalized by the coordinator after commit).
 		F.setMetadata("obf.vm.caller", MDNode::get(F.getContext(), {}));

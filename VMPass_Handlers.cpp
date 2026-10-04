@@ -851,9 +851,20 @@ void VMImpl::buildHandlersControl() {
 		auto B = mkOpc(OP_RET_INT, "ret_int");
 		Value* IP = advIP(B, 1);
 		if (SharedEngineMode) {
-			rdVR(B, IP, 0, "vm.ri.s");  // consume operand
-			B.CreateRetVoid();
-
+			// 同一引擎服务不同整数返回类型；按本次调用选择索引掩码和解密路径。
+			auto* Ret32 = BasicBlock::Create(Ctx, "vm.ri.i32", HFn);
+			auto* Ret64 = BasicBlock::Create(Ctx, "vm.ri.i64", HFn);
+			auto* SW = B.CreateSwitch(EffRetKind, InvalidBB, 2);
+			SW->addCase(B.getInt32(static_cast<uint32_t>(VMReturnKind::I32)), Ret32);
+			SW->addCase(B.getInt32(static_cast<uint32_t>(VMReturnKind::I64)), Ret64);
+			IRBuilder<> B32(Ret32);
+			Value* Src32 = rdVR(B32, IP, 0, "vm.ri.s");
+			B32.CreateStore(ldVR(B32, Src32), EffRetStorage);
+			B32.CreateRetVoid();
+			IRBuilder<> B64(Ret64);
+			Value* Src64 = rdVR64(B64, IP, 0, "vm.ri64.s");
+			B64.CreateStore(ldVR64(B64, Src64), EffRetStorage);
+			B64.CreateRetVoid();
 		}
 		else {
 			Type* RT = F.getReturnType();
@@ -878,9 +889,9 @@ void VMImpl::buildHandlersControl() {
 		auto B = mkOpc(OP_RET_PTR, "ret_ptr");
 		Value* IP = advIP(B, 1);
 		if (SharedEngineMode) {
-			rdPR(B, IP, 0, "vm.rp.s");
+			Value* Src = rdPR(B, IP, 0, "vm.rp.s");
+			B.CreateStore(ldPR(B, Src), EffRetStorage);
 			B.CreateRetVoid();
-
 		}
 		else {
 			Type* RT = F.getReturnType();
@@ -1232,9 +1243,9 @@ void VMImpl::buildHandlersFloat() {
 		auto B = mkOpc(OP_RET_F, "ret_f");
 		Value* IP = advIP(B, 1);
 		if (SharedEngineMode) {
-			rdFR(B, IP, 0, "vm.rf.s");
+			Value* Src = rdFR(B, IP, 0, "vm.rf.s");
+			B.CreateStore(ldFR(B, Src), EffRetStorage);
 			B.CreateRetVoid();
-
 		}
 		else {
 			Type* RT = F.getReturnType();

@@ -9,10 +9,12 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Requirements.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
+#include "llvm/Transforms/Obfuscator/SensitiveDecision.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #ifdef OBF_TEST_VM_IMPL
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdlib>
 #endif
 
 using namespace llvm;
@@ -21,6 +23,124 @@ TEST(VMPlan, EmptyCoordinatorFreezesWithoutCandidates) {
 	VMPlanCoordinator Coordinator;
 	EXPECT_TRUE(Coordinator.freeze());
 	EXPECT_EQ(Coordinator.candidateCount(), 0u);
+}
+
+// Task 4: sensitive candidate lifecycle.
+TEST(VMPlan, RequiredCandidateKeepsRegionAndStrictFlag) {
+	LLVMContext C;
+	Module M("plan", C);
+	FunctionType* FT = FunctionType::get(Type::getInt32Ty(C), { Type::getInt32Ty(C) }, false);
+	Function* F = Function::Create(FT, GlobalValue::ExternalLinkage, "auth", M);
+	auto* V = Function::Create(
+		FunctionType::get(Type::getInt32Ty(C), { Type::getInt32Ty(C) }, false),
+		GlobalValue::ExternalLinkage, "verify", M);
+	VMPassConfig Config;
+	EngineConfigKey Key = EngineConfigKey::fromConfig(Config, 0, 0);
+	VMPlanCoordinator Coordinator;
+	SmallVector<Function*, 4> Callees{V};
+	VMPreparedCandidate* C0 = Coordinator.addRequired(
+		*F, "auth", /*Strict=*/true, Callees, Config, Key, BytecodeEmitter{}, {});
+	ASSERT_NE(C0, nullptr);
+	EXPECT_TRUE(C0->Required);
+	EXPECT_TRUE(C0->SensitiveStrict);
+	EXPECT_EQ(C0->Region, "auth");
+	ASSERT_EQ(C0->SensitiveCallees.size(), 1u);
+	EXPECT_EQ(C0->SensitiveCallees.front()->getName(), "verify");
+	EXPECT_FALSE(C0->Accepted);  // not prepared yet
+}
+
+TEST(SensitivePostValidation, AcceptsCommittedWrapper) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+define i32 @auth(i32 %x) !obf.sensitive.validated !0 !obf.sensitive.committed !1 !obf.vm.caller !2 {
+entry:
+  ret i32 0
+}
+!0 = !{!"auth", i1 true}
+!1 = !{!"auth"}
+!2 = !{}
+)IR", D, C);
+	ASSERT_NE(M, nullptr) << D.getMessage().str();
+	std::string E;
+	raw_string_ostream OS(E);
+	EXPECT_TRUE(verifyCommittedSensitiveRegions(*M, OS)) << E;
+}
+
+TEST(SensitivePostValidation, RejectsMissingCommittedProof) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+define i32 @auth(i32 %x) !obf.sensitive.validated !0 !obf.vm.caller !2 {
+entry:
+  ret i32 0
+}
+!0 = !{!"auth", i1 true}
+!2 = !{}
+)IR", D, C);
+	ASSERT_NE(M, nullptr) << D.getMessage().str();
+	std::string E;
+	raw_string_ostream OS(E);
+	EXPECT_FALSE(verifyCommittedSensitiveRegions(*M, OS));
+	EXPECT_NE(E.find("no committed proof metadata"), std::string::npos) << E;
+}
+
+TEST(SensitivePostValidation, RejectsDirectExternalCallInWrapper) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+declare i32 @fixture_verify(ptr, i64)
+define i32 @auth(ptr %p, i64 %n) !obf.sensitive.validated !0 !obf.sensitive.committed !1 !obf.vm.caller !2 {
+entry:
+  %r = call i32 @fixture_verify(ptr %p, i64 %n)
+  ret i32 %r
+}
+!0 = !{!"auth", i1 true}
+!1 = !{!"auth"}
+!2 = !{}
+)IR", D, C);
+	ASSERT_NE(M, nullptr) << D.getMessage().str();
+	std::string E;
+	raw_string_ostream OS(E);
+	EXPECT_FALSE(verifyCommittedSensitiveRegions(*M, OS));
+	EXPECT_NE(E.find("retains direct call to 'fixture_verify'"), std::string::npos) << E;
+}
+
+TEST(SensitivePostValidation, RejectsRegionMismatch) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+define i32 @auth(i32 %x) !obf.sensitive.validated !0 !obf.sensitive.committed !1 !obf.vm.caller !2 {
+entry:
+  ret i32 0
+}
+!0 = !{!"auth", i1 true}
+!1 = !{!"other"}
+!2 = !{}
+)IR", D, C);
+	ASSERT_NE(M, nullptr) << D.getMessage().str();
+	std::string E;
+	raw_string_ostream OS(E);
+	EXPECT_FALSE(verifyCommittedSensitiveRegions(*M, OS));
+	EXPECT_NE(E.find("committed under region 'other'"), std::string::npos) << E;
+}
+
+TEST(VMPlan, RequiredCandidateUpgradesExistingCandidateInPlace) {
+	LLVMContext C;
+	Module M("plan", C);
+	FunctionType* FT = FunctionType::get(Type::getInt32Ty(C), { Type::getInt32Ty(C) }, false);
+	Function* F = Function::Create(FT, GlobalValue::ExternalLinkage, "auth", M);
+	VMPassConfig Config;
+	EngineConfigKey Key = EngineConfigKey::fromConfig(Config, 0, 0);
+	VMPlanCoordinator Coordinator;
+	VMPreparedCandidate* A = Coordinator.addCandidate(*F, Config, Key, BytecodeEmitter{}, {});
+	ASSERT_NE(A, nullptr);
+	SmallVector<Function*, 4> NoCallees;
+	VMPreparedCandidate* B = Coordinator.addRequired(
+		*F, "auth", true, NoCallees, Config, Key, BytecodeEmitter{}, {});
+	EXPECT_EQ(A, B);
+	EXPECT_EQ(Coordinator.candidateCount(), 1u);
+	EXPECT_TRUE(B->Required);
 }
 
 TEST(VMPlan, FreezesCompatibleCandidatesIntoOneDemandUnion) {
@@ -680,8 +800,230 @@ define i32 @target(ptr %p, double %d, i64 %n) {
 	EXPECT_EQ(IP, 0u);
 }
 
+// ============================================================================
+// Task 3: sensitive decision parsing and def-use validation
+// ============================================================================
+
+TEST(SensitiveDecisionConfigTest, ParsesRegionAndStrict) {
+	auto C = AnnotationParser::parseAnnotationString(
+		"obf: sensitive(region=auth,strict=1), vm(preset=max)");
+	auto PC = C.getPassConfig("sensitive");
+	ASSERT_TRUE(PC.has_value());
+	auto S = SensitiveDecisionConfig::fromPassConfig(*PC);
+	EXPECT_TRUE(S.enable);
+	EXPECT_TRUE(S.strict);
+	EXPECT_EQ(S.region, "auth");
+}
+
+TEST(SensitiveDecisionConfigTest, DefaultsToStrictWhenUnspecified) {
+	auto C = AnnotationParser::parseAnnotationString(
+		"obf: sensitive(region=auth), vm(preset=max)");
+	auto PC = C.getPassConfig("sensitive");
+	ASSERT_TRUE(PC.has_value());
+	auto S = SensitiveDecisionConfig::fromPassConfig(*PC);
+	EXPECT_TRUE(S.enable);
+	EXPECT_TRUE(S.strict);
+	EXPECT_EQ(S.region, "auth");
+}
+
+TEST(SensitiveDecisionConfigTest, RejectsEmptyRegion) {
+	auto C = AnnotationParser::parseAnnotationString(
+		"obf: sensitive(region=,strict=1), vm(preset=max)");
+	auto PC = C.getPassConfig("sensitive");
+	ASSERT_TRUE(PC.has_value());
+	auto S = SensitiveDecisionConfig::fromPassConfig(*PC);
+	std::string Reason;
+	EXPECT_FALSE(S.validate(&Reason));
+	EXPECT_FALSE(Reason.empty());
+}
+
+TEST(SensitiveDecisionConfigTest, RejectsUnknownParameters) {
+	auto C = AnnotationParser::parseAnnotationString(
+		"obf: sensitive(region=auth,bogus=1), vm(preset=max)");
+	auto PC = C.getPassConfig("sensitive");
+	ASSERT_TRUE(PC.has_value());
+	auto S = SensitiveDecisionConfig::fromPassConfig(*PC);
+	std::string Reason;
+	EXPECT_FALSE(S.validate(&Reason));
+}
+
+TEST(SensitiveDecisionConfigTest, RequiresEnabledVM) {
+	std::string Reason;
+	auto Only = AnnotationParser::parseAnnotationString(
+		"obf: sensitive(region=auth,strict=1)");
+	EXPECT_FALSE(validateSensitiveConfig(Only, &Reason));
+	EXPECT_FALSE(Reason.empty());
+	auto Both = AnnotationParser::parseAnnotationString(
+		"obf: sensitive(region=auth,strict=1), vm(preset=max)");
+	EXPECT_TRUE(validateSensitiveConfig(Both, &Reason));
+}
+
 #ifdef OBF_TEST_VM_IMPL
-TEST(VMPreparation, RejectionLeavesOriginalFunctionAndModuleUntouched) {
+static std::unique_ptr<Module> parseSensitiveFixture(const char* IR) {
+	// context 必须比返回的 Module 活得久，否则 Module 持有悬垂引用导致 SIGSEGV
+	static LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(IR, D, C);
+	if (!M) errs() << D.getMessage();
+	return M;
+}
+
+static SensitiveDecisionConfig AuthConfig() {
+	SensitiveDecisionConfig Cfg;
+	Cfg.enable = true;
+	Cfg.strict = true;
+	Cfg.region = "auth";
+	return Cfg;
+}
+
+TEST(SensitiveDecisionValidation, AcceptsLocalDecisionWithLiteralReturns) {
+	auto M = parseSensitiveFixture(R"IR(
+declare i32 @verify(i32)
+define i32 @auth(i32 %x) {
+entry:
+  %r = call i32 @verify(i32 %x)
+  %ok = icmp eq i32 %r, 1
+  br i1 %ok, label %success, label %fail
+success:
+  ret i32 1
+fail:
+  ret i32 0
+}
+)IR");
+	ASSERT_NE(M, nullptr);
+	SensitiveDecisionAnalysisResult R;
+	ASSERT_TRUE(validateSensitiveDecision(*M->getFunction("auth"), AuthConfig(), R));
+	EXPECT_TRUE(R.Valid);
+	EXPECT_EQ(R.Callees.size(), 1u);
+	EXPECT_EQ(R.Callees.front()->getName(), "verify");
+}
+
+TEST(SensitiveDecisionValidation, RejectsTaintedReturn) {
+	auto M = parseSensitiveFixture(R"IR(
+declare i32 @verify(i32)
+define i32 @auth(i32 %x) {
+entry:
+  %r = call i32 @verify(i32 %x)
+  %ok = icmp eq i32 %r, 1
+  br i1 %ok, label %success, label %fail
+success:
+  ret i32 1
+fail:
+  ret i32 %r
+}
+)IR");
+	ASSERT_NE(M, nullptr);
+	SensitiveDecisionAnalysisResult R;
+	EXPECT_FALSE(validateSensitiveDecision(*M->getFunction("auth"), AuthConfig(), R));
+	EXPECT_NE(R.Diagnostic.find("escapes through return"), std::string::npos) << R.Diagnostic;
+}
+
+TEST(SensitiveDecisionValidation, RejectsTaintedStore) {
+	auto M = parseSensitiveFixture(R"IR(
+@g = global i32 0
+declare i32 @verify(i32)
+define i32 @auth(i32 %x) {
+entry:
+  %r = call i32 @verify(i32 %x)
+  store i32 %r, ptr @g
+  %ok = icmp eq i32 %r, 1
+  br i1 %ok, label %success, label %fail
+success:
+  ret i32 1
+fail:
+  ret i32 0
+}
+)IR");
+	ASSERT_NE(M, nullptr);
+	SensitiveDecisionAnalysisResult R;
+	EXPECT_FALSE(validateSensitiveDecision(*M->getFunction("auth"), AuthConfig(), R));
+	EXPECT_NE(R.Diagnostic.find("escapes through store"), std::string::npos) << R.Diagnostic;
+}
+
+TEST(SensitiveDecisionValidation, RejectsTaintedUnknownCall) {
+	auto M = parseSensitiveFixture(R"IR(
+declare i32 @verify(i32)
+declare void @sink(i32)
+define i32 @auth(i32 %x) {
+entry:
+  %r = call i32 @verify(i32 %x)
+  call void @sink(i32 %r)
+  %ok = icmp eq i32 %r, 1
+  br i1 %ok, label %success, label %fail
+success:
+  ret i32 1
+fail:
+  ret i32 0
+}
+)IR");
+	ASSERT_NE(M, nullptr);
+	SensitiveDecisionAnalysisResult R;
+	EXPECT_FALSE(validateSensitiveDecision(*M->getFunction("auth"), AuthConfig(), R));
+	EXPECT_NE(R.Diagnostic.find("escapes to unknown call"), std::string::npos) << R.Diagnostic;
+}
+
+TEST(SensitiveDecisionValidation, RejectsMissingDecisionBranch) {
+	auto M = parseSensitiveFixture(R"IR(
+declare i32 @verify(i32)
+define i32 @auth(i32 %x) {
+entry:
+  %r = call i32 @verify(i32 %x)
+  ret i32 0
+}
+)IR");
+	ASSERT_NE(M, nullptr);
+	SensitiveDecisionAnalysisResult R;
+	EXPECT_FALSE(validateSensitiveDecision(*M->getFunction("auth"), AuthConfig(), R));
+	EXPECT_NE(R.Diagnostic.find("no in-region success/failure branch"),
+		std::string::npos) << R.Diagnostic;
+}
+
+TEST(SensitiveDecisionValidation, AllowsStateCommitThenLiteralReturn) {
+	auto M = parseSensitiveFixture(R"IR(
+declare i32 @verify(i32)
+define i32 @auth(i32 %x, ptr %state) {
+entry:
+  %r = call i32 @verify(i32 %x)
+  %ok = icmp eq i32 %r, 1
+  br i1 %ok, label %success, label %fail
+success:
+  store i32 1, ptr %state
+  ret i32 1
+fail:
+  store i32 0, ptr %state
+  ret i32 0
+}
+)IR");
+	ASSERT_NE(M, nullptr);
+	SensitiveDecisionAnalysisResult R;
+	EXPECT_TRUE(validateSensitiveDecision(*M->getFunction("auth"), AuthConfig(), R)) << R.Diagnostic;
+}
+
+TEST(SensitiveDecisionValidation, LocalAllocaRoundTripIsAllowed) {
+	auto M = parseSensitiveFixture(R"IR(
+declare i32 @verify(i32)
+define i32 @auth(i32 %x) {
+entry:
+  %slot = alloca i32
+  %r = call i32 @verify(i32 %x)
+  store i32 %r, ptr %slot
+  %loaded = load i32, ptr %slot
+  %ok = icmp eq i32 %loaded, 1
+  br i1 %ok, label %success, label %fail
+success:
+  ret i32 1
+fail:
+  ret i32 0
+}
+)IR");
+	ASSERT_NE(M, nullptr);
+	SensitiveDecisionAnalysisResult R;
+	EXPECT_TRUE(validateSensitiveDecision(*M->getFunction("auth"), AuthConfig(), R)) << R.Diagnostic;
+}
+#endif
+
+#ifdef OBF_TEST_VM_IMPL
+TEST(VMEligibility, AcceptsMultipleReturnValues) {
 	LLVMContext C;
 	SMDiagnostic D;
 	auto M = parseAssemblyString(R"IR(
@@ -689,13 +1031,208 @@ define i32 @target(i1 %c, i32 %x) {
 entry:
   br i1 %c, label %a, label %b
 a:
-  br label %end
+  %left = add i32 %x, 17
+  ret i32 %left
 b:
-  br label %end
-end:
-  %p = phi i32 [ %x, %a ], [ 0, %b ]
-  %r = freeze i32 %p
+  %right = sub i32 %x, 29
+  ret i32 %right
+}
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	Function &F = *M->getFunction("target");
+	FunctionObfContext FOC(F, false);
+	FOC.NumNormalBlocks = F.size();
+	VMPassConfig Config;
+	std::string Reason;
+	raw_string_ostream OS(Reason);
+	EXPECT_TRUE(isVMEligible(F, FOC, Config, &OS)) << Reason;
+	EXPECT_TRUE(Reason.empty()) << Reason;
+}
+
+TEST(VMRequirements, IntegerReturnHandlerNeedsBothRegisterFiles) {
+	VMRequirementSet R;
+	R.requireOpcode(OP_RET_INT);
+	R.closeDependencies(VMPassConfig{});
+	EXPECT_TRUE(R.NeedsRegFile[0]);
+	EXPECT_TRUE(R.NeedsRegFile[1]);
+}
+
+TEST(VMEligibility, RejectsMustTailWithMultipleReturns) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+declare i32 @callee(i1, i32)
+define i32 @target(i1 %c, i32 %x) {
+entry:
+  br i1 %c, label %a, label %b
+a:
+  %r = musttail call i32 @callee(i1 %c, i32 %x)
   ret i32 %r
+b:
+  ret i32 %x
+}
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	ASSERT_FALSE(verifyModule(*M, &errs()));
+	Function &F = *M->getFunction("target");
+	FunctionObfContext FOC(F, false);
+	FOC.NumNormalBlocks = F.size();
+	for (BasicBlock &BB : F)
+		for (Instruction &I : BB)
+			if (auto *CI = dyn_cast<CallInst>(&I))
+				FOC.HasMustTail |= CI->isMustTailCall();
+	std::string Reason;
+	raw_string_ostream OS(Reason);
+	EXPECT_FALSE(isVMEligible(F, FOC, VMPassConfig{}, &OS));
+	EXPECT_EQ(Reason, "musttail");
+}
+
+// 同一模块混用返回类型；分支结果占不同槽，避免统一出口掩盖返回 ABI 错误。
+TEST(VMReturnABI, MultipleReturnRuntimeModule) {
+	const char *IR = R"IR(
+define i1 @ret_i1(i1 %c, i32 %x) {
+entry:
+  br i1 %c, label %a, label %b
+a:
+  %left = icmp slt i32 %x, 7
+  ret i1 %left
+b:
+  %right = icmp sgt i32 %x, -3
+  ret i1 %right
+}
+define i32 @ret_i32(i1 %c, i32 %x) {
+entry:
+  br i1 %c, label %a, label %b
+a:
+  %left = add i32 %x, 17
+  ret i32 %left
+b:
+  %right = sub i32 %x, 29
+  ret i32 %right
+}
+define i64 @ret_i64(i1 %c, i64 %x) {
+entry:
+  br i1 %c, label %a, label %b
+a:
+  %left = add i64 %x, 4294967313
+  ret i64 %left
+b:
+  %t0 = xor i64 %x, 4294967295
+  %t1 = add i64 %t0, 4294967325
+  %t2 = xor i64 %t1, 72623859790382856
+  %right = sub i64 %t2, 17
+  ret i64 %right
+}
+define ptr @ret_ptr(i1 %c, ptr %x, ptr %y) {
+entry:
+  br i1 %c, label %a, label %b
+a:
+  ret ptr %x
+b:
+  ret ptr %y
+}
+define float @ret_float(i1 %c, float %x) {
+entry:
+  br i1 %c, label %a, label %b
+a:
+  %left = fadd float %x, 1.250000e+00
+  ret float %left
+b:
+  %right = fsub float %x, 2.500000e+00
+  ret float %right
+}
+define double @ret_double(i1 %c, double %x) {
+entry:
+  br i1 %c, label %a, label %b
+a:
+  %left = fadd double %x, 1.250000e+00
+  ret double %left
+b:
+  %right = fsub double %x, 2.500000e+00
+  ret double %right
+}
+define void @ret_void(i1 %c, ptr %out) {
+entry:
+  br i1 %c, label %a, label %b
+a:
+  store i32 17, ptr %out
+  ret void
+b:
+  store i32 29, ptr %out
+  ret void
+}
+)IR";
+	const char *OutDir = std::getenv("OBF_VM_RETURN_IR_DIR");
+	for (unsigned Mode = 0; Mode != 4; ++Mode) {
+		SCOPED_TRACE(Mode);
+		LLVMContext C;
+		SMDiagnostic D;
+		auto M = parseAssemblyString(IR, D, C);
+		ASSERT_NE(M, nullptr);
+		auto WriteIR = [&](StringRef Name) {
+			if (!OutDir) return;
+			std::error_code EC;
+			raw_fd_ostream OS(std::string(OutDir) + "/" + Name.str() + ".ll", EC);
+			ASSERT_FALSE(EC) << EC.message();
+			M->print(OS, nullptr);
+		};
+		if (Mode == 0) WriteIR("reference");
+		VMPassConfig Config;
+		Config.hardened = false;
+		Config.encBytecode = Mode != 0;
+		Config.regEncrypt = Mode != 0;
+		Config.rollingRegKey = Mode >= 2;
+		Config.lazyDecrypt = Mode == 3;
+		Config.constInStream = Mode >= 2;
+		Config.handlerVariants = 2;
+		VMPlanCoordinator Coordinator;
+		SmallVector<VMImpl *, 8> Impls;
+		for (Function &F : *M) {
+			FunctionObfContext FOC(F, false);
+			FOC.NumNormalBlocks = F.size();
+			std::string Reason;
+			raw_string_ostream OS(Reason);
+			ASSERT_TRUE(isVMEligible(F, FOC, Config, &OS)) << F.getName().str() << ": " << Reason;
+			obf::Rng R(42 + Impls.size());
+			auto Impl = std::make_unique<VMImpl>(F, Config, R, 42);
+			ASSERT_TRUE(Impl->prepare()) << Impl->FailReason;
+			Impls.push_back(Impl.get());
+			ASSERT_NE(Coordinator.addPrepared(std::move(Impl), Config,
+				EngineConfigKey::fromConfig(Config, 0, 0, 42)), nullptr);
+		}
+		ASSERT_EQ(Impls.size(), 7u);
+		ASSERT_TRUE(Coordinator.freeze());
+		ASSERT_EQ(Coordinator.groupCount(), 1u);
+		ASSERT_TRUE(Coordinator.commit());
+		for (VMImpl *Impl : Impls) {
+			EXPECT_TRUE(Impl->Committed) << Impl->F.getName().str();
+			EXPECT_NE(Impl->GVBytecode, nullptr);
+			EXPECT_EQ(Impl->EngineId, Impls.front()->EngineId);
+		}
+		EXPECT_FALSE(verifyModule(*M, &errs()));
+		WriteIR("mode-" + std::to_string(Mode));
+		VMEngine::releaseSharedState(*M);
+	}
+}
+
+TEST(VMPreparation, RejectionLeavesOriginalFunctionAndModuleUntouched) {
+	LLVMContext C;
+	SMDiagnostic D;
+	// invoke 是 isVMEligible 明确拒绝的条件（EH/invoke），
+	// 确保被拒绝的函数不会被 VM 改写。
+	auto M = parseAssemblyString(R"IR(
+declare i32 @may_throw(i32)
+declare i32 @__gxx_personality_v0(...)
+
+define i32 @target(i32 %x) personality ptr @__gxx_personality_v0 {
+entry:
+  %r = invoke i32 @may_throw(i32 %x)
+          to label %ok unwind label %lpad
+ok:
+  ret i32 %r
+lpad:
+  %lp = landingpad { ptr, i32 } cleanup
+  ret i32 0
 }
 )IR", D, C);
 	ASSERT_NE(M, nullptr);

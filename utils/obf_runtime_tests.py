@@ -16,4 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from runner.cli import main  # noqa: E402
 
 if __name__ == "__main__":
+    if "--case" in sys.argv:
+        from cases.vm_returns import main as return_main
+        raise SystemExit(return_main())
     raise SystemExit(main())

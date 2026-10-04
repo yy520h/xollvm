@@ -550,6 +550,7 @@ void VMImpl::populateVMEngine() {
 			"handlers", "fty_indices",
 			"regkeys", "reg64keys", "fregkeys",
 			"callee_mask",
+			"ret_storage", "ret_kind",
 			"lazyctx",
 		};
 		for (Argument& A : EF->args()) A.setName(PNames[PIdx++]);
@@ -585,6 +586,8 @@ void VMImpl::populateVMEngine() {
 	EffReg64Keys = EF->getArg(VMEngine::kParamReg64Keys);
 	EffFRegKeys = EF->getArg(VMEngine::kParamFRegKeys);
 	EffCalleeMask = EF->getArg(VMEngine::kParamCalleeMask);
+	EffRetStorage = EF->getArg(VMEngine::kParamRetStorage);
+	EffRetKind = EF->getArg(VMEngine::kParamRetKind);
 	EffLazyCtx = LazyDecrypt ? EF->getArg(VMEngine::kParamLazyCtx) : nullptr;
 
 	// lazyDecrypt: forward-declare the runtime keystream helper so the fetch
