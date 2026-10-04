@@ -59,6 +59,45 @@
 #  define OBF_FN(spec)
 #endif
 
+/*
+ * 敏感决策边界：sensitive(region=<标识>, strict=<0|1>)
+ *
+ * 把一次敏感判断（验签、比较、授权决策）连同它的成功/失败动作收进一个
+ * 完整函数，并注解该函数。编译器会：
+ *   - 校验区域边界（结果不得从 return/store/未知调用/inline asm 逃逸，
+ *     且区域内必须有基于结果的成功/失败分支）；
+ *   - strict=1 时，边界错误或无法虚拟化一律编译失败（report_fatal_error）；
+ *   - 要求该函数同时启用 vm（否则报错）；
+ *   - 校验通过后附加 !obf.sensitive.validated，并在 VM 提交后附加
+ *     !obf.sensitive.committed，作为提交后结构门禁的依据。
+ *
+ * 写法要点：
+ *   - region 是诊断用的稳定标识，不参与安全判断；
+ *   - strict=1 时函数必须能被 VM 化：不能含 EH/invoke、callbr、indirectbr、
+ *     musttail、naked，且需满足 vm 的 minBlocks/maxBlocks；
+ *   - 区域内不要用会抛异常的构造（std::string/std::vector）或返回 bool
+ *     （-O0 会生成 i1 槽，VM 不支持）——把资源准备放在注解函数之外。
+ *
+ * 示例：
+ *   OBF("sensitive(region=auth,strict=1), vm(preset=max)")
+ *   bool verifyAndAuthorize(const Request& r) { ... }
+ *
+ * 最终 ELF 完整性：含严格敏感区域的模块会发射 .text.xollvm.integrity
+ * manifest 占位与运行时校验 ctor；由后链接工具 xollvm-elf-hardener 回填
+ * 摘要与范围。链接包装器（demo/jni/ndk-linker-wrapper/clang++）在链接后
+ * 自动 audit + seal。相关环境变量：
+ *   XOLLVM_ELF_HARDENER          xollvm-elf-hardener 路径（链接时必需）
+ *   XOLLVM_ELF_ZERO_THRESHOLD    可执行段零洞阈值，默认 512（含）
+ *   XOLLVM_REAL_CLANG            NDK clang++（真实链接器）
+ *   XOLLVM_OBFUSCATOR_CLANG      xollvm clang++（编译阶段）
+ *
+ * 退出码（xollvm-elf-hardener）：0 通过 / 2 malformed / 3 策略违规。
+ *
+ * 范围说明：manifest 自身参与摘要（窗口置零），覆盖 EHDR+程序头+承载
+ * manifest 的可执行段；文件尾追加数据不在内存自校验范围内，应由 APK/包
+ * 签名负责。动态符号（如外部 API）仍可能保留在 .dynsym，这是已知事实。
+ */
+
 /*===----------------------------------------------------------------------===*\
 |*  内置预设                                                                    *|
 |*                                                                            *|
@@ -80,6 +119,9 @@
  * 并叠加静态混淆 Pass。体积最大、速度最慢，仅用于确实需要保护的少数函数，
  * 例如授权检查或信任根检查。 */
 #define OBF_MAX         OBF("vm(preset=max), mba, bcf, flattening, strenc, adec, shield")
+
+/* 敏感决策边界（strict）：验签/比较/授权函数。region 名称按项目自定。 */
+#define OBF_SENSITIVE(region) OBF("sensitive(region=" region ",strict=1), vm(preset=max)")
 
 /* 使用各项技术默认参数的快捷宏。 */
 #define OBF_VM          OBF("vm")
