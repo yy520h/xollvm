@@ -156,6 +156,40 @@ def test_mutations_fail_verify(sealed):
         assert r.returncode == 3, f"{name}: {r.returncode} {r.stderr}"
 
 
+def test_sealed_manifest_has_runtime_metadata(sealed):
+    work, so, tool = sealed
+    out = work / "meta.so"
+    _run(tool, "seal", "--input", str(so), "--output", str(out))
+    data = out.read_bytes()
+    # Locate the manifest via its symbol vaddr from the symtab.
+    import struct, subprocess
+    nm = subprocess.run([str(_tool("llvm-nm")), str(out)],
+                        capture_output=True, text=True).stdout
+    man = None
+    for line in nm.splitlines():
+        if "integrity_manifest" in line:
+            man = int(line.split()[0], 16); break
+    assert man is not None
+    e_phoff = struct.unpack_from("<Q", data, 32)[0]
+    e_phentsz = struct.unpack_from("<H", data, 54)[0]
+    e_phnum = struct.unpack_from("<H", data, 56)[0]
+    off = None
+    for i in range(e_phnum):
+        p = struct.unpack_from("<IIQQQQQQ", data, e_phoff + i * e_phentsz)
+        if p[0] == 1 and p[3] <= man < p[3] + p[5]:
+            off = p[2] + (man - p[3]); break
+    assert off is not None
+    magic = data[off:off + 8]
+    rangecount = struct.unpack_from("<I", data, off + 12)[0]
+    manifest_va = struct.unpack_from("<Q", data, off + 16)[0]
+    r0vaddr = struct.unpack_from("<Q", data, off + 24)[0]
+    r0size = struct.unpack_from("<Q", data, off + 32)[0]
+    assert rangecount == 1, f"rangecount={rangecount}"
+    assert manifest_va != 0, "ManifestVirtualAddress not stamped"
+    assert r0vaddr != 0 and r0size != 0, "range[0] not stamped"
+    assert magic == b"XOLINT01", f"magic={magic!r}"
+
+
 def test_malformed_elf_is_exit_2(sealed):
     work, _so, tool = sealed
     bad = work / "bad.bin"

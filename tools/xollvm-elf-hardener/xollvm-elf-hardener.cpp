@@ -339,32 +339,31 @@ int main(int argc, char** argv) {
 		}
 
 		std::vector<uint8_t> Out(Data.begin(), Data.end());
-		// Stamp ManifestVirtualAddress (offset 16) for the runtime base calc.
-		if (Command == "seal") put64(Out, ManOff + kManifestVAOff, ManAddr);
-		// Range[0] = the manifest-carrying executable range.
-		if (Command == "seal") {
-			put64(Out, ManOff + kManifestRangeCountOff, 1);
-			put64(Out, ManOff + kManifestRangesOff + 0, R0Vaddr);
-			put64(Out, ManOff + kManifestRangesOff + 8, R0Size);
-		}
-		// Hash the executable range with the manifest bytes zeroed (both the
-		// seal-time stamp and the digest live inside this zeroed window, so the
-		// hash is stable across seal and runtime). Also bind the canonical
-		// program-header table region: the [EHDR .. end of phdrs) file bytes
-		// live outside every range but describe the load layout.
+
+		// Hash the executable range with the entire manifest window treated as
+		// zero (both seal-time metadata and the digest live inside it), plus
+		// the canonical [EHDR .. end of phdrs) region. The hash therefore does
+		// not depend on the manifest contents, so seal and runtime agree.
 		for (uint64_t J = 0; J < kManifestSize; ++J)
 			Out[ManOff + J] = 0;
 		SHA256 Hasher;
-		// Canonical ELF header + program header table region.
 		uint64_t HdrEnd = PhOff + PhEnt * PhNum;
 		if (HdrEnd > Data.size()) HdrEnd = Data.size();
 		Hasher.update(ArrayRef<uint8_t>(Out.data(), HdrEnd));
-		// The manifest-carrying executable range, manifest window zeroed.
 		Hasher.update(ArrayRef<uint8_t>(Out.data() + SegOff, SegSize));
 		auto Hash = Hasher.final();
 		ArrayRef<uint8_t> DigestBytes(Hash.data(), 32);
 
 		if (Command == "verify") {
+			const char Want[8] = { 'X','O','L','I','N','T','0','1' };
+			if (std::memcmp(Data.data() + ManOff, Want, 8) != 0) {
+				errs() << "error: manifest magic mismatch\n";
+				return PolicyViolation;
+			}
+			if (Data[ManOff + 8] != 1) {
+				errs() << "error: unsupported manifest version\n";
+				return PolicyViolation;
+			}
 			ArrayRef<uint8_t> Stored(Data.data() + ManOff + kManifestDigestOff, 32);
 			if (DigestBytes != Stored) {
 				errs() << "error: integrity digest mismatch\n";
@@ -374,12 +373,28 @@ int main(int argc, char** argv) {
 			return Ok;
 		}
 
-		// seal: write the digest (into the previously-zeroed window).
+		// seal: after hashing the zeroed window, stamp the runtime metadata and
+		// digest. These live inside the hashed window, so writing them does not
+		// change the digest.
 		if (Output.empty()) {
 			errs() << "error: seal requires --output\n";
 			return Malformed;
 		}
-		for (uint64_t J = 0; J < 32; ++J) Out[ManOff + kManifestDigestOff + J] = DigestBytes[J];
+		// Write manifest metadata (VA + range table) and digest.
+		uint8_t* man = Out.data() + ManOff;
+		auto st64 = [&](uint64_t O, uint64_t V) {
+			for (int J = 0; J < 8; ++J) man[O + J] = (uint8_t)(V >> (J * 8));
+		};
+		st64(kManifestVAOff, ManAddr);
+		for (int J = 0; J < 4; ++J) man[kManifestRangeCountOff + J] = (uint8_t)(1u >> (J * 8));
+		st64(kManifestRangesOff + 0, R0Vaddr);
+		st64(kManifestRangesOff + 8, R0Size);
+		for (uint64_t J = 0; J < 32; ++J) man[kManifestDigestOff + J] = DigestBytes[J];
+		// Magic "XOLINT01" + version 1, written last.
+		const char Magic[8] = { 'X','O','L','I','N','T','0','1' };
+		for (int J = 0; J < 8; ++J) man[J] = (uint8_t)Magic[J];
+		for (int J = 0; J < 4; ++J) man[8 + J] = (uint8_t)(1u >> (J * 8));
+
 
 		std::error_code EC;
 		raw_fd_ostream OS(Output, EC, sys::fs::OF_None);
