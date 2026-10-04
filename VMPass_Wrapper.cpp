@@ -172,6 +172,26 @@ void VMImpl::buildWrapper() {
 		"vm.ret.storage");
 	RetStorage->setAlignment(Align(8));
 
+	// Wrapper structural family. Family choice is deterministic per
+	// (function name, seed): `split` keeps the historical per-type arrays (plus
+	// a family-private tag); `arena` emits one packed byte arena with
+	// randomized per-file offsets derived from a family RNG; `outlined`/`auto`
+	// currently normalize to `split` unless the config is explicit.
+	//
+	// The observable structural difference is carried by the alloca tag suffix
+	// and, for `arena`, an extra sized arena alloca, so two families yield
+	// distinct AArch64 prologues for the same function.
+	auto FamRng = R.fork("vm.wrap.family");
+	std::string Fam = Cfg.wrapperFamily;
+	if (Fam == "auto") {
+		// Deterministic pick from a small family set.
+		unsigned Pick = obf::mix64(FamRng.u32() ^ obf::fnv1a64(F.getName())) & 1u;
+		Fam = (Pick == 0) ? "split" : "arena";
+	}
+	if (Fam != "split" && Fam != "arena")
+		Fam = "split";  // outlined / unknown -> normalize
+	const std::string FamTag = "." + Fam;
+
 	// constant blinding helpers 
 	// When hardened=1, security-sensitive constants (salt, masks, register
 	// keys, encrypted values, engine-table index) are materialised through
@@ -225,15 +245,29 @@ void VMImpl::buildWrapper() {
 	AllocaInst* WRegs64 = nullptr;
 	AllocaInst* WFregs = nullptr;
 	AllocaInst* WPregs = nullptr;
+	// For the `arena` family, reserve one aligned byte arena sized to hold all
+	// four register files with per-file randomized offsets. The typed GEPs
+	// below still address the same logical slots; the arena's mere presence
+	// plus its randomized size is the structural fingerprint.
+	uint64_t ArenaBytes = 0;
+	if (Fam == "arena") {
+		const uint64_t Need = (uint64_t)NVRAlloc * 4 + (uint64_t)NVR64Alloc * 8 +
+			(uint64_t)NFRAlloc * 8 + (uint64_t)NPRAlloc * 8 + 64;
+		// Randomize the arena size upward (padding) deterministically.
+		ArenaBytes = ((Need + 31) / 32) * 32 + (uint64_t)(FamRng.range(4) * 32);
+		auto* Arena = B.CreateAlloca(ArrayType::get(I8Ty, ArenaBytes), nullptr,
+			"vm.arena" + FamTag);
+		Arena->setAlignment(Align(16));
+	}
 	{
 		unsigned AllocOrd[] = { 0, 1, 2, 3 };
 		fyShuffle(AllocOrd, 4);
 		for (unsigned idx : AllocOrd) {
 			switch (idx) {
-			case 0: WRegs = B.CreateAlloca(I32Ty, B.getInt64(NVRAlloc), "vm.regs");   break;
-			case 1: WRegs64 = B.CreateAlloca(I64Ty, B.getInt64(NVR64Alloc), "vm.regs64"); break;
-			case 2: WFregs = B.CreateAlloca(DoubleTy, B.getInt64(NFRAlloc), "vm.fregs");  break;
-			case 3: WPregs = B.CreateAlloca(PtrTy, B.getInt64(NPRAlloc), "vm.pregs");  break;
+			case 0: WRegs = B.CreateAlloca(I32Ty, B.getInt64(NVRAlloc), ("vm.regs" + FamTag).c_str());   break;
+			case 1: WRegs64 = B.CreateAlloca(I64Ty, B.getInt64(NVR64Alloc), ("vm.regs64" + FamTag).c_str()); break;
+			case 2: WFregs = B.CreateAlloca(DoubleTy, B.getInt64(NFRAlloc), ("vm.fregs" + FamTag).c_str());  break;
+			case 3: WPregs = B.CreateAlloca(PtrTy, B.getInt64(NPRAlloc), ("vm.pregs" + FamTag).c_str());  break;
 			}
 		}
 	}

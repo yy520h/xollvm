@@ -141,6 +141,12 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC) {
 	getBool("metamorphicEngines", Cfg.metamorphicEngines);
 	getBool("perFnEngine", Cfg.perFnEngine);
 
+	if (auto It = PC.params.find("wrapperFamily"); It != PC.params.end()) {
+		const std::string& F = It->second;
+		if (F == "auto" || F == "split" || F == "arena" || F == "outlined")
+			Cfg.wrapperFamily = F;
+	}
+
 	// lazyDecrypt requires encBytecode — nothing to defer if bytecode isn't encrypted.
 	if (!Cfg.encBytecode) Cfg.lazyDecrypt = false;
 	// hardened requires encBytecode (meaningful only with encrypted bytecode)

@@ -422,6 +422,12 @@ namespace llvm {
 		// setting it everywhere gives a full per-function engine build. Highest
 		// structural resilience, highest .text cost. Off = use enginePoolSize.
 		bool     perFnEngine = false;
+
+		// wrapperFamily: structural layout of the thin wrapper's register-file
+		// setup. `split` (default) keeps separate typed arrays; `arena` packs
+		// them into one byte arena with randomized offsets; `outlined` moves
+		// the preload into a private helper; `auto` picks per function+seed.
+		std::string wrapperFamily = "split";
 		AntiDebugConfig antiDebugConfig;
 
 		static VMPassConfig fromPassConfig(const PassConfig& PC);
