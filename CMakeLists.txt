@@ -203,6 +203,12 @@ if(TARGET vt_gen)
   endif()
 endif()
 
+# Post-link ELF hardener (Task 7+). Only meaningful inside an LLVM build tree
+# where AddLLVM's add_llvm_executable is available.
+if(DEFINED LLVM_MAIN_SRC_DIR)
+  add_subdirectory(tools/xollvm-elf-hardener)
+endif()
+
 if(LLVM_INCLUDE_TESTS AND DEFINED LLVM_MAIN_SRC_DIR)
   add_custom_target(ObfuscatorUnitTests)
   set(LLVM_LINK_COMPONENTS Core Support AsmParser)
