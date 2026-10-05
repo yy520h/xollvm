@@ -46,6 +46,37 @@ namespace {
 
 } // namespace
 
+void llvm::ElfIntegrityPrepare(Module& M) {
+	LLVMContext& Ctx = M.getContext();
+	Type* I8Ty = Type::getInt8Ty(Ctx);
+	Type* I64Ty = Type::getInt64Ty(Ctx);
+
+	// Manifest placeholder: 184 zero bytes in .text.xollvm.integrity. Patched
+	// by the post-link tool. isConstant=true so lld routes it into a READ-ONLY
+	// section (never a writable RWE load); the tool patches the file bytes, not
+	// the in-memory copy, so read-only is correct.
+	if (!M.getGlobalVariable(kIntegrityManifestSymbol, /*AllowInternal=*/true)) {
+		auto* ManTy = ArrayType::get(I8Ty, sizeof(ElfIntegrityManifestV1));
+		Constant* Zero = Constant::getNullValue(ManTy);
+		auto* Manifest = new GlobalVariable(
+			M, ManTy, /*isConstant=*/true, GlobalValue::LinkOnceODRLinkage, Zero,
+			kIntegrityManifestSymbol);
+		Manifest->setSection(kIntegritySectionName);
+		Manifest->setAlignment(Align(8));
+		Manifest->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
+		appendToCompilerUsed(M, { Manifest });
+	}
+
+	// Runtime integrity state: writable i64; failure poisons it. Emitted
+	// EARLY so strict VM wrappers (built during commit) can reference it.
+	if (!M.getGlobalVariable(kIntegrityStateSymbol, /*AllowInternal=*/true)) {
+		auto* State = new GlobalVariable(
+			M, I64Ty, /*isConstant=*/false, GlobalValue::InternalLinkage,
+			ConstantInt::get(I64Ty, 0), kIntegrityStateSymbol);
+		State->setAlignment(Align(8));
+	}
+}
+
 PreservedAnalyses ElfIntegrityPass::run(Module& M, ModuleAnalysisManager&) {
 	if (!hasStrictSensitiveRegion(M)) return PreservedAnalyses::all();
 
@@ -54,24 +85,13 @@ PreservedAnalyses ElfIntegrityPass::run(Module& M, ModuleAnalysisManager&) {
 	Type* I32Ty = Type::getInt32Ty(Ctx);
 	Type* I64Ty = Type::getInt64Ty(Ctx);
 
-	// 1. Manifest placeholder: 184 zero bytes in .xollvm.integrity. Patched by
-	//    the post-link tool. Named hidden global so the tool can find it.
+	// 1+2. Reuse the globals emitted by ElfIntegrityPrepare() before commit.
+	ElfIntegrityPrepare(M);
 	auto* ManTy = ArrayType::get(I8Ty, sizeof(ElfIntegrityManifestV1));
-	Constant* Zero = Constant::getNullValue(ManTy);
-	auto* Manifest = new GlobalVariable(
-		M, ManTy, /*isConstant=*/false, GlobalValue::LinkOnceODRLinkage, Zero,
-		"__xollvm_elf_integrity_manifest");
-	Manifest->setSection(kIntegritySectionName);
-	Manifest->setAlignment(Align(8));
-	Manifest->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
-	// Keep it through the optimizer even before the tool patches it.
-	appendToCompilerUsed(M, { Manifest });
-
-	// 2. Runtime integrity state: hidden writable i64; failure poisons it.
-	auto* State = new GlobalVariable(
-		M, I64Ty, /*isConstant=*/false, GlobalValue::InternalLinkage,
-		ConstantInt::get(I64Ty, 0), "__obf_elf_integrity_state");
-	State->setAlignment(Align(8));
+	auto* Manifest = cast<GlobalVariable>(
+		M.getGlobalVariable(kIntegrityManifestSymbol, true));
+	auto* State = cast<GlobalVariable>(
+		M.getGlobalVariable(kIntegrityStateSymbol, true));
 
 	// 3. Link the freestanding SHA-256 helper (deduped across modules).
 	if (!M.getFunction(kIntegritySha256Symbol)) {
@@ -135,20 +155,9 @@ PreservedAnalyses ElfIntegrityPass::run(Module& M, ModuleAnalysisManager&) {
 	auto* RangeCount = B.CreateLoad(I32Ty,
 		B.CreateConstGEP2_64(ManTy, Manifest, 0, 12), "rcnt");
 
-	// range[0] = {vaddr, filesize} at manifest offsets 24/32.
-	auto* R0VA = B.CreateLoad(I64Ty, B.CreateConstGEP2_64(ManTy, Manifest, 0, 24), "r0va");
-	auto* R0Sz = B.CreateLoad(I64Ty, B.CreateConstGEP2_64(ManTy, Manifest, 0, 32), "r0sz");
-	auto* R0Int = B.CreateAdd(Base, R0VA, "r0int");
-	auto* R0Ptr = B.CreateIntToPtr(R0Int, PointerType::getUnqual(Ctx), "r0ptr");
-	// Manifest's own file offset relative to Base, so we can zero its window.
-	// Offset of the manifest FROM THE RANGE START (not from Base), so
-	// rangeStart + ManOff == &manifest. (&manifest - Base = manifest vaddr;
-	// subtract range[0]'s vaddr to get the in-range offset.)
+	// Manifest's own vaddr relative to Base; used to detect which recorded
+	// range contains the manifest and to zero its window while hashing.
 	auto* ManVAddr = B.CreateSub(B.CreatePtrToInt(Manifest, I64Ty), Base, "manvaddr");
-	auto* ManOffInt = B.CreateSub(ManVAddr, R0VA, "manoff");
-	auto* ManOffPtr = B.CreateIntToPtr(B.CreateAdd(R0Int, ManOffInt, "manabs"),
-		PointerType::getUnqual(Ctx), "manptr");
-	(void)ManOffPtr;
 
 	Function* Zeros = B.GetInsertBlock()->getModule()->getFunction(
 		"__xollvm_integrity_sha256_update_zeros");
@@ -187,23 +196,54 @@ PreservedAnalyses ElfIntegrityPass::run(Module& M, ModuleAnalysisManager&) {
 	Value* HdrEnd = B.CreateAdd(PhOffV, B.CreateMul(PhEntV, PhNumV), "hdrend");
 	B.CreateCall(SHAUpdate, { SHAState, SafeBase, HdrEnd });
 
-	// 2. The manifest-carrying executable range [rangeStart, rangeEnd) with the
-	//    184-byte manifest window treated as zero. Only hash when the base is
-	//    a valid ELF image; otherwise skip (safely) and treat as bad.
-	// ManOffInt is already the manifest's offset FROM the range start, so the
-	// head length is exactly ManOffInt (do NOT subtract R0VA again).
-	Value* HeadLen = ManOffInt;
-	Value* SafeR0Ptr = B.CreateSelect(MagicOk, R0Ptr, Manifest, "safer0ptr");
-	Value* SafeHeadLen = B.CreateSelect(MagicOk, HeadLen, B.getInt64(0), "safeheadlen");
-	B.CreateCall(SHAUpdate, { SHAState, SafeR0Ptr, SafeHeadLen });
-	B.CreateCall(Zeros, { SHAState, B.getInt64(sizeof(ElfIntegrityManifestV1)) });
-	Value* TailPtr = B.CreateIntToPtr(
-		B.CreateAdd(B.CreateAdd(R0Int, ManOffInt), B.getInt64(sizeof(ElfIntegrityManifestV1))),
-		PointerType::getUnqual(Ctx), "tailptr");
-	Value* TailLen = B.CreateSub(R0Sz, B.CreateAdd(ManOffInt, B.getInt64(sizeof(ElfIntegrityManifestV1))), "taillen");
-	Value* SafeTailPtr = B.CreateSelect(MagicOk, TailPtr, Manifest, "safetailptr");
-	Value* SafeTailLen = B.CreateSelect(MagicOk, TailLen, B.getInt64(0), "safetaillen");
-	B.CreateCall(SHAUpdate, { SHAState, SafeTailPtr, SafeTailLen });
+	// 2. Every recorded executable range, in order, with the manifest window
+	//    treated as zero (the manifest lies inside one of them). This mirrors
+	//    the seal tool exactly: [EHDR..phdrs) then range[0], range[1], ...
+	//    Range[i] = {vaddr, filesz} at manifest offsets 24 + 16*i.
+	// ManFound tracks that exactly one recorded range contains the manifest;
+	// if none does, the split zeroing never happens and the digest would be
+	// hashed as-is (self-referential). Treat "manifest not in any range" as
+	// Bad so a digest-only tamper cannot pass.
+	Value* ManFound = B.getFalse();
+	for (unsigned I = 0; I < kIntegrityMaxRanges; ++I) {
+		Value* RV = B.CreateLoad(I64Ty,
+			B.CreateConstGEP2_64(ManTy, Manifest, 0, 24 + (uint64_t)I * 16), "rng.va");
+		Value* RS = B.CreateLoad(I64Ty,
+			B.CreateConstGEP2_64(ManTy, Manifest, 0, 32 + (uint64_t)I * 16), "rng.sz");
+		// Skip beyond RangeCount.
+		Value* Active = B.CreateICmpULT(B.getInt32(I), RangeCount, "rng.act");
+		Value* A = B.CreateAnd(MagicOk, Active, "rng.a");
+		Value* BaseI = B.CreateAdd(Base, RV, "rng.base");
+		Value* PtrI = B.CreateIntToPtr(BaseI, PointerType::getUnqual(Ctx), "rng.ptr");
+		// If this range is the manifest's own, split around the zeroed window.
+		Value* ManInRange = B.CreateAnd(
+			B.CreateICmpUGE(ManVAddr, RV, "mir.lo"),
+			B.CreateICmpULT(ManVAddr,
+				B.CreateAdd(RV, RS, "mir.hi1"), "mir.hi"), "mir.in");
+		Value* DoSplit = B.CreateAnd(A, ManInRange, "rng.split");
+		ManFound = B.CreateOr(ManFound, DoSplit, "man.found");
+		// Non-manifest range: hash the whole range.
+		B.CreateCall(SHAUpdate, { SHAState,
+			B.CreateSelect(DoSplit, Manifest, PtrI, "rng.p1"),
+			B.CreateSelect(DoSplit, B.getInt64(0), RS, "rng.l1") });
+		// Manifest range: head + zeros([0,152) metadata) + tail from digest on.
+		Value* HeadLen = B.CreateSub(ManVAddr, RV, "rng.head");
+		B.CreateCall(SHAUpdate, { SHAState,
+			B.CreateSelect(DoSplit, PtrI, Manifest, "rng.p2"),
+			B.CreateSelect(DoSplit, HeadLen, B.getInt64(0), "rng.l2") });
+		B.CreateCall(Zeros, { SHAState,
+			B.CreateSelect(DoSplit, B.getInt64(sizeof(ElfIntegrityManifestV1)), B.getInt64(0), "rng.z") });
+		// Tail = range bytes from (manifest end) to range end, hashed as-is.
+		Value* TailLen = B.CreateSub(RS, B.CreateAdd(HeadLen,
+			B.getInt64(sizeof(ElfIntegrityManifestV1))), "rng.tail");
+		Value* TailP = B.CreateIntToPtr(
+			B.CreateAdd(BaseI, B.CreateAdd(HeadLen,
+				B.getInt64(sizeof(ElfIntegrityManifestV1))), "rng.toff"),
+			PointerType::getUnqual(Ctx), "rng.tp");
+		B.CreateCall(SHAUpdate, { SHAState,
+			B.CreateSelect(DoSplit, TailP, Manifest, "rng.p3"),
+			B.CreateSelect(DoSplit, TailLen, B.getInt64(0), "rng.l3") });
+	}
 	B.CreateCall(SHAFinal, { SHAState, Digest });
 
 	// Constant-time compare digest vs manifest digest (offset 152).
@@ -219,7 +259,7 @@ PreservedAnalyses ElfIntegrityPass::run(Module& M, ModuleAnalysisManager&) {
 	Value* Unpatched = B.CreateICmpEQ(RangeCount, B.getInt32(0));
 	Value* Mismatch = B.CreateICmpNE(Diff, B.getInt8(0));
 	Value* Bad = B.CreateOr(B.CreateNot(MagicOk),
-		B.CreateOr(Unpatched, Mismatch), "bad");
+		B.CreateOr(Unpatched, B.CreateOr(Mismatch, B.CreateNot(ManFound, "no.man"))), "bad");
 	Value* Poison = B.CreateSelect(Bad, B.getInt64(0xDEAD00DUL), B.getInt64(0), "poison");
 	B.CreateStore(Poison, State);
 	B.CreateRetVoid();

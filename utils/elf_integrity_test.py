@@ -90,7 +90,7 @@ def sealed(tmp_path_factory):
     so = work / "f.so"
     subprocess.run(
         [str(clang), "-target", "aarch64-linux-android", "-fuse-ld=lld",
-         "-nostdlib", "-shared", "-Wl,-z,notext", str(low), "-o", str(so)],
+         "-nostdlib", "-shared", "-Wl,--rosegment", str(low), "-o", str(so)],
         check=True, capture_output=True, text=True, timeout=600)
     return work, so, tool
 

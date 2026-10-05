@@ -47,9 +47,16 @@ namespace llvm {
 	static constexpr const char* kIntegrityManifestSymbol = "__xollvm_elf_integrity_manifest";
 	static constexpr const char* kIntegrityStateSymbol = "__obf_elf_integrity_state";
 	static constexpr const char* kIntegritySha256Symbol = "__xollvm_integrity_sha256";
+	static constexpr unsigned kIntegrityMaxRanges = 8;
 
-	// Emits the manifest placeholder + runtime integrity state for any module
-	// that contains at least one strict sensitive region. No-op otherwise.
+	// Emit the manifest placeholder global + runtime integrity STATE global.
+	// MUST be called BEFORE the function pipeline / VM commit so strict
+	// wrappers can reference __obf_elf_integrity_state. Idempotent.
+	void ElfIntegrityPrepare(Module& M);
+
+	// Emits the runtime checker/ctor for any module that ends up with at least
+	// one strict sensitive region (post-commit). Reuses the globals from
+	// ElfIntegrityPrepare. No-op otherwise.
 	class ElfIntegrityPass : public PassInfoMixin<ElfIntegrityPass> {
 	public:
 		PreservedAnalyses run(Module& M, ModuleAnalysisManager& MAM);

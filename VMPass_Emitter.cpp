@@ -889,9 +889,38 @@ void BytecodeEmitter::emit(Instruction* I) {
 	if (Op == Instruction::GetElementPtr && Ty->isPointerTy()) {
 		auto* GEP = cast<GetElementPtrInst>(I);
 
-		// Accept:
-		//  (1) gep ..., base, idx
-		//  (2) gep ..., base, 0, idx
+		// The VM's OP_GEP/OP_GEP64 compute base + idx*elemsz, which is only
+		// correct for a single ARRAY index. LLVM GEPs also encode STRUCT field
+		// indices (whose byte offset is the field offset, NOT idx*elemsz) and
+		// multi-index forms. Compute the TRUE constant byte offset with the
+		// DataLayout and emit it as one i8 GEP with elemsz=1. If any index is
+		// non-constant, fall back to the legacy single-array-index form.
+		SmallVector<const Value*, 4> Ops(GEP->indices());
+		APInt ConstOff(DL->getIndexSizeInBits(GEP->getPointerAddressSpace()),
+			0, /*isSigned=*/true);
+		bool AllConst = false;
+		if (GEP->accumulateConstantOffset(*DL, ConstOff)) {
+			AllConst = true;
+		}
+
+		if (AllConst) {
+			// Byte offset fully known at compile time: base_ptr + off, elemsz=1.
+			int64_t Off = ConstOff.getSExtValue();
+			uint16_t ElemSz = 1;
+			uint32_t IdxConst = (uint32_t)(int32_t)Off;
+			// Reuse the idx vreg to carry the constant offset value.
+			Value* OffC = ConstantInt::get(
+				IntegerType::get(I->getContext(), 32), IdxConst, /*isSigned=*/false);
+			bop(OP_GEP);
+			b8(xorSalt(newPR(I)));
+			b8(xorSalt(pr(GEP->getPointerOperand())));
+			b8(xorSalt(vr(OffC)));
+			b8((uint8_t)(ElemSz & 0xFF));
+			b8((uint8_t)(ElemSz >> 8));
+			return;
+		}
+
+		// Legacy: accept  gep base, idx  or  gep base, 0, idx  (array element).
 		Value* IdxV = nullptr;
 		if (GEP->getNumIndices() == 1) {
 			IdxV = *GEP->idx_begin();

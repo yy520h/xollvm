@@ -334,43 +334,49 @@ int main(int argc, char** argv) {
 			for (int J = 0; J < 8; ++J) V[Off + J] = (uint8_t)(Val >> (J * 8));
 		};
 
-		// The canonical range is exactly the executable PT_LOAD that contains
-		// the manifest: the runtime recovers the module base from the manifest
-		// address, so range[0] must be that same load for both sides to hash
-		// identical bytes.
-		uint64_t SegOff = 0, SegSize = 0, R0Vaddr = 0, R0Size = 0;
-		bool HaveSeg = false;
+		// Canonical range set = EVERY file-backed executable (PF_X) PT_LOAD,
+		// in segment order, up to kMaxRanges. The runtime hashes the identical
+		// set, so seal and runtime observe the same bytes. The manifest must
+		// live inside one of these ranges (the runtime recovers the base from
+		// &manifest - ManifestVirtualAddress).
+		struct Range { uint64_t Off, Vaddr, Size; };
+		std::vector<Range> Ranges;
+		bool ManInRange = false;
 		for (uint64_t P = 0; P != PhNum; ++P) {
 			const auto* Phdr = reinterpret_cast<const ELF::Elf64_Phdr*>(
 				Data.data() + PhOff + P * PhEnt);
 			if (Phdr->p_type != ELF::PT_LOAD || !(Phdr->p_flags & ELF::PF_X)) continue;
 			if (Phdr->p_filesz == 0) continue;
+			Ranges.push_back({ Phdr->p_offset, Phdr->p_vaddr, Phdr->p_filesz });
 			if (ManAddr >= Phdr->p_vaddr &&
-				ManAddr + kManifestSize <= Phdr->p_vaddr + Phdr->p_filesz) {
-				SegOff = Phdr->p_offset; SegSize = Phdr->p_filesz;
-				R0Vaddr = Phdr->p_vaddr; R0Size = Phdr->p_filesz;
-				HaveSeg = true;
-				break;
-			}
+				ManAddr + kManifestSize <= Phdr->p_vaddr + Phdr->p_filesz)
+				ManInRange = true;
 		}
-		if (!HaveSeg) {
+		if (!ManInRange) {
 			errs() << "error: manifest is not inside an executable PT_LOAD\n";
+			return Malformed;
+		}
+		if (Ranges.size() > kMaxRanges) {
+			errs() << "error: more executable PT_LOADs (" << Ranges.size()
+				<< ") than the manifest can bind (" << kMaxRanges << ")\n";
 			return Malformed;
 		}
 
 		std::vector<uint8_t> Out(Data.begin(), Data.end());
 
-		// Hash the executable range with the entire manifest window treated as
-		// zero (both seal-time metadata and the digest live inside it), plus
-		// the canonical [EHDR .. end of phdrs) region. The hash therefore does
-		// not depend on the manifest contents, so seal and runtime agree.
+		// Hash [EHDR .. end of phdrs) then every executable range, with the
+		// ENTIRE manifest window [0,184) zeroed. The comparison computed==stored
+		// then detects any change to the stored digest itself (computed stays
+		// the same because the window is zeroed), as well as any change to the
+		// covered code/data.
 		for (uint64_t J = 0; J < kManifestSize; ++J)
 			Out[ManOff + J] = 0;
 		SHA256 Hasher;
 		uint64_t HdrEnd = PhOff + PhEnt * PhNum;
 		if (HdrEnd > Data.size()) HdrEnd = Data.size();
 		Hasher.update(ArrayRef<uint8_t>(Out.data(), HdrEnd));
-		Hasher.update(ArrayRef<uint8_t>(Out.data() + SegOff, SegSize));
+		for (const Range& R : Ranges)
+			Hasher.update(ArrayRef<uint8_t>(Out.data() + R.Off, R.Size));
 		auto Hash = Hasher.final();
 		ArrayRef<uint8_t> DigestBytes(Hash.data(), 32);
 
@@ -406,9 +412,12 @@ int main(int argc, char** argv) {
 			for (int J = 0; J < 8; ++J) man[O + J] = (uint8_t)(V >> (J * 8));
 		};
 		st64(kManifestVAOff, ManAddr);
-		for (int J = 0; J < 4; ++J) man[kManifestRangeCountOff + J] = (uint8_t)(1u >> (J * 8));
-		st64(kManifestRangesOff + 0, R0Vaddr);
-		st64(kManifestRangesOff + 8, R0Size);
+		uint32_t RC = (uint32_t)Ranges.size();
+		for (int J = 0; J < 4; ++J) man[kManifestRangeCountOff + J] = (uint8_t)(RC >> (J * 8));
+		for (uint32_t I = 0; I < RC; ++I) {
+			st64(kManifestRangesOff + (uint64_t)I * 16 + 0, Ranges[I].Vaddr);
+			st64(kManifestRangesOff + (uint64_t)I * 16 + 8, Ranges[I].Size);
+		}
 		for (uint64_t J = 0; J < 32; ++J) man[kManifestDigestOff + J] = DigestBytes[J];
 		// Magic "XOLINT01" + version 1, written last.
 		const char Magic[8] = { 'X','O','L','I','N','T','0','1' };
@@ -423,8 +432,7 @@ int main(int argc, char** argv) {
 			return Malformed;
 		}
 		OS.write(reinterpret_cast<const char*>(Out.data()), Out.size());
-		errs() << "seal: wrote " << Output << " (range vaddr 0x"
-			<< Twine::utohexstr(R0Vaddr) << " size " << R0Size << ")\n";
+		errs() << "seal: wrote " << Output << " (" << RC << " executable range(s))\n";
 		return Ok;
 	}
 

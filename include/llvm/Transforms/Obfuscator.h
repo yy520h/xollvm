@@ -654,6 +654,13 @@ namespace llvm {
 			// aborts loudly (report_fatal_error) if any pass produced invalid IR.
 			MPM.addPass(llvm::obf::ObfVerifyModulePass("final"));
 
+			// Task 8: emit the integrity MANIFEST PLACEHOLDER and the runtime
+			// STATE global BEFORE the function pipeline, so strict VM wrappers
+			// built during commit() can reference __obf_elf_integrity_state and
+			// fold it into their salt. The runtime checker/ctor is added after
+			// commit (when we know a strict region exists).
+			ElfIntegrityPrepare(M);
+
 			VMPlanCoordinator Coordinator;
 			VMPlanCoordinator* PreviousCoordinator = VMPlanCoordinator::setActive(&Coordinator);
 			PreservedAnalyses PA = MPM.run(M, MAM);
