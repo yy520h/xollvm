@@ -141,9 +141,14 @@ PreservedAnalyses ElfIntegrityPass::run(Module& M, ModuleAnalysisManager&) {
 	auto* R0Int = B.CreateAdd(Base, R0VA, "r0int");
 	auto* R0Ptr = B.CreateIntToPtr(R0Int, PointerType::getUnqual(Ctx), "r0ptr");
 	// Manifest's own file offset relative to Base, so we can zero its window.
-	auto* ManOffInt = B.CreateSub(B.CreatePtrToInt(Manifest, I64Ty), Base, "manoff");
+	// Offset of the manifest FROM THE RANGE START (not from Base), so
+	// rangeStart + ManOff == &manifest. (&manifest - Base = manifest vaddr;
+	// subtract range[0]'s vaddr to get the in-range offset.)
+	auto* ManVAddr = B.CreateSub(B.CreatePtrToInt(Manifest, I64Ty), Base, "manvaddr");
+	auto* ManOffInt = B.CreateSub(ManVAddr, R0VA, "manoff");
 	auto* ManOffPtr = B.CreateIntToPtr(B.CreateAdd(R0Int, ManOffInt, "manabs"),
 		PointerType::getUnqual(Ctx), "manptr");
+	(void)ManOffPtr;
 
 	Function* Zeros = B.GetInsertBlock()->getModule()->getFunction(
 		"__xollvm_integrity_sha256_update_zeros");
@@ -154,30 +159,51 @@ PreservedAnalyses ElfIntegrityPass::run(Module& M, ModuleAnalysisManager&) {
 	B.CreateCall(SHAInit, { SHAState });
 
 	// 1. Canonical ELF header + program header table region [base, base+HdrEnd).
-	//    e_phoff @8, e_phentsize @54, e_phnum @56 in Elf64_Ehdr. HdrEnd =
-	//    max(e_ehsize, e_phoff + e_phentsize*e_phnum).
+	//    e_phoff @32, e_phentsize @54, e_phnum @56 in Elf64_Ehdr. HdrEnd =
+	//    e_phoff + e_phentsize*e_phnum. All header reads are guarded by the
+	//    ELF magic check below so an unsealed/invalid base never faults.
 	auto* BasePtr = B.CreateIntToPtr(Base, PointerType::getUnqual(Ctx), "bptr");
-	auto* PhOffV = B.CreateLoad(I64Ty, B.CreateConstGEP1_64(I8Ty, BasePtr, 32), "phoff");
-	// e_phoff is at byte offset 32 in Elf64_Ehdr.
+	// Validate ELF magic at Base before any out-of-header dereference.
+	Value* M0 = B.CreateLoad(I8Ty, BasePtr, "elf.m0");
+	Value* M1 = B.CreateLoad(I8Ty, B.CreateConstGEP1_64(I8Ty, BasePtr, 1), "elf.m1");
+	Value* M2 = B.CreateLoad(I8Ty, B.CreateConstGEP1_64(I8Ty, BasePtr, 2), "elf.m2");
+	Value* M3 = B.CreateLoad(I8Ty, B.CreateConstGEP1_64(I8Ty, BasePtr, 3), "elf.m3");
+	Value* MagicOk = B.CreateAnd(
+		B.CreateAnd(B.CreateICmpEQ(M0, B.getInt8(0x7f)),
+		            B.CreateICmpEQ(M1, B.getInt8('E'))),
+		B.CreateAnd(B.CreateICmpEQ(M2, B.getInt8('L')),
+		            B.CreateICmpEQ(M3, B.getInt8('F'))), "elf.magic.ok");
+
+	// Select a safe pointer: Base when valid, else the manifest itself (always
+	// mapped) so the reads below never touch an unmapped address.
+	Value* SafeBase = B.CreateSelect(MagicOk, BasePtr, Manifest, "safebase");
+	auto* PhOffV = B.CreateLoad(I64Ty, B.CreateConstGEP1_64(I8Ty, SafeBase, 32), "phoff");
 	auto* PhEntV = B.CreateZExt(
-		B.CreateLoad(Type::getInt16Ty(Ctx), B.CreateConstGEP1_64(I8Ty, BasePtr, 54)),
+		B.CreateLoad(Type::getInt16Ty(Ctx), B.CreateConstGEP1_64(I8Ty, SafeBase, 54)),
 		I64Ty, "phent");
 	auto* PhNumV = B.CreateZExt(
-		B.CreateLoad(Type::getInt16Ty(Ctx), B.CreateConstGEP1_64(I8Ty, BasePtr, 56)),
+		B.CreateLoad(Type::getInt16Ty(Ctx), B.CreateConstGEP1_64(I8Ty, SafeBase, 56)),
 		I64Ty, "phnum");
 	Value* HdrEnd = B.CreateAdd(PhOffV, B.CreateMul(PhEntV, PhNumV), "hdrend");
-	B.CreateCall(SHAUpdate, { SHAState, BasePtr, HdrEnd });
+	B.CreateCall(SHAUpdate, { SHAState, SafeBase, HdrEnd });
 
 	// 2. The manifest-carrying executable range [rangeStart, rangeEnd) with the
-	//    184-byte manifest window treated as zero.
-	Value* HeadLen = B.CreateSub(ManOffInt, R0VA, "headlen");
-	B.CreateCall(SHAUpdate, { SHAState, R0Ptr, HeadLen });
+	//    184-byte manifest window treated as zero. Only hash when the base is
+	//    a valid ELF image; otherwise skip (safely) and treat as bad.
+	// ManOffInt is already the manifest's offset FROM the range start, so the
+	// head length is exactly ManOffInt (do NOT subtract R0VA again).
+	Value* HeadLen = ManOffInt;
+	Value* SafeR0Ptr = B.CreateSelect(MagicOk, R0Ptr, Manifest, "safer0ptr");
+	Value* SafeHeadLen = B.CreateSelect(MagicOk, HeadLen, B.getInt64(0), "safeheadlen");
+	B.CreateCall(SHAUpdate, { SHAState, SafeR0Ptr, SafeHeadLen });
 	B.CreateCall(Zeros, { SHAState, B.getInt64(sizeof(ElfIntegrityManifestV1)) });
 	Value* TailPtr = B.CreateIntToPtr(
 		B.CreateAdd(B.CreateAdd(R0Int, ManOffInt), B.getInt64(sizeof(ElfIntegrityManifestV1))),
 		PointerType::getUnqual(Ctx), "tailptr");
 	Value* TailLen = B.CreateSub(R0Sz, B.CreateAdd(ManOffInt, B.getInt64(sizeof(ElfIntegrityManifestV1))), "taillen");
-	B.CreateCall(SHAUpdate, { SHAState, TailPtr, TailLen });
+	Value* SafeTailPtr = B.CreateSelect(MagicOk, TailPtr, Manifest, "safetailptr");
+	Value* SafeTailLen = B.CreateSelect(MagicOk, TailLen, B.getInt64(0), "safetaillen");
+	B.CreateCall(SHAUpdate, { SHAState, SafeTailPtr, SafeTailLen });
 	B.CreateCall(SHAFinal, { SHAState, Digest });
 
 	// Constant-time compare digest vs manifest digest (offset 152).
@@ -188,10 +214,12 @@ PreservedAnalyses ElfIntegrityPass::run(Module& M, ModuleAnalysisManager&) {
 		Value* MP = B.CreateGEP(I8Ty, ManDigest, B.getInt64(I));
 		Diff = B.CreateOr(Diff, B.CreateXor(B.CreateLoad(I8Ty, DP), B.CreateLoad(I8Ty, MP)));
 	}
-	// If unpatched (range count 0) or mismatch, mix failure into state.
+	// Bad when the base is not a valid ELF image, unpatched (range count 0), or
+	// the digest mismatches.
 	Value* Unpatched = B.CreateICmpEQ(RangeCount, B.getInt32(0));
 	Value* Mismatch = B.CreateICmpNE(Diff, B.getInt8(0));
-	Value* Bad = B.CreateOr(Unpatched, Mismatch, "bad");
+	Value* Bad = B.CreateOr(B.CreateNot(MagicOk),
+		B.CreateOr(Unpatched, Mismatch), "bad");
 	Value* Poison = B.CreateSelect(Bad, B.getInt64(0xDEAD00DUL), B.getInt64(0), "poison");
 	B.CreateStore(Poison, State);
 	B.CreateRetVoid();

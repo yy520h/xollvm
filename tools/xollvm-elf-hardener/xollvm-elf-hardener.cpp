@@ -270,6 +270,26 @@ int main(int argc, char** argv) {
 				}
 			}
 		}
+		// (c) Fallback: scan PT_LOADs for the 8-byte magic. Survives stripping
+		// (which removes the manifest symbol) and lld section merging.
+		if (!ManFound) {
+			static const char Magic[8] = { 'X','O','L','I','N','T','0','1' };
+			for (uint64_t P = 0; P != PhNum && !ManFound; ++P) {
+				const auto* Phdr = reinterpret_cast<const ELF::Elf64_Phdr*>(
+					Data.data() + PhOff + P * PhEnt);
+				if (Phdr->p_type != ELF::PT_LOAD || Phdr->p_filesz < kManifestSize)
+					continue;
+				const uint8_t* begin = Data.data() + Phdr->p_offset;
+				const uint8_t* end = begin + Phdr->p_filesz - kManifestSize;
+				for (const uint8_t* p = begin; p <= end; ++p) {
+					if (std::memcmp(p, Magic, 8) != 0) continue;
+					ManOff = (uint64_t)(p - Data.data());
+					ManAddr = Phdr->p_vaddr + (ManOff - Phdr->p_offset);
+					ManFound = true;
+					break;
+				}
+			}
+		}
 		if (!ManFound) {
 			errs() << "error: no xollvm integrity manifest found\n";
 			return Malformed;

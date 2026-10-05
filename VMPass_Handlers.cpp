@@ -1358,10 +1358,14 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 	// 寄存器文件，保留 ABI 语义（修复 #2：float 被当 double 调）。
 	SmallVector<Value*, MaxArgs> PVals, IVals, I64Vs, F32Vs, FregVals;
 	SmallVector<Type*, MaxArgs> RealPTys;
+	// EffectiveNArgs must cover the WIDEST callee signature across all unique
+	// FunctionTypes, not just UniqueFTys[0]: call sites with more params index
+	// these vectors up to their own arity. Sizing to FTy[0] under-reads and
+	// crashes the per-FTy switch below (OOB) when a later type has more params.
 	unsigned EffectiveNArgs = 0;
-	FunctionType* FirstFTy = (NFTy > 0) ? UniqueFTys[0] : nullptr;
-	if (FirstFTy)
-		EffectiveNArgs = std::min<unsigned>(FirstFTy->getNumParams(), MaxArgs);
+	for (FunctionType* FT : UniqueFTys)
+		EffectiveNArgs = std::max<unsigned>(EffectiveNArgs,
+			std::min<unsigned>(FT->getNumParams(), MaxArgs));
 	for (unsigned i = 0; i < EffectiveNArgs; ++i) {
 		// arg bytes now start at Base+2 (was Base+5).
 		Value* AB = loadBC(B, CurIP, Base + 2 + i, "vm.cl.ab");
@@ -1376,10 +1380,12 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 
 		FregVals.push_back(ldFR(B, FIdx));
 		F32Vs.push_back(B.CreateFPTrunc(FregVals.back(), Type::getFloatTy(Ctx), "vm.cl.f32"));
-		if (FirstFTy && i < FirstFTy->getNumParams())
-			RealPTys.push_back(FirstFTy->getParamType(i));
-		else
+		// RealPTys is per-arg-slot type info from the first type only; the
+		// switch below re-derives from SrcFTy when the slot index exceeds it.
+		if (UniqueFTys.empty() || i >= UniqueFTys[0]->getNumParams())
 			RealPTys.push_back(PtrTy);
+		else
+			RealPTys.push_back(UniqueFTys[0]->getParamType(i));
 	}
 
 
@@ -1427,7 +1433,11 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 		SmallVector<Type*, MaxArgs> ATys;
 		SmallVector<Value*, MaxArgs> CA;
 		for (unsigned i = 0; i < N && i < MaxArgs; ++i) {
-			Type* PT = (i < RealPTys.size()) ? RealPTys[i] : SrcFTy->getParamType(i);
+			// The register file for arg i MUST come from THIS callee's type
+			// (SrcFTy), not from UniqueFTys[0]: two callees in one engine can
+			// have different signatures (e.g. 4-arg vs 5-arg), and reusing
+			// FTy[0]'s param types selects the wrong file (i32 vs i64 vs ptr).
+			Type* PT = SrcFTy->getParamType(i);
 			if (PT->isFloatTy()) {
 				// 修复 #2：float 参数必须用真实 float 类型，不能升 double。
 				ATys.push_back(Type::getFloatTy(Ctx));
