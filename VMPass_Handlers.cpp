@@ -1479,6 +1479,18 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 		CSW.I64Vs.assign(I64Vs.begin(), I64Vs.end());
 		CSW.F32Vs.assign(F32Vs.begin(), F32Vs.end());
 		CSW.FregVals.assign(FregVals.begin(), FregVals.end());
+		// Capture the engine's reload context so ensureCallFTyCases() can
+		// re-load args from the engine bytecode for later-registered callees.
+		CSW.EffBC = EffBC;
+		CSW.EffSalt = EffSalt;
+		CSW.MaskVR = MaskVR;
+		CSW.MaskVR64 = MaskVR64;
+		CSW.MaskFR = MaskFR;
+		CSW.MaskPR = MaskPR;
+		CSW.EncBytecode = EncBytecode;
+		CSW.StrongBC = StrongBC;
+		CSW.ObfRegIdx = ObfRegIdx;
+		CSW.ArgByteBase = Base + 2;
 	}
 
 	IRBuilder<> MB(MergeBB);

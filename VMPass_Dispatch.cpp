@@ -781,27 +781,78 @@ void VMImpl::ensureCallFTyCases() {
 				cast<ConstantInt>(ConstantInt::get(I32Ty, TIdx)), CaseBB);
 			IRBuilder<> CB(CaseBB);
 
+			// Re-load args from the ENGINE's bytecode in this new case block.
+			// Reusing the Values captured in buildCall2 is invalid: they live in
+			// another basic block (no dominance) and were sized to the arity at
+			// first build. The CALL handler read the engine IP into its own
+			// block; recompute it here from SS->EngineVMIP and the same masks.
+			Value* CurIP = CB.CreateLoad(I32Ty, SS->EngineVMIP, "vm.cl.ip");
+			cast<LoadInst>(CurIP)->setVolatile(true);
+
+			// Engine-context byte loader: mirrors loadBC()/deobf() but uses the
+			// captured engine EffBC/EffSalt/masks instead of this VMImpl's.
+			// StrongBC and lazy contexts are intentionally NOT handled here:
+			// the engine's byte-load keying must match buildCall2 exactly, and
+			// the demo/engine configuration uses StrongBC off for the sensitive
+			// region. Assert so a mismatch is loud rather than silent.
+			if (CSW.StrongBC)
+				report_fatal_error("[vm] ensureCallFTyCases: StrongBC engine "
+					"call-arg reload not supported", /*gen_crash_diag=*/false);
+			auto engLoadBC = [&](IRBuilder<>& B, Value* IP, uint32_t Off,
+				const Twine& Nm) -> Value* {
+				Value* Idx32 = Off ? B.CreateAdd(IP, B.getInt32(Off), Nm + ".i32") : IP;
+				Value* Idx64 = B.CreateSExt(Idx32, I64Ty, Nm + ".ip64");
+				Value* Ptr = B.CreateGEP(I8Ty, CSW.EffBC, Idx64, Nm + ".p");
+				Value* Raw = B.CreateLoad(I8Ty, Ptr, Nm);
+				if (!CSW.EncBytecode) return Raw;
+				auto* SL = B.CreateLoad(I32Ty, CSW.EffSalt, Nm + ".s");
+				SL->setVolatile(true);
+				Value* Key32 = B.CreateAnd(B.CreateXor(SL, Idx32, Nm + ".kx"),
+					B.getInt32(0xFF), Nm + ".km");
+				Value* Key8 = B.CreateTrunc(Key32, I8Ty, Nm + ".k8");
+				return B.CreateXor(Raw, Key8, Nm + ".dec");
+			};
+			auto engDeobf = [&](IRBuilder<>& B, Value* Raw8, Value* MaskVal,
+				const Twine& Nm) -> Value* {
+				Value* Ext = B.CreateZExt(Raw8, I32Ty, Nm + ".e");
+				if (CSW.ObfRegIdx) {
+					auto* SL = B.CreateLoad(I32Ty, CSW.EffSalt, Nm + ".s");
+					SL->setVolatile(true);
+					Ext = B.CreateXor(Ext,
+						B.CreateAnd(SL, B.getInt32(0xFF), Nm + ".sb"), Nm + ".x");
+				}
+				return B.CreateAnd(Ext, MaskVal, Nm + ".m");
+			};
+
 			SmallVector<Type*, VMEngine::MaxArgs> ATys;
 			SmallVector<Value*, VMEngine::MaxArgs> CA;
 			for (unsigned i = 0; i < N && i < VMEngine::MaxArgs; ++i) {
 				Type* PT = SrcFTy->getParamType(i);
+				Value* AB = engLoadBC(CB, CurIP, CSW.ArgByteBase + 2 + i,
+					"vm.cl.ab");
+				Value* PIdx = engDeobf(CB, AB, CSW.MaskPR, "vm.cl.pi");
+				Value* VIdx = engDeobf(CB, AB, CSW.MaskVR, "vm.cl.vi");
+				Value* V64I = engDeobf(CB, AB, CSW.MaskVR64, "vm.cl.v64i");
+				Value* FIdx = engDeobf(CB, AB, CSW.MaskFR, "vm.cl.fxi");
 				if (PT->isFloatTy()) {
-					// 修复 #2：float 参数必须用真实 float 类型，不能升 double。
 					ATys.push_back(Type::getFloatTy(Ctx));
-					CA.push_back(CSW.F32Vs[i]);
+					CA.push_back(CB.CreateFPTrunc(ldFR(CB, FIdx),
+						Type::getFloatTy(Ctx), "vm.cl.f32"));
 				}
 				else if (PT->isDoubleTy()) {
 					ATys.push_back(DoubleTy);
-					CA.push_back(CSW.FregVals[i]);
+					CA.push_back(ldFR(CB, FIdx));
 				}
 				else {
 					ATys.push_back(PtrTy);
 					if (PT->isPointerTy())
-						CA.push_back(CSW.PVals[i]);
+						CA.push_back(ldPR(CB, PIdx));
 					else if (PT->isIntegerTy(64))
-						CA.push_back(CSW.I64Vs[i]);
+						CA.push_back(CB.CreateIntToPtr(ldVR64(CB, V64I), PtrTy,
+							"vm.cl.i64p"));
 					else
-						CA.push_back(CSW.IVals[i]);
+						CA.push_back(CB.CreateIntToPtr(ldVR(CB, VIdx), PtrTy,
+							"vm.cl.ivp"));
 				}
 			}
 

@@ -277,6 +277,21 @@ namespace llvm {
 			Value* Callee = nullptr;
 			SmallVector<Value*, 8> PVals, IVals, I64Vs, F32Vs, FregVals;
 			RetKind2    RK = RK2_VOID;
+
+			// Engine-context pointers captured when this CALL handler was built.
+			// ensureCallFTyCases() runs on a DIFFERENT VMImpl whose Eff* point
+			// at that function's own state, not the engine's, so it must reload
+			// args from the engine's bytecode using these captured pointers.
+			Value* EffBC = nullptr;
+			Value* EffSalt = nullptr;
+			Value* MaskVR = nullptr;
+			Value* MaskVR64 = nullptr;
+			Value* MaskFR = nullptr;
+			Value* MaskPR = nullptr;
+			bool EncBytecode = false;
+			bool StrongBC = false;
+			bool ObfRegIdx = false;
+			unsigned ArgByteBase = 0;   // first arg-byte offset (0 void, else 1)
 		};
 			CallSwitchInfo CallSW[5];
 
