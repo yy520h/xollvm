@@ -162,10 +162,9 @@ bool llvm::validateSensitiveDecision(Function& F, const SensitiveDecisionConfig&
 					EscapesInlineAsm = true;
 					continue;
 				}
-				if (isSensitiveSource(*CB)) continue; // the seed call itself
-				const Function* Callee = CB->getCalledFunction();
-				if (!Callee || !Callee->isDeclaration() || Callee->isIntrinsic())
-					continue;
+				// Skip only the call that produced V (the taint seed itself).
+				// If V is an argument to any other call, it escapes.
+				if (static_cast<Value*>(CB) == V) continue;
 				for (unsigned I = 0, E = CB->arg_size(); I != E; ++I)
 					if (CB->getArgOperand(I) == V) {
 						EscapesUnknownCall = true;

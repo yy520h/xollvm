@@ -962,6 +962,28 @@ fail:
 	EXPECT_NE(R.Diagnostic.find("escapes to unknown call"), std::string::npos) << R.Diagnostic;
 }
 
+TEST(SensitiveDecisionValidation, RejectsTaintedArgToNonVoidExternal) {
+	auto M = parseSensitiveFixture(R"IR(
+declare i32 @verify(i32)
+declare i32 @rehash(i32)
+define i32 @auth(i32 %x) {
+entry:
+  %r = call i32 @verify(i32 %x)
+  %z = call i32 @rehash(i32 %r)
+  %ok = icmp eq i32 %r, 1
+  br i1 %ok, label %success, label %fail
+success:
+  ret i32 1
+fail:
+  ret i32 0
+}
+)IR");
+	ASSERT_NE(M, nullptr);
+	SensitiveDecisionAnalysisResult R;
+	EXPECT_FALSE(validateSensitiveDecision(*M->getFunction("auth"), AuthConfig(), R));
+	EXPECT_NE(R.Diagnostic.find("escapes to unknown call"), std::string::npos) << R.Diagnostic;
+}
+
 TEST(SensitiveDecisionValidation, RejectsMissingDecisionBranch) {
 	auto M = parseSensitiveFixture(R"IR(
 declare i32 @verify(i32)

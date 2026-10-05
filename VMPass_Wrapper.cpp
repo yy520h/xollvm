@@ -614,6 +614,19 @@ void VMImpl::buildWrapper() {
 				Poisoned, blindI32(SaltConst), "vm.ad.salt.effective");
 		}
 	}
+	// ELF integrity fail-closed: when the module carries a runtime integrity
+	// state (emitted only for strict sensitive regions), fold it into the VM
+	// salt. Valid state is 0 (neutral); a tampered/unsigned image sets a
+	// nonzero poison that deterministically corrupts bytecode decode/dispatch
+	// before the sensitive decision can succeed. No standalone public boolean.
+	if (auto* State = M.getGlobalVariable("__obf_elf_integrity_state", true)) {
+		Value* S = B.CreateLoad(I64Ty, State, "vm.integrity.state");
+		cast<LoadInst>(S)->setVolatile(true);
+		Value* Lo = B.CreateTrunc(S, I32Ty, "vm.integrity.lo");
+		// Salt parameter is i32; XOR the state's low word directly.
+		Args[VMEngine::kParamSalt] = B.CreateXor(Args[VMEngine::kParamSalt], Lo,
+			"vm.integrity.mix");
+	}
 	if (LazyActive) Args.push_back(LazyCtxArg);              // lazyctx
 
 	// Load engine function pointer from handler table slot [OP_COUNT*K]
