@@ -324,6 +324,14 @@ namespace llvm {
 		bool maps = false;
 		bool integrity = false;
 		bool dynamic = false;
+		bool debuggerProcess = false;
+		bool injection = false;
+		bool debugPorts = false;
+		bool vpn = false;
+		bool proxy = false;
+		bool iptables = false;
+		bool selinux = false;
+		bool rootRequired = false;
 		unsigned intervalMs = 1000;
 		uint64_t thresholdNs = 1000000;
 		bool responseCorrupt = true;

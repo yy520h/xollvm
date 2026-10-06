@@ -48,6 +48,14 @@ def detector_binary(request, tmp_path_factory):
 static const char *fixture;
 static volatile sig_atomic_t interrupted, start;
 extern int __real_open(const char *, int, ...);
+extern FILE *__real_fopen(const char *, const char *);
+FILE *__wrap_fopen(const char *path, const char *mode) {
+    if (!fixture || strcmp(path, "/proc/self/status") != 0) return __real_fopen(path, mode);
+    if (strcmp(fixture, "read-error") == 0) return NULL;
+    FILE *f = tmpfile();
+    if (!f) return NULL;
+    fputs(fixture, f); rewind(f); return f;
+}
 extern ssize_t __real_read(int, void *, size_t);
 extern int __real_close(int);
 int __wrap_open(const char *path, int flags, ...) {
@@ -91,7 +99,7 @@ int main(int argc, char **argv) {
     exe = work / "test"
     subprocess.run([str(ndk / "bin/clang"), "--target=aarch64-linux-android26",
                     f"--sysroot={ndk / 'sysroot'}", str(harness), str(obj),
-                    "-Wl,--wrap=open", "-Wl,--wrap=read", "-Wl,--wrap=close", "-o", str(exe)],
+                    "-Wl,--wrap=open", "-Wl,--wrap=read", "-Wl,--wrap=close", "-Wl,--wrap=fopen", "-o", str(exe)],
                    check=True, capture_output=True, text=True)
     return exe
 

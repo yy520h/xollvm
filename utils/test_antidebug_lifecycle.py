@@ -50,6 +50,12 @@ def lifecycle_binary(request, tmp_path_factory):
 #include <stdlib.h>
 #include <errno.h>
 static atomic_int hit, reads;
+FILE *__wrap_fopen(const char* p, const char* mode) {
+    const char* s = strstr(p, "status") ? (atomic_load(&hit) ? "TracerPid: 42\n" : "TracerPid: 0\n") :
+        "1000-2000 r-xp 0 00:00 0 /data/normal-library.so\n";
+    FILE* f = tmpfile(); if (!f) return NULL;
+    fputs(s, f); rewind(f); atomic_fetch_add(&reads, 1); return f;
+}
 int __wrap_open(const char* p, int f, ...) { return strstr(p, "status") ? 10001 : 10002; }
 ssize_t __wrap_read(int fd, void* out, size_t n) {
     const char* s = fd == 10001 ? (atomic_load(&hit) ? "TracerPid: 42\n" : "TracerPid: 0\n") : "normal-library\n";
@@ -90,7 +96,7 @@ int main(int argc, char** argv) {
     exe = work / 'main'
     subprocess.run([str(ndk / 'bin/clang'), '--target=aarch64-linux-android26',
                     f'--sysroot={ndk / "sysroot"}', str(harness), str(obj),
-                    *[f'-Wl,--wrap={f}' for f in ('open', 'read', 'close', 'pthread_create', 'pthread_join')],
+                    *[f'-Wl,--wrap={f}' for f in ('open', 'read', 'close', 'fopen', 'pthread_create', 'pthread_join')],
                     '-pthread', '-o', str(exe)], check=True, capture_output=True, text=True)
     return exe
 

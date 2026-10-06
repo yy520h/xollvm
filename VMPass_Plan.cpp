@@ -104,13 +104,14 @@ bool VMPlanCoordinator::freeze() {
 	{
 		std::set<unsigned> Used;
 		for (auto& Group : Groups) {
-			// addCandidate() 创建的候选没有 VMImpl 对象（仅用于分组/需求合并），
-			// 跳过 engine-id 冲突检测；它们不会被 commit。
-			if (!Group.Candidates.front()->Impl) {
+			// 需求候选可能先于已准备候选；从整个组中找实际执行实例。
+			auto Prepared = llvm::find_if(Group.Candidates,
+				[](const VMPreparedCandidate* C) { return C->Impl != nullptr; });
+			if (Prepared == Group.Candidates.end()) {
 				Group.Plan.EngineId = 0;
 				continue;
 			}
-			unsigned Base = Group.Candidates.front()->Impl->EngineId;
+			unsigned Base = (*Prepared)->Impl->EngineId;
 			if (Used.insert(Base).second) {
 				Group.Plan.EngineId = Base;
 				continue;

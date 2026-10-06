@@ -859,6 +859,29 @@ TEST(SensitiveDecisionConfigTest, RequiresEnabledVM) {
 }
 
 #ifdef OBF_TEST_VM_IMPL
+TEST(VMPlan, DemandOnlyCandidateCanPrecedePreparedCandidate) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+define i32 @target(i32 %x) { %r = add i32 %x, 1 ret i32 %r }
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	VMPassConfig Config;
+	obf::Rng R(42);
+	auto Impl = std::make_unique<VMImpl>(*M->getFunction("target"), Config, R, 42);
+	ASSERT_TRUE(Impl->prepare()) << Impl->FailReason;
+	Impl->EngineId = VMEngine::makeEngineId(3, 0);
+	unsigned ExpectedId = Impl->EngineId;
+	auto Key = EngineConfigKey::fromConfig(Config, 3, 0);
+	VMPlanCoordinator Coordinator;
+	ASSERT_NE(Coordinator.addCandidate(*M->getFunction("target"), Config, Key,
+		BytecodeEmitter{}, {}), nullptr);
+	ASSERT_NE(Coordinator.addPrepared(std::move(Impl), Config, Key), nullptr);
+	ASSERT_TRUE(Coordinator.freeze());
+	ASSERT_EQ(Coordinator.groupCount(), 1u);
+	EXPECT_EQ(Coordinator.groupPlan(0)->EngineId, ExpectedId);
+}
+
 static std::unique_ptr<Module> parseSensitiveFixture(const char* IR) {
 	// context 必须比返回的 Module 活得久，否则 Module 持有悬垂引用导致 SIGSEGV
 	static LLVMContext C;

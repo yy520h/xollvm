@@ -123,6 +123,7 @@ namespace llvm::obf {
 		bool AntiDebugEnabled = false;
 		std::vector<std::string> AntiDebugDetectors;
 		bool AntiDebugDynamic = false;
+		bool AntiDebugRootRequired = false;
 		std::string AntiDebugResponse;
 	};
 

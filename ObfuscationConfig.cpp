@@ -39,13 +39,22 @@ AntiDebugConfig AntiDebugConfig::fromPassConfig(const PassConfig& PC) {
 	getBool("maps", C.maps);
 	getBool("integrity", C.integrity);
 	getBool("dynamic", C.dynamic);
+	getBool("debuggerProcess", C.debuggerProcess);
+	getBool("injection", C.injection);
+	getBool("debugPorts", C.debugPorts);
+	getBool("vpn", C.vpn);
+	getBool("proxy", C.proxy);
+	getBool("iptables", C.iptables);
+	getBool("selinux", C.selinux);
+	getBool("rootRequired", C.rootRequired);
 	uint64_t Interval = C.intervalMs;
 	getUInt("interval", Interval);
 	if (Interval <= std::numeric_limits<unsigned>::max()) C.intervalMs = (unsigned)Interval;
 	getUInt("threshold", C.thresholdNs);
 	getBool("responseCorrupt", C.responseCorrupt);
 	C.enabled = C.enabled || C.tracerPid || C.ptrace || C.timing || C.maps ||
-		C.integrity || C.dynamic;
+		C.integrity || C.dynamic || C.debuggerProcess || C.injection ||
+		C.debugPorts || C.vpn || C.proxy || C.iptables || C.selinux;
 	return C;
 }
 
@@ -57,7 +66,8 @@ bool AntiDebugConfig::validate(std::string* Reason) const {
 	if (intervalMs < 50 || intervalMs > 60000) return fail("interval must be 50..60000 ms");
 	if (thresholdNs == 0 || thresholdNs == std::numeric_limits<uint64_t>::max())
 		return fail("threshold must be positive");
-	if (dynamic && !(tracerPid || ptrace || timing || maps || integrity))
+	if (dynamic && !(tracerPid || ptrace || timing || maps || integrity ||
+		debuggerProcess || injection || debugPorts || vpn || proxy || iptables || selinux))
 		return fail("dynamic monitor requires at least one detector");
 	return true;
 }

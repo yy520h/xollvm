@@ -1087,6 +1087,7 @@ namespace llvm::obf {
 		for (const auto& D : R.AntiDebugDetectors) Detectors.push_back(D);
 		AntiDebug["detectors"] = std::move(Detectors);
 		AntiDebug["dynamic"] = R.AntiDebugDynamic;
+		AntiDebug["root_required"] = R.AntiDebugRootRequired;
 		AntiDebug["response"] = R.AntiDebugResponse;
 		O["anti_debug"] = std::move(AntiDebug);
 

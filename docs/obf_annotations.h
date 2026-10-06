@@ -28,8 +28,7 @@
 #define OBF_ANNOTATIONS_H
 
 /*
- * Zone 卡密授权：
- * OBF("zoneauth(capability=main, policy=fail_closed), vm(...)")
+ * Zone 卡密授权由最终项目的 zone_runtime 集成；zoneauth 注解已移除。
  *
  * 目标必须将 zone_runtime/zone_wrapper.cpp、官方 Zone 静态 SDK 及其所需的
  * 静态依赖一起链接。卡密在运行时输入，不会存储在注解或编译器选项中。
@@ -80,7 +79,8 @@
  *
  * 示例：
  *   OBF("sensitive(region=auth,strict=1), vm(preset=max)")
- *   bool verifyAndAuthorize(const Request& r) { ... }
+ *   int verifyAndAuthorize(const unsigned char* data, unsigned long size);
+ * 局部内存的 GEP/指针转换派生地址也会递归检查，并传播其 load 污点。
  *
  * 最终 ELF 完整性：含严格敏感区域的模块会发射 .text.xollvm.integrity
  * manifest 占位与运行时校验 ctor；由后链接工具 xollvm-elf-hardener 回填
@@ -93,8 +93,9 @@
  *
  * 退出码（xollvm-elf-hardener）：0 通过 / 2 malformed / 3 策略违规。
  *
- * 范围说明：manifest 自身参与摘要（窗口置零），覆盖 EHDR+程序头+承载
- * manifest 的可执行段；文件尾追加数据不在内存自校验范围内，应由 APK/包
+ * 范围说明：manifest 自身参与摘要（窗口置零），覆盖 EHDR+程序头及全部
+ * 文件支持的可执行 PT_LOAD；seal 后不能 strip 或修改这些字节。
+ * verify 另校验版本、VA、范围数量和全部范围槽；文件尾追加数据应由 APK/包
  * 签名负责。动态符号（如外部 API）仍可能保留在 .dynsym，这是已知事实。
  */
 
@@ -335,8 +336,9 @@
  *   运行时（客户端）：
  *     cloud_value_manager 首次 dispatch 时同步拉取当前 window 的 V（避免首跑
  *     用全零 V 必崩），之后按 VM_DISPATCH_PREFETCH_SEC 异步预取；按
- *     window_id 分桶，用 HMAC-SHA256(V, window_le64) 取低 VM_DISPATCH_OFFSET_MASK
+ *     当前 window_id 计算 HMAC-SHA256(V, window_le64)，取低 VM_DISPATCH_OFFSET_MASK
  *     位作为偏移。V 通过 zone_wrapper 的既有登录/租约/capability 线路取得。
+ *     跨窗口刷新失败仍使用当前窗口计算，不能沿用缓存窗口延长旧 V 有效期。
  *
  *   云端：
  *     持有固定密钥 k，为每个 window 搜索一个 V 使 HMAC(V, window) & MASK == 0，
@@ -389,23 +391,40 @@
 /*----------------------------------------------------------------------------
  * antidebug                                              反调试检测
  *   在函数入口执行反调试检测；检测到异常时记录响应状态，并可让函数返回
- *   对应返回类型的零值。dynamic 模式会创建模块级监控线程和响应状态。
+ *   对应返回类型的零值。所有检测器、dynamic、rootRequired 默认均为 0。
+ *   dynamic 按有效配置复用模块内线程和响应状态；不同配置独立，异常锁存。
  *
  *   tracerPid     [0/1]       检测 /proc/self/status 中的 TracerPid
- *   ptrace        [0/1]       执行 ptrace 检测
+ *   ptrace        [0/1]       兼容为只读 TracerPid 检测，不执行 PTRACE_TRACEME
  *   timing        [0/1]       检测运行时间异常
- *   maps          [0/1]       检查进程 maps 状态
- *   integrity     [0/1]       启用完整性检测入口
+ *   maps          [0/1]       检查 /proc/self/maps 中明确的调试器名称
+ *   integrity     [0/1]       与 vm 组合时启用字节码完整性构造函数
+ *   debuggerProcess [0/1]    枚举 /proc/<pid>/comm 检查工具进程（需 root）
+ *   injection     [0/1]       maps 中 Frida/Xposed/Substrate/Riru/LSPosed 特征
+ *   debugPorts    [0/1]       本机 IPv4 23946/23947/27042，单次等待至多 20 ms
+ *   vpn           [0/1]       /proc/net/dev 中 tun/ppp/pptp/ipsec 加编号接口
+ *   proxy         [0/1]       大小写 http_proxy/https_proxy/all_proxy 环境变量
+ *   iptables      [0/1]       只读 nat/filter/mangle 的 REDIRECT/本机 DNAT（需 root）
+ *   selinux       [0/1]       /sys/fs/selinux/enforce：0 命中，1 正常
+ *   rootRequired  [0/1]       严格权限和读取策略；本身不启用任何检测器
  *   dynamic       [0/1]       启用动态监控线程
- *   interval      [1-...] (1000)  动态检测间隔，单位毫秒
+ *   interval      [50-60000] (1000)  动态检测间隔，单位毫秒
  *   threshold     [1-...] (1000000)  timing 阈值，单位纳秒
  *   responseCorrupt [0/1] (1) 检测到异常时让函数返回安全失败值
  *
- *   dynamic 至少需要启用一个检测器。该 Pass 会根据目标平台能力跳过不支持
- *   Linux proc/pthread ABI 的配置。
+ *   新增七项及 rootRequired 仅对 Android/AArch64 生效。rootRequired=0 跳过
+ *   debuggerProcess/iptables，其余探测读取失败时跳过。rootRequired=1 先检查
+ *   geteuid()==0；权限不足直接触发响应，启用项读取/解析失败也触发响应。
+ *   proxy 不读取 Android 系统代理设置；VPN/工具名/端口均为特征检测。
+ *   dynamic 在入口与后台检测；线程退出用停止标志和 join 回收；创建失败锁存。
+ *   ptrace=1 与 tracerPid 共用只读检测，不改变父子跟踪和信号关系。
+ *   普通 MT/root 终端不等于调试器附加；默认不因 root 身份拒绝运行。
+ *   与 vm 组合时 guard 在正式 wrapper 提交后插入，integrity 在 VM 初始化执行。
+ *   responseCorrupt=0 只记录状态；报告 anti_debug 记录请求配置，目标/权限门控
+ *   仍可能跳过检测。完整性检测沿用 VM 的字节码损坏响应。
  *
- *   e.g.  OBF("antidebug(tracerPid=1, ptrace=1, maps=1)")
- *   e.g.  OBF("antidebug(timing=1, interval=250, threshold=900000)")
+ *   e.g.  OBF("antidebug(tracerPid=1, injection=1, dynamic=1, interval=250)")
+ *   e.g.  OBF("antidebug(rootRequired=1, debuggerProcess=1, iptables=1, selinux=1)")
  *--------------------------------------------------------------------------*/
 
 /*----------------------------------------------------------------------------
@@ -475,6 +494,8 @@
  *
  *   antidebug(...) 是独立的显式启用配置：
  *     tracerPid, ptrace, timing, maps, integrity, dynamic（默认均为 0）
+ *     Android/AArch64：debuggerProcess, injection, debugPorts, vpn, proxy,
+ *     iptables, selinux, rootRequired（默认均为 0，权限策略见 antidebug 小节）
  *     interval（1000 ms）、threshold（1000000 ns）、responseCorrupt（1）
  *     dynamic 至少需要一个检测器
  *
