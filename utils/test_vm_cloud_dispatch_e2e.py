@@ -8,7 +8,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEMO = Path("/data/user/0/com.termux/files/home/demo/jni/main.cpp")
+DEMO = ROOT.parent / "demo/jni/main.cpp"
 
 
 def _demo_src():

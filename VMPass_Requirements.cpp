@@ -366,6 +366,14 @@ unsigned EnginePool, unsigned EngineOwner, uint64_t MappingSeed,
 	Key.Fields.emplace_back("ad_maps", AD.maps);
 	Key.Fields.emplace_back("ad_integrity", AD.integrity);
 	Key.Fields.emplace_back("ad_dynamic", AD.dynamic);
+	Key.Fields.emplace_back("ad_debugger_process", AD.debuggerProcess);
+	Key.Fields.emplace_back("ad_injection", AD.injection);
+	Key.Fields.emplace_back("ad_debug_ports", AD.debugPorts);
+	Key.Fields.emplace_back("ad_vpn", AD.vpn);
+	Key.Fields.emplace_back("ad_proxy", AD.proxy);
+	Key.Fields.emplace_back("ad_iptables", AD.iptables);
+	Key.Fields.emplace_back("ad_selinux", AD.selinux);
+	Key.Fields.emplace_back("ad_root_required", AD.rootRequired);
 	Key.Fields.emplace_back("ad_interval", AD.intervalMs);
 	Key.Fields.emplace_back("ad_threshold", AD.thresholdNs);
 	Key.Fields.emplace_back("ad_response_corrupt", AD.responseCorrupt);

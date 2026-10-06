@@ -76,6 +76,21 @@ TEST(VMPlan, AntiDebugConfigurationSeparatesEngineKeys) {
 		EngineConfigKey::fromConfig(B, 0, 0));
 }
 
+TEST(VMPlan, AndroidAntiDebugOptionsSeparateEngineKeys) {
+	VMPassConfig Base;
+	Base.antiDebugConfig.enabled = true;
+	for (auto Field : {&AntiDebugConfig::debuggerProcess, &AntiDebugConfig::injection,
+		&AntiDebugConfig::debugPorts, &AntiDebugConfig::vpn, &AntiDebugConfig::proxy,
+		&AntiDebugConfig::iptables, &AntiDebugConfig::selinux, &AntiDebugConfig::rootRequired}) {
+		VMPassConfig Changed = Base;
+		Changed.antiDebugConfig.*Field = true;
+		auto A = EngineConfigKey::fromConfig(Base, 0, 0);
+		auto B = EngineConfigKey::fromConfig(Changed, 0, 0);
+		EXPECT_FALSE(A == B);
+		EXPECT_NE(A.stableHash(), B.stableHash());
+	}
+}
+
 TEST(VMPlan, NestedHelperRequirementsAreMergedIntoGroup) {
 	LLVMContext C;
 	Module M("plan", C);
@@ -126,6 +141,32 @@ TEST(AntiDebugConfig, DefaultsAreDisabled) {
 	EXPECT_FALSE(AD.maps);
 	EXPECT_FALSE(AD.integrity);
 	EXPECT_FALSE(AD.dynamic);
+	EXPECT_FALSE(AD.debuggerProcess);
+	EXPECT_FALSE(AD.injection);
+	EXPECT_FALSE(AD.debugPorts);
+	EXPECT_FALSE(AD.vpn);
+	EXPECT_FALSE(AD.proxy);
+	EXPECT_FALSE(AD.iptables);
+	EXPECT_FALSE(AD.selinux);
+	EXPECT_FALSE(AD.rootRequired);
+}
+
+TEST(AntiDebugConfig, AndroidOptionsAreIndependentAndSupportDynamic) {
+	for (StringRef Name : {"debuggerProcess", "injection", "debugPorts", "vpn",
+		"proxy", "iptables", "selinux"}) {
+		auto C = AnnotationParser::parseAnnotationString(
+			("obf: antidebug(" + Name + "=1,dynamic=1,rootRequired=1)").str());
+		auto PC = C.getPassConfig("antidebug");
+		ASSERT_TRUE(PC.has_value());
+		auto AD = AntiDebugConfig::fromPassConfig(*PC);
+		EXPECT_TRUE(AD.enabled);
+		EXPECT_TRUE(AD.rootRequired);
+		EXPECT_TRUE(AD.validate());
+		EXPECT_FALSE(AD.tracerPid);
+		EXPECT_FALSE(AD.ptrace);
+		EXPECT_FALSE(AD.timing);
+		EXPECT_FALSE(AD.maps);
+	}
 }
 
 TEST(AntiDebugConfig, ExplicitZeroWins) {
@@ -681,6 +722,29 @@ define i32 @target(ptr %p, double %d, i64 %n) {
 }
 
 #ifdef OBF_TEST_VM_IMPL
+TEST(VMPlan, DemandOnlyCandidateCanPrecedePreparedCandidate) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString(R"IR(
+define i32 @target(i32 %x) { %r = add i32 %x, 1 ret i32 %r }
+)IR", D, C);
+	ASSERT_NE(M, nullptr);
+	VMPassConfig Config;
+	obf::Rng R(42);
+	auto Impl = std::make_unique<VMImpl>(*M->getFunction("target"), Config, R, 42);
+	ASSERT_TRUE(Impl->prepare()) << Impl->FailReason;
+	Impl->EngineId = VMEngine::makeEngineId(3, 0);
+	unsigned ExpectedId = Impl->EngineId;
+	auto Key = EngineConfigKey::fromConfig(Config, 3, 0);
+	VMPlanCoordinator Coordinator;
+	ASSERT_NE(Coordinator.addCandidate(*M->getFunction("target"), Config, Key,
+		BytecodeEmitter{}, {}), nullptr);
+	ASSERT_NE(Coordinator.addPrepared(std::move(Impl), Config, Key), nullptr);
+	ASSERT_TRUE(Coordinator.freeze());
+	ASSERT_EQ(Coordinator.groupCount(), 1u);
+	EXPECT_EQ(Coordinator.groupPlan(0)->EngineId, ExpectedId);
+}
+
 TEST(VMPreparation, RejectionLeavesOriginalFunctionAndModuleUntouched) {
 	LLVMContext C;
 	SMDiagnostic D;
@@ -694,8 +758,8 @@ b:
   br label %end
 end:
   %p = phi i32 [ %x, %a ], [ 0, %b ]
-  %r = freeze i32 %p
-  ret i32 %r
+  fence seq_cst
+  ret i32 %p
 }
 )IR", D, C);
 	ASSERT_NE(M, nullptr);
@@ -715,5 +779,6 @@ end:
 		EXPECT_EQ(Print(), Before);
 	}
 	EXPECT_EQ(Print(), Before);
+	EXPECT_FALSE(verifyModule(*M));
 }
 #endif

@@ -348,23 +348,39 @@
 /*----------------------------------------------------------------------------
  * antidebug                                              反调试检测
  *   在函数入口执行反调试检测；检测到异常时记录响应状态，并可让函数返回
- *   对应返回类型的零值。dynamic 模式会创建模块级监控线程和响应状态。
+ *   对应返回类型的零值。所有检测器、dynamic、rootRequired 默认均为 0。
+ *   dynamic 按有效配置复用模块内线程和响应状态；不同配置独立，异常锁存。
  *
  *   tracerPid     [0/1]       检测 /proc/self/status 中的 TracerPid
- *   ptrace        [0/1]       执行 ptrace 检测
+ *   ptrace        [0/1]       每线程首次入口执行 PTRACE_TRACEME，复用结果
  *   timing        [0/1]       检测运行时间异常
- *   maps          [0/1]       检查进程 maps 状态
- *   integrity     [0/1]       启用完整性检测入口
+ *   maps          [0/1]       检查 /proc/self/maps 中明确的调试器名称
+ *   integrity     [0/1]       与 vm 组合时启用字节码完整性构造函数
+ *   debuggerProcess [0/1]    枚举 /proc/<pid>/comm 检查工具进程（需 root）
+ *   injection     [0/1]       maps 中 Frida/Xposed/Substrate/Riru/LSPosed 特征
+ *   debugPorts    [0/1]       本机 IPv4 23946/23947/27042，单次等待至多 20 ms
+ *   vpn           [0/1]       /proc/net/dev 中 tun/ppp/pptp/ipsec 加编号接口
+ *   proxy         [0/1]       大小写 http_proxy/https_proxy/all_proxy 环境变量
+ *   iptables      [0/1]       只读 nat/filter/mangle 的 REDIRECT/本机 DNAT（需 root）
+ *   selinux       [0/1]       /sys/fs/selinux/enforce：0 命中，1 正常
+ *   rootRequired  [0/1]       严格权限和读取策略；本身不启用任何检测器
  *   dynamic       [0/1]       启用动态监控线程
- *   interval      [1-...] (1000)  动态检测间隔，单位毫秒
+ *   interval      [50-60000] (1000)  动态检测间隔，单位毫秒
  *   threshold     [1-...] (1000000)  timing 阈值，单位纳秒
  *   responseCorrupt [0/1] (1) 检测到异常时让函数返回安全失败值
  *
- *   dynamic 至少需要启用一个检测器。该 Pass 会根据目标平台能力跳过不支持
- *   Linux proc/pthread ABI 的配置。
+ *   新增七项及 rootRequired 仅对 Android/AArch64 生效。rootRequired=0 跳过
+ *   debuggerProcess/iptables，其余探测读取失败时跳过。rootRequired=1 先检查
+ *   geteuid()==0；权限不足直接触发响应，启用项读取/解析失败也触发响应。
+ *   proxy 不读取 Android 系统代理设置；VPN/工具名/端口均为特征检测。
+ *   dynamic 在入口与后台检测；线程退出用停止标志和 join 回收。ptrace 仅在
+ *   入口执行，integrity 仅在 VM 初始化执行；后台需配合其他轮询检测器使用。
+ *   PTRACE_TRACEME 会改变线程跟踪状态，可能使后续 tracerPid 检测命中父进程。
+ *   responseCorrupt=0 只记录状态；报告 anti_debug 记录请求配置，目标/权限门控
+ *   仍可能跳过检测。完整性检测沿用 VM 的字节码损坏响应。
  *
- *   e.g.  OBF("antidebug(tracerPid=1, ptrace=1, maps=1)")
- *   e.g.  OBF("antidebug(timing=1, interval=250, threshold=900000)")
+ *   e.g.  OBF("antidebug(tracerPid=1, injection=1, dynamic=1, interval=250)")
+ *   e.g.  OBF("antidebug(rootRequired=1, debuggerProcess=1, iptables=1, selinux=1)")
  *--------------------------------------------------------------------------*/
 
 /*----------------------------------------------------------------------------
@@ -434,6 +450,8 @@
  *
  *   antidebug(...) 是独立的显式启用配置：
  *     tracerPid, ptrace, timing, maps, integrity, dynamic（默认均为 0）
+ *     Android/AArch64：debuggerProcess, injection, debugPorts, vpn, proxy,
+ *     iptables, selinux, rootRequired（默认均为 0，权限策略见 antidebug 小节）
  *     interval（1000 ms）、threshold（1000000 ns）、responseCorrupt（1）
  *     dynamic 至少需要一个检测器
  *

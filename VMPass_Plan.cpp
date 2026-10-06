@@ -64,7 +64,11 @@ bool VMPlanCoordinator::freeze() {
 	{
 		std::set<unsigned> Used;
 		for (auto& Group : Groups) {
-			unsigned Base = Group.Candidates.front()->Impl->EngineId;
+			// 仅需求候选没有执行实例；从组内已准备候选取得真实引擎 ID。
+			auto Prepared = llvm::find_if(Group.Candidates,
+				[](const VMPreparedCandidate* C) { return C->Impl != nullptr; });
+			if (Prepared == Group.Candidates.end()) continue;
+			unsigned Base = (*Prepared)->Impl->EngineId;
 			if (Used.insert(Base).second) {
 				Group.Plan.EngineId = Base;
 				continue;

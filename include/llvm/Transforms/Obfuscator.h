@@ -270,12 +270,20 @@ namespace llvm {
 					AntiDebugConfig A = AntiDebugConfig::fromPassConfig(*AD);
 					Report.AntiDebugEnabled = A.enabled;
 					Report.AntiDebugDynamic = A.dynamic;
+					Report.AntiDebugRootRequired = A.rootRequired;
 					Report.AntiDebugResponse = A.responseCorrupt ? "corrupt" : "none";
 					if (A.tracerPid) Report.AntiDebugDetectors.push_back("tracerPid");
 					if (A.ptrace) Report.AntiDebugDetectors.push_back("ptrace");
 					if (A.timing) Report.AntiDebugDetectors.push_back("timing");
 					if (A.maps) Report.AntiDebugDetectors.push_back("maps");
 					if (A.integrity) Report.AntiDebugDetectors.push_back("integrity");
+					if (A.debuggerProcess) Report.AntiDebugDetectors.push_back("debuggerProcess");
+					if (A.injection) Report.AntiDebugDetectors.push_back("injection");
+					if (A.debugPorts) Report.AntiDebugDetectors.push_back("debugPorts");
+					if (A.vpn) Report.AntiDebugDetectors.push_back("vpn");
+					if (A.proxy) Report.AntiDebugDetectors.push_back("proxy");
+					if (A.iptables) Report.AntiDebugDetectors.push_back("iptables");
+					if (A.selinux) Report.AntiDebugDetectors.push_back("selinux");
 				}
 
 				Report.InstsBefore = llvm::obf::countInstructions(F);
