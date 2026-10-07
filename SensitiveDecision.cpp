@@ -64,20 +64,41 @@ namespace {
 		}
 	}
 
-	// A provably function-local, non-escaping alloca: every use is a load,
-	// store, or address computation. Passing the alloca to a call (or
-	// ptrtoint-ing it) makes it escape and disables memory taint.
+	// 递归检查派生地址，并收集所有别名上的 load；store 的值操作数不能是地址本身。
+	bool collectLocalLoads(Value* Ptr, SmallVectorImpl<LoadInst*>& Loads) {
+		SmallPtrSet<Value*, 16> Seen;
+		SmallVector<Value*, 16> Pending{Ptr};
+		while (!Pending.empty()) {
+			Value* P = Pending.pop_back_val();
+			if (!Seen.insert(P).second) continue;
+			for (User* U : P->users()) {
+				if (auto* LI = dyn_cast<LoadInst>(U)) {
+					if (LI->getPointerOperand() != P) return false;
+					Loads.push_back(LI);
+				}
+				else if (auto* SI = dyn_cast<StoreInst>(U)) {
+					if (SI->getPointerOperand() != P || SI->getValueOperand() == P)
+						return false;
+				}
+				else if (auto* GEP = dyn_cast<GetElementPtrInst>(U)) {
+					if (GEP->getPointerOperand() != P) return false;
+					Pending.push_back(GEP);
+				}
+				else if (isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U)) {
+					Pending.push_back(cast<Value>(U));
+				}
+				else return false;
+			}
+		}
+		return true;
+	}
+
 	AllocaInst* getLocalAlloca(Value* Ptr, Function& F) {
 		Value* Obj = stripOffsets(Ptr);
 		auto* AI = dyn_cast<AllocaInst>(Obj);
 		if (!AI || AI->getFunction() != &F) return nullptr;
-		for (const User* U : AI->users()) {
-			if (isa<LoadInst>(U) || isa<StoreInst>(U) ||
-				isa<GetElementPtrInst>(U) || isa<BitCastInst>(U) ||
-				isa<AddrSpaceCastInst>(U))
-				continue;
-			return nullptr;
-		}
+		SmallVector<LoadInst*, 8> Loads;
+		if (!collectLocalLoads(AI, Loads)) return nullptr;
 		return AI;
 	}
 
@@ -183,9 +204,9 @@ bool llvm::validateSensitiveDecision(Function& F, const SensitiveDecisionConfig&
 			process(Worklist.pop_back_val());
 		while (!MemWorklist.empty()) {
 			AllocaInst* AI = MemWorklist.pop_back_val();
-			for (User* U : AI->users())
-				if (auto* LI = dyn_cast<LoadInst>(U))
-					taint(LI);
+			SmallVector<LoadInst*, 8> Loads;
+			collectLocalLoads(AI, Loads);
+			for (LoadInst* LI : Loads) taint(LI);
 		}
 	}
 

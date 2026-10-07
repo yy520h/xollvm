@@ -71,6 +71,14 @@ jobs:
   release:
     name: Draft release
     needs: [build22, build23, build-android22, build-android23]
+    # 显式状态条件允许未选择的依赖 skipped；所选构建必须全部成功。
+    if: >-
+      ${{ !cancelled() &&
+          (inputs.build_llvm22 || inputs.build_llvm23) &&
+          (!inputs.build_llvm22 || needs.build22.result == 'success') &&
+          (!inputs.build_llvm23 || needs.build23.result == 'success') &&
+          (!(inputs.build_android && inputs.build_llvm22) || needs.build-android22.result == 'success') &&
+          (!(inputs.build_android && inputs.build_llvm23) || needs.build-android23.result == 'success') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write

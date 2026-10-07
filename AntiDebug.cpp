@@ -10,6 +10,7 @@
 #include "llvm/Transforms/Obfuscator/ObfuscationAnnotationAnalysis.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationConfig.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 using namespace llvm;
@@ -147,15 +148,6 @@ void createMonitorCtor(Module& M, GlobalVariable* State, Function* Monitor,
 	appendToGlobalCtors(M, Ctor, 65535, nullptr);
 }
 
-GlobalVariable* getOrCreateResponse(Module& M) {
-	LLVMContext& C = M.getContext();
-	if (auto* Existing = M.getGlobalVariable("__obf_antidebug_response", true))
-		return Existing;
-	return new GlobalVariable(M, Type::getInt32Ty(C), false,
-		GlobalValue::InternalLinkage, ConstantInt::get(Type::getInt32Ty(C), 0),
-		"__obf_antidebug_response");
-}
-
 Value* hasToken(IRBuilder<>& B, Value* Buffer, Value* Length, StringRef Token) {
 	Module* M = B.GetInsertBlock()->getModule();
 	LLVMContext& C = M->getContext();
@@ -223,6 +215,15 @@ Value* emitTiming(IRBuilder<>& B, AntiDebugSymbols& S, uint64_t Threshold) {
 
 } // namespace
 
+GlobalVariable* llvm::getOrCreateAntiDebugResponse(Module& M) {
+	LLVMContext& C = M.getContext();
+	if (auto* Existing = M.getGlobalVariable("__obf_antidebug_response", true))
+		return Existing;
+	return new GlobalVariable(M, Type::getInt32Ty(C), false,
+		GlobalValue::InternalLinkage, ConstantInt::get(Type::getInt32Ty(C), 0),
+		"__obf_antidebug_response");
+}
+
 PreservedAnalyses AntiDebugPass::run(Function& F, FunctionAnalysisManager& AM) {
 	if (F.isDeclaration()) return PreservedAnalyses::all();
 	const ObfuscationConfig& OC = getObfConfig(F, AM);
@@ -237,14 +238,27 @@ PreservedAnalyses AntiDebugPass::run(Function& F, FunctionAnalysisManager& AM) {
 		obf::recordObfPassSkip(FOC, "antidebug", "target platform lacks Linux proc/pthread ABI");
 		return PreservedAnalyses::all();
 	}
+	// VM 的暂存副本已经冻结；入口保护必须等正式 wrapper 提交后再插入。
+	if (VMPlanCoordinator::active() && F.getMetadata("obf.vm.caller")) {
+		F.setMetadata("obf.antidebug.deferred", MDNode::get(M.getContext(), {}));
+		return PreservedAnalyses::all();
+	}
+	return applyAntiDebug(F, Cfg) ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}
+
+bool llvm::applyAntiDebug(Function& F, AntiDebugConfig Cfg) {
+	if (F.isDeclaration() || !Cfg.enabled || !Cfg.validate()) return false;
+	Module& M = *F.getParent();
+	if (!supportsProcAntiDebug(M) && (Cfg.tracerPid || Cfg.ptrace || Cfg.maps || Cfg.dynamic))
+		return false;
 	AntiDebugSymbols S = getSymbols(M, Cfg);
 	if (Cfg.dynamic) {
 		GlobalVariable* State = getOrCreateMonitorState(M, Cfg);
-		GlobalVariable* Response = getOrCreateResponse(M);
+		GlobalVariable* Response = getOrCreateAntiDebugResponse(M);
 		Function* Monitor = getOrCreateMonitor(M, Cfg, State, Response, S);
 		createMonitorCtor(M, State, Monitor, S);
 	}
-	GlobalVariable* Response = getOrCreateResponse(M);
+	GlobalVariable* Response = getOrCreateAntiDebugResponse(M);
 	BasicBlock* Entry = &F.getEntryBlock();
 	IRBuilder<> B(&*Entry->getFirstInsertionPt());
 	Value* Detected = B.getFalse();
@@ -256,7 +270,7 @@ PreservedAnalyses AntiDebugPass::run(Function& F, FunctionAnalysisManager& AM) {
 	}
 	if (Cfg.timing) Detected = B.CreateOr(Detected, emitTiming(B, S, Cfg.thresholdNs), "obf.ad.any");
 	B.CreateStore(B.CreateSelect(Detected, B.getInt32(1), B.getInt32(0)), Response)->setVolatile(true);
-	if (!Cfg.responseCorrupt) return PreservedAnalyses::none();
+	if (!Cfg.responseCorrupt) return true;
 	BasicBlock* Body = Entry->splitBasicBlock(B.GetInsertPoint(), "obf.ad.body");
 	Entry->getTerminator()->eraseFromParent();
 	IRBuilder<> Guard(Entry);
@@ -271,5 +285,5 @@ PreservedAnalyses AntiDebugPass::run(Function& F, FunctionAnalysisManager& AM) {
 	else if (RT->isIntegerTy()) FailBuilder.CreateRet(ConstantInt::get(RT, 0));
 	else if (RT->isFloatingPointTy()) FailBuilder.CreateRet(ConstantFP::get(RT, 0.0));
 	else FailBuilder.CreateUnreachable();
-	return PreservedAnalyses::none();
+	return true;
 }

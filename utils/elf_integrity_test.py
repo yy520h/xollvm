@@ -196,3 +196,25 @@ def test_malformed_elf_is_exit_2(sealed):
     bad.write_bytes(b"\x7fELF\x02\x01\x01garbage")
     p = _run(tool, "verify", "--input", str(bad))
     assert p.returncode == 2, p.stderr
+
+
+@pytest.mark.parametrize("field,value", [
+    (8, b"\x01\x01\x00\x00"),
+    (12, b"\x00\x00\x00\x00"),
+    (12, b"\x09\x00\x00\x00"),
+    (16, b"\x00" * 8),
+    (24, b"\x00" * 8),
+    (32, b"\x00" * 8),
+    (40, b"\x01" + b"\x00" * 7),
+])
+def test_manifest_metadata_mutation_fails_verify(sealed, field, value):
+    work, so, tool = sealed
+    out = work / f"metadata-{field}-{value.hex()}.so"
+    result = _run(tool, "seal", "--input", str(so), "--output", str(out))
+    assert result.returncode == 0, result.stderr
+    data = bytearray(out.read_bytes())
+    offset = data.index(b"XOLINT01")
+    data[offset + field:offset + field + len(value)] = value
+    out.write_bytes(data)
+    result = _run(tool, "verify", "--input", str(out))
+    assert result.returncode == 3, result.stderr

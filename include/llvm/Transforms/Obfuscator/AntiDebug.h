@@ -5,6 +5,10 @@
 
 namespace llvm {
 
+class GlobalVariable;
+GlobalVariable* getOrCreateAntiDebugResponse(Module& M);
+bool applyAntiDebug(Function& F, AntiDebugConfig Cfg);
+
 class AntiDebugPass : public PassInfoMixin<AntiDebugPass> {
 public:
 	PreservedAnalyses run(Function& F, FunctionAnalysisManager& AM);

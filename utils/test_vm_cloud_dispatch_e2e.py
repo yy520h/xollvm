@@ -8,7 +8,8 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEMO = Path("/data/user/0/com.termux/files/home/demo/jni/main.cpp")
+PROJECT = ROOT.parents[2] if ROOT.parent.name == ".worktrees" else ROOT.parent
+DEMO = PROJECT / "demo/jni/main.cpp"
 
 
 def _demo_src():

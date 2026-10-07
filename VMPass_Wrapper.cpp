@@ -603,7 +603,7 @@ void VMImpl::buildWrapper() {
 		RetStorage,
 		B.getInt32(static_cast<uint32_t>(WrapRetKind)),
 	};
-	if (AntiDebug.enabled) {
+	if (AntiDebug.enabled && AntiDebug.responseCorrupt) {
 		if (auto* Response = M.getGlobalVariable("__obf_antidebug_response", true)) {
 			Value* Flag = B.CreateLoad(I32Ty, Response, "vm.ad.response");
 			cast<LoadInst>(Flag)->setVolatile(true);

@@ -7,6 +7,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+PROJECT = ROOT.parents[2] if ROOT.parent.name == ".worktrees" else ROOT.parent
 
 
 def _read(rel):
@@ -39,7 +40,7 @@ def test_cloud_dispatch_enters_engine_key():
 
 def test_runtime_offset_zero_means_valid():
     """运行时语义：合法 V 返回 0；窗口推进使旧 V 非 0。"""
-    src = _read("zone_runtime/cloud_value_manager.cpp")
+    src = (PROJECT / "demo/jni/zone_runtime/cloud_value_manager.cpp").read_text()
     assert "VM_DISPATCH_OFFSET_MASK" in src
     assert "getWindowId" in src
     assert "HMAC" not in src or "SHA256" in src  # 手写 HMAC，避免前缀漏改
@@ -61,4 +62,3 @@ def test_dispatch_offset_injection_is_gated_for_non_cloud_parity():
         window = src[max(0, idx - 400):idx]
         assert "if (CloudDispatch)" in window, "dispatch 注入未受 CloudDispatch 守卫"
         idx += 1
-

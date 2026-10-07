@@ -26,6 +26,7 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Verifier.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
+#include "llvm/Transforms/Obfuscator/AntiDebug.h"
 
 #include <functional>
 using namespace llvm;
@@ -362,7 +363,13 @@ bool VMImpl::commit() {
 
 
 	// Build thin wrapper that tail-calls vm_engine
+	if (F.getMetadata("obf.antidebug.deferred"))
+		getOrCreateAntiDebugResponse(M);
 	buildWrapper();
+	if (F.getMetadata("obf.antidebug.deferred")) {
+		applyAntiDebug(F, AntiDebug);
+		F.setMetadata("obf.antidebug.deferred", nullptr);
+	}
 
 	// Split wrapper into phases + insert junk (hardened only)
 	hardenWrapper();

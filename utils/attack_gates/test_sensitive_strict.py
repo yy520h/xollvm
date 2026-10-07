@@ -212,3 +212,74 @@ f2:
 }
 """, SENSITIVE_VM)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_tainted_return_via_derived_alloca_load_fails(tmp_path):
+    _expect_fatal(tmp_path, r"""
+declare i32 @verify(i32)
+define i32 @auth(i32 %x) {
+entry:
+  %slot = alloca [2 x i32]
+  %field = getelementptr [2 x i32], ptr %slot, i64 0, i64 1
+  %alias = getelementptr i32, ptr %field, i64 0
+  %r = call i32 @verify(i32 %x)
+  store i32 %r, ptr %field
+  %ok = icmp eq i32 %r, 1
+  br i1 %ok, label %success, label %fail
+success:
+  %loaded = load i32, ptr %alias
+  ret i32 %loaded
+fail:
+  ret i32 0
+}
+""", SENSITIVE_VM, "escapes through return")
+
+
+@pytest.mark.parametrize("escape", [
+    "call void @sink(ptr %alias)",
+    "store ptr %alias, ptr @escaped",
+    "%address = ptrtoint ptr %alias to i64",
+])
+def test_tainted_alloca_derived_address_escape_fails(tmp_path, escape):
+    _expect_fatal(tmp_path, r"""
+declare i32 @verify(i32)
+declare void @sink(ptr)
+@escaped = global ptr null
+define i32 @auth(i32 %x) {
+entry:
+  %slot = alloca [2 x i32]
+  %field = getelementptr [2 x i32], ptr %slot, i64 0, i64 1
+  %alias = getelementptr i32, ptr %field, i64 0
+  %r = call i32 @verify(i32 %x)
+  store i32 %r, ptr %field
+  """ + escape + r"""
+  %ok = icmp eq i32 %r, 1
+  br i1 %ok, label %success, label %fail
+success:
+  ret i32 1
+fail:
+  ret i32 0
+}
+""", SENSITIVE_VM, "escapes through store")
+
+
+def test_local_derived_load_drives_literal_decision(tmp_path):
+    proc = _compile(tmp_path, r"""
+declare i32 @verify(i32)
+define i32 @auth(i32 %x) {
+entry:
+  %slot = alloca [2 x i32]
+  %field = getelementptr [2 x i32], ptr %slot, i64 0, i64 1
+  %alias = getelementptr i32, ptr %field, i64 0
+  %r = call i32 @verify(i32 %x)
+  store i32 %r, ptr %field
+  %loaded = load i32, ptr %alias
+  %ok = icmp eq i32 %loaded, 1
+  br i1 %ok, label %success, label %fail
+success:
+  ret i32 1
+fail:
+  ret i32 0
+}
+""", SENSITIVE_VM)
+    assert proc.returncode == 0, proc.stdout + proc.stderr

@@ -130,3 +130,29 @@ def test_existing_output_preserved_on_failure(env):
                        capture_output=True, text=True, env=envd, timeout=120)
     assert p.returncode != 0
     assert out.read_bytes() == b"PRECIOUS"
+
+
+@pytest.mark.parametrize("hardener", [None, "/nonexistent/hardener"])
+def test_required_hardener_failure_preserves_output(env, hardener):
+    envd, canned, _real, tmp = env
+    _write_canned_elf(canned, seg_flags=6, zerolen=0)
+    if hardener is None:
+        envd.pop("XOLLVM_ELF_HARDENER", None)
+    else:
+        envd["XOLLVM_ELF_HARDENER"] = hardener
+    out = tmp / "out.so"
+    out.write_bytes(b"PRECIOUS")
+    p = subprocess.run(["bash", str(WRAPPER), "-o", str(out)],
+                       capture_output=True, text=True, env=envd, timeout=60)
+    assert p.returncode != 0
+    assert out.read_bytes() == b"PRECIOUS"
+    assert not (tmp / "out.so.xollvm-unsealed").exists()
+
+
+def test_link_without_output_is_rejected(env):
+    envd, _canned, _real, tmp = env
+    p = subprocess.run(["bash", str(WRAPPER), "input.o"], cwd=tmp,
+                       capture_output=True, text=True, env=envd, timeout=60)
+    assert p.returncode != 0
+    assert "explicit -o" in p.stderr
+    assert not (tmp / "a.out").exists()

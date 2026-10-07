@@ -294,6 +294,10 @@ int main(int argc, char** argv) {
 			errs() << "error: no xollvm integrity manifest found\n";
 			return Malformed;
 		}
+		if (ManOff > Data.size() || kManifestSize > Data.size() - ManOff) {
+			errs() << "error: manifest exceeds file bounds\n";
+			return Malformed;
+		}
 
 		// Reject dynamic relocation targets inside any PF_X PT_LOAD.
 		// Enumerate RELA/REL from section headers.
@@ -386,9 +390,25 @@ int main(int argc, char** argv) {
 				errs() << "error: manifest magic mismatch\n";
 				return PolicyViolation;
 			}
-			if (Data[ManOff + 8] != 1) {
+			const uint8_t* Man = Data.data() + ManOff;
+			if (support::endian::read32le(Man + 8) != 1) {
 				errs() << "error: unsupported manifest version\n";
 				return PolicyViolation;
+			}
+			// manifest 不参与自身哈希，必须独立匹配从 ELF 推导的规范元数据。
+			if (support::endian::read32le(Man + kManifestRangeCountOff) != Ranges.size() ||
+				support::endian::read64le(Man + kManifestVAOff) != ManAddr) {
+				errs() << "error: manifest range count or virtual address mismatch\n";
+				return PolicyViolation;
+			}
+			for (unsigned I = 0; I < kMaxRanges; ++I) {
+				uint64_t VA = I < Ranges.size() ? Ranges[I].Vaddr : 0;
+				uint64_t Size = I < Ranges.size() ? Ranges[I].Size : 0;
+				if (support::endian::read64le(Man + kManifestRangesOff + I * 16) != VA ||
+					support::endian::read64le(Man + kManifestRangesOff + I * 16 + 8) != Size) {
+					errs() << "error: manifest executable range mismatch at slot " << I << "\n";
+					return PolicyViolation;
+				}
 			}
 			ArrayRef<uint8_t> Stored(Data.data() + ManOff + kManifestDigestOff, 32);
 			if (DigestBytes != Stored) {
