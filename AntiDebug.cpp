@@ -26,7 +26,6 @@ struct AntiDebugSymbols {
 	FunctionCallee Open;
 	FunctionCallee Read;
 	FunctionCallee Close;
-	FunctionCallee Ptrace;
 	FunctionCallee Clock;
 	FunctionCallee PthreadCreate;
 	FunctionCallee Sleep;
@@ -44,13 +43,11 @@ AntiDebugSymbols getSymbols(Module& M, const AntiDebugConfig& Cfg) {
 	Type* I64 = Type::getInt64Ty(C);
 	Type* Timespec = StructType::get(C, {I64, I64});
 	AntiDebugSymbols S;
-	if (Cfg.tracerPid || Cfg.maps) {
+	if (Cfg.tracerPid || Cfg.ptrace || Cfg.maps) {
 		S.Open = M.getOrInsertFunction("open", FunctionType::get(I32, {Ptr, I32}, false));
 		S.Read = M.getOrInsertFunction("read", FunctionType::get(I64, {I32, Ptr, I64}, false));
 		S.Close = M.getOrInsertFunction("close", FunctionType::get(I32, {I32}, false));
 	}
-	if (Cfg.ptrace)
-		S.Ptrace = M.getOrInsertFunction("ptrace", FunctionType::get(I64, {I64, I64, Ptr, Ptr}, false));
 	if (Cfg.timing)
 		S.Clock = M.getOrInsertFunction("clock_gettime", FunctionType::get(I32, {I32, PointerType::getUnqual(Timespec)}, false));
 	if (Cfg.dynamic) {
@@ -98,7 +95,7 @@ Function* getOrCreateMonitor(Module& M, AntiDebugConfig& Cfg,
 	B.CreateCondBr(Done, Exit, Check);
 	B.SetInsertPoint(Check);
 	Value* Detected = B.getFalse();
-	if (Cfg.tracerPid)
+	if (Cfg.tracerPid || Cfg.ptrace)
 		Detected = B.CreateOr(Detected, emitTracerPid(B, S, Buffer), "obf.ad.monitor.any");
 	if (Cfg.maps)
 		Detected = B.CreateOr(Detected, emitMaps(B, S), "obf.ad.monitor.any");
@@ -170,14 +167,103 @@ Value* emitTracerPid(IRBuilder<>& B, const AntiDebugSymbols& S) {
 	return emitTracerPid(B, S, Buffer);
 }
 
+Function* getOrCreateTracerParser(Module& M) {
+	if (auto* Existing = M.getFunction("__obf_antidebug_parse_tracer")) return Existing;
+	LLVMContext& C = M.getContext();
+	Function* Fn = Function::Create(FunctionType::get(Type::getInt1Ty(C),
+		{PointerType::getUnqual(C), Type::getInt64Ty(C)}, false),
+		GlobalValue::InternalLinkage, "__obf_antidebug_parse_tracer", &M);
+	Value* Buffer = Fn->getArg(0);
+	Value* Length = Fn->getArg(1);
+	auto Block = [&](const char* Name) { return BasicBlock::Create(C, Name, Fn); };
+	BasicBlock* Entry = Block("entry");
+	BasicBlock* Line = Block("line");
+	BasicBlock* Prefix = Block("prefix");
+	BasicBlock* Skip = Block("skip");
+	BasicBlock* Advance = Block("advance");
+	BasicBlock* Space = Block("space");
+	BasicBlock* SpaceChar = Block("space.char");
+	BasicBlock* SpaceNext = Block("space.next");
+	BasicBlock* Digits = Block("digits");
+	BasicBlock* DigitChar = Block("digit.char");
+	BasicBlock* DigitNext = Block("digit.next");
+	BasicBlock* End = Block("end");
+	BasicBlock* Miss = Block("miss");
+	IRBuilder<> P(Entry);
+	P.CreateBr(Line);
+	P.SetInsertPoint(Line);
+	PHINode* Pos = P.CreatePHI(P.getInt64Ty(), 2, "pos");
+	Pos->addIncoming(P.getInt64(0), Entry);
+	// 每次只从行首匹配，且先检查长度；不依赖缓冲区终止符。
+	P.CreateCondBr(P.CreateICmpUGE(P.CreateSub(Length, Pos), P.getInt64(10)), Prefix, Miss);
+	P.SetInsertPoint(Prefix);
+	Value* Match = P.getTrue();
+	StringRef Field = "TracerPid:";
+	for (unsigned I = 0; I < Field.size(); ++I) {
+		Value* Ch = P.CreateLoad(P.getInt8Ty(), P.CreateGEP(P.getInt8Ty(), Buffer,
+			P.CreateAdd(Pos, P.getInt64(I))));
+		Match = P.CreateAnd(Match, P.CreateICmpEQ(Ch, P.getInt8(Field[I])));
+	}
+	Value* FieldEnd = P.CreateAdd(Pos, P.getInt64(Field.size()));
+	P.CreateCondBr(Match, Space, Skip);
+	P.SetInsertPoint(Skip);
+	PHINode* Scan = P.CreatePHI(P.getInt64Ty(), 2, "scan");
+	Scan->addIncoming(Pos, Prefix);
+	P.CreateCondBr(P.CreateICmpULT(Scan, Length), Advance, Miss);
+	P.SetInsertPoint(Advance);
+	Value* Ch = P.CreateLoad(P.getInt8Ty(), P.CreateGEP(P.getInt8Ty(), Buffer, Scan));
+	Value* Next = P.CreateAdd(Scan, P.getInt64(1));
+	P.CreateCondBr(P.CreateICmpEQ(Ch, P.getInt8('\n')), Line, Skip);
+	Scan->addIncoming(Next, Advance);
+	Pos->addIncoming(Next, Advance);
+	P.SetInsertPoint(Space);
+	PHINode* Cursor = P.CreatePHI(P.getInt64Ty(), 2, "cursor");
+	Cursor->addIncoming(FieldEnd, Prefix);
+	P.CreateCondBr(P.CreateICmpULT(Cursor, Length), SpaceChar, Miss);
+	P.SetInsertPoint(SpaceChar);
+	Ch = P.CreateLoad(P.getInt8Ty(), P.CreateGEP(P.getInt8Ty(), Buffer, Cursor));
+	Value* White = P.CreateOr(P.CreateICmpEQ(Ch, P.getInt8(' ')),
+		P.CreateICmpEQ(Ch, P.getInt8('\t')));
+	P.CreateCondBr(White, SpaceNext, Digits);
+	P.SetInsertPoint(SpaceNext);
+	Next = P.CreateAdd(Cursor, P.getInt64(1));
+	P.CreateBr(Space);
+	Cursor->addIncoming(Next, SpaceNext);
+	P.SetInsertPoint(Digits);
+	PHINode* DigitPos = P.CreatePHI(P.getInt64Ty(), 2, "digit.pos");
+	PHINode* Nonzero = P.CreatePHI(P.getInt1Ty(), 2, "nonzero");
+	DigitPos->addIncoming(Cursor, SpaceChar);
+	Nonzero->addIncoming(P.getFalse(), SpaceChar);
+	P.CreateCondBr(P.CreateICmpULT(DigitPos, Length), DigitChar, End);
+	P.SetInsertPoint(DigitChar);
+	Ch = P.CreateLoad(P.getInt8Ty(), P.CreateGEP(P.getInt8Ty(), Buffer, DigitPos));
+	Value* IsDigit = P.CreateAnd(P.CreateICmpUGE(Ch, P.getInt8('0')),
+		P.CreateICmpULE(Ch, P.getInt8('9')));
+	P.CreateCondBr(IsDigit, DigitNext, End);
+	P.SetInsertPoint(DigitNext);
+	Next = P.CreateAdd(DigitPos, P.getInt64(1));
+	Value* HasNonzero = P.CreateOr(Nonzero, P.CreateICmpNE(Ch, P.getInt8('0')));
+	P.CreateBr(Digits);
+	DigitPos->addIncoming(Next, DigitNext);
+	Nonzero->addIncoming(HasNonzero, DigitNext);
+	P.SetInsertPoint(End);
+	P.CreateRet(Nonzero);
+	P.SetInsertPoint(Miss);
+	P.CreateRet(P.getFalse());
+	return Fn;
+}
+
 Value* emitTracerPid(IRBuilder<>& B, const AntiDebugSymbols& S, AllocaInst* Buffer) {
 	Value* Path = B.CreateGlobalString("/proc/self/status", "obf.ad.status");
 	Value* FD = B.CreateCall(S.Open, {Path, B.getInt32(0)}, "obf.ad.fd");
 	Value* N = B.CreateCall(S.Read, {FD, Buffer, B.getInt64(4095)}, "obf.ad.n");
 	B.CreateCall(S.Close, {FD});
-	Value* Valid = B.CreateICmpSGT(N, B.getInt64(0));
-	Value* Hit = hasToken(B, Buffer, N, "TracerPid: 1");
-	return B.CreateAnd(Valid, Hit, "obf.ad.tracer");
+	// 读取失败按空输入处理，读取长度必须限制在实际缓冲区内。
+	Value* Positive = B.CreateSelect(B.CreateICmpSGT(N, B.getInt64(0)), N, B.getInt64(0));
+	Value* Length = B.CreateSelect(B.CreateICmpUGT(Positive, B.getInt64(4095)),
+		B.getInt64(4095), Positive);
+	return B.CreateCall(getOrCreateTracerParser(*B.GetInsertBlock()->getModule()),
+		{Buffer, Length}, "obf.ad.tracer");
 }
 
 Value* emitMaps(IRBuilder<>& B, const AntiDebugSymbols& S) {
@@ -262,12 +348,10 @@ bool llvm::applyAntiDebug(Function& F, AntiDebugConfig Cfg) {
 	BasicBlock* Entry = &F.getEntryBlock();
 	IRBuilder<> B(&*Entry->getFirstInsertionPt());
 	Value* Detected = B.getFalse();
-	if (Cfg.tracerPid) Detected = B.CreateOr(Detected, emitTracerPid(B, S), "obf.ad.any");
+	// ptrace 配置兼容为只读 tracer 检测，不改变父子进程的跟踪/信号关系。
+	if (Cfg.tracerPid || Cfg.ptrace)
+		Detected = B.CreateOr(Detected, emitTracerPid(B, S), "obf.ad.any");
 	if (Cfg.maps) Detected = B.CreateOr(Detected, emitMaps(B, S), "obf.ad.any");
-	if (Cfg.ptrace) {
-		Value* Result = B.CreateCall(S.Ptrace, {B.getInt64(0), B.getInt64(0), ConstantPointerNull::get(cast<PointerType>(B.getInt8Ty()->getPointerTo())), ConstantPointerNull::get(cast<PointerType>(B.getInt8Ty()->getPointerTo()))}, "obf.ad.ptrace");
-		Detected = B.CreateOr(Detected, B.CreateICmpSLT(Result, B.getInt64(0)), "obf.ad.any");
-	}
 	if (Cfg.timing) Detected = B.CreateOr(Detected, emitTiming(B, S, Cfg.thresholdNs), "obf.ad.any");
 	B.CreateStore(B.CreateSelect(Detected, B.getInt32(1), B.getInt32(0)), Response)->setVolatile(true);
 	if (!Cfg.responseCorrupt) return true;

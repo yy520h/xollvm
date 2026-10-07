@@ -66,8 +66,18 @@ def test_detected_debugger_blocks_business_after_vm_commit(tmp_path, with_vm):
     harness = tmp_path / "harness.c"
     harness.write_text('''
 #include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 static int detected;
-long ptrace(int request, ...) { return detected ? -1 : 0; }
+int __wrap_open(const char *path, int flags, ...) { return 10001; }
+ssize_t __wrap_read(int fd, void *out, size_t len) {
+    const char *status = detected ? "TracerPid: 23456\\n" : "TracerPid: 0\\n";
+    size_t n = strlen(status);
+    if (n > len) n = len;
+    memcpy(out, status, n);
+    return n;
+}
+int __wrap_close(int fd) { return 0; }
 extern int target(int);
 int main(int argc, char **argv) {
     detected = argc > 1;
@@ -78,7 +88,8 @@ int main(int argc, char **argv) {
 ''')
     exe = tmp_path / "test"
     subprocess.run([str(ndk / "bin/clang"), "--target=aarch64-linux-android26",
-                    f"--sysroot={ndk / 'sysroot'}", str(harness), str(obj), "-o", str(exe)],
+                    f"--sysroot={ndk / 'sysroot'}", str(harness), str(obj),
+                    "-Wl,--wrap=open", "-Wl,--wrap=read", "-Wl,--wrap=close", "-o", str(exe)],
                    check=True, capture_output=True, text=True)
     for args, expected in (([], "result=16"), (["detected"], "result=0")):
         run = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=10)
