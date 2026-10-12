@@ -6,7 +6,7 @@
 namespace llvm {
 
 class GlobalVariable;
-GlobalVariable* getOrCreateAntiDebugResponse(Module& M);
+GlobalVariable* getOrCreateAntiDebugResponse(Module& M, const AntiDebugConfig& Cfg);
 bool applyAntiDebug(Function& F, AntiDebugConfig Cfg);
 
 class AntiDebugPass : public PassInfoMixin<AntiDebugPass> {

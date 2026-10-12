@@ -21,6 +21,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
+#include "llvm/Transforms/Obfuscator/AntiDebug.h"
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
 #include "llvm/Transforms/Obfuscator/OpaqueUtils.h"
@@ -604,9 +605,9 @@ void VMImpl::buildWrapper() {
 		B.getInt32(static_cast<uint32_t>(WrapRetKind)),
 	};
 	if (AntiDebug.enabled && AntiDebug.responseCorrupt) {
-		if (auto* Response = M.getGlobalVariable("__obf_antidebug_response", true)) {
+		if (auto* Response = getOrCreateAntiDebugResponse(M, AntiDebug)) {
 			Value* Flag = B.CreateLoad(I32Ty, Response, "vm.ad.response");
-			cast<LoadInst>(Flag)->setVolatile(true);
+			cast<LoadInst>(Flag)->setAtomic(AtomicOrdering::Monotonic);
 			Value* Poisoned = B.CreateXor(B.getInt32(SaltConst), B.getInt32(ADPoisonKey),
 				"vm.ad.salt.poison");
 			Args[VMEngine::kParamSalt] = B.CreateSelect(

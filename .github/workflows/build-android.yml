@@ -101,7 +101,7 @@ jobs:
             -DCLANG_INCLUDE_TESTS=OFF \
             -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
             -DCLANG_ENABLE_ARCMT=OFF \
-            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt;lld;lldb;clang-format" \
+            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt;lld;lldb;clang-format;xollvm-elf-hardener" \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
@@ -127,6 +127,11 @@ jobs:
       - name: 兜底：运行时库 + 头文件一并放进安装树
         shell: bash
         run: |
+          # 交叉编译产物不能在 runner 执行，从生成的 LLVM 配置读取实际版本。
+          MAJOR=$(awk '/^#define LLVM_VERSION_MAJOR / {print $3}' build/include/llvm/Config/llvm-config.h)
+          [ "$MAJOR" = '${{ inputs.llvm_major }}' ] || { echo "LLVM 版本与发布输入不一致"; exit 1; }
+          RESOURCE="install/lib/clang/$MAJOR"
+          [ -d "$RESOURCE/include" ] || { echo "缺少 clang 资源头目录: $RESOURCE"; exit 1; }
           # 1. 按架构分类拷贝 builtins（aarch64 / x86_64 / arm）
           for f in $(find build -name "libclang_rt.builtins*.a"); do
             case "$f" in
@@ -135,8 +140,8 @@ jobs:
               *arm*android*) D=armv7-unknown-linux-androideabi24 ;;
               *) echo "跳过未知架构: $f"; continue ;;
             esac
-            mkdir -p "install/lib/clang/23/lib/$D"
-            cp "$f" "install/lib/clang/23/lib/$D/libclang_rt.builtins.a"
+            mkdir -p "$RESOURCE/lib/$D"
+            cp "$f" "$RESOURCE/lib/$D/libclang_rt.builtins.a"
             echo "builtins($D) <- $f"
           done
 
@@ -148,24 +153,32 @@ jobs:
               *arm*)     D=armv7-unknown-linux-androideabi24 ;;
               *) D=aarch64-unknown-linux-android24 ;;
             esac
-            mkdir -p "install/lib/clang/23/lib/$D"
-            cp "$f" "install/lib/clang/23/lib/$D/libunwind.a"
+            mkdir -p "$RESOURCE/lib/$D"
+            cp "$f" "$RESOURCE/lib/$D/libunwind.a"
             echo "unwind($D) <- $f"
           done
 
           # 3. 头文件
           for h in unwind.h libunwind.h __libunwind_config.h; do
             SRC=$(find build llvm-src/libunwind/include -name "$h" 2>/dev/null | head -n1)
-            if [ -n "$SRC" ]; then cp "$SRC" install/lib/clang/23/include/; echo "头 $h <- $SRC"; fi
+            if [ -n "$SRC" ]; then cp "$SRC" "$RESOURCE/include/"; echo "头 $h <- $SRC"; fi
           done
 
           echo "=== 对账 ==="
-          find install/lib/clang/23/lib -type f
+          find "$RESOURCE/lib" -type f
 
       - name: 验证产物（交叉编译无法本机执行，只验 ELF 身份）
         run: |
-          file install/bin/clang
-          readelf -h install/bin/clang | grep -E "Class|Machine|interpreter" || true
+          for tool in clang opt xollvm-elf-hardener; do
+            exe="install/bin/$tool"
+            [ -x "$exe" ] || { echo "缺少发布工具: $tool"; exit 1; }
+            file "$exe"
+            readelf -h "$exe" | grep -q 'Machine:.*AArch64'
+            readelf -l "$exe" | grep -q '/system/bin/linker64'
+            if readelf -d "$exe" | grep -q 'NEEDED.*libc++_shared'; then
+              echo "工具仍依赖外部 libc++: $tool"; exit 1
+            fi
+          done
           # 期望看到: ELF 64-bit / ARM aarch64 / interpreter /system/bin/linker64
 
       - name: 打包

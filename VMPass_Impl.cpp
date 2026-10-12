@@ -364,7 +364,7 @@ bool VMImpl::commit() {
 
 	// Build thin wrapper that tail-calls vm_engine
 	if (F.getMetadata("obf.antidebug.deferred"))
-		getOrCreateAntiDebugResponse(M);
+		getOrCreateAntiDebugResponse(M, AntiDebug);
 	buildWrapper();
 	if (F.getMetadata("obf.antidebug.deferred")) {
 		applyAntiDebug(F, AntiDebug);

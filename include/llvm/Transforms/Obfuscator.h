@@ -85,7 +85,11 @@ namespace llvm {
 
 	class ObfuscationFunctionDriverPass
 		: public PassInfoMixin<ObfuscationFunctionDriverPass> {
+		unsigned Start = 0;
+		unsigned OriginalInsts = 0;
 	public:
+		explicit ObfuscationFunctionDriverPass(unsigned Start = 0, unsigned Initial = 0)
+			: Start(Start), OriginalInsts(Initial) {}
 		PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
 			if (F.isDeclaration())
 				return PreservedAnalyses::all();
@@ -286,7 +290,7 @@ namespace llvm {
 				ReportDir = llvm::obf::getReportDir();
 				FnSafe = llvm::obf::sanitizePathComponent(F.getName());
 
-				if (!ReportDir.empty()) {
+				if (!ReportDir.empty() && Start == 0) {
 					SmallString<256> Rel;
 					sys::path::append(Rel, "cfg");
 					sys::path::append(Rel, FnSafe);
@@ -307,7 +311,7 @@ namespace llvm {
 			}
 
 			// Seed manifest (existing behavior).
-			if (llvm::ObfSeedManifest || llvm::ObfSeedManifestMD) {
+			if (Start == 0 && (llvm::ObfSeedManifest || llvm::ObfSeedManifestMD)) {
 				auto Enabled = Cfg.getEnabledPasses();
 				auto Ordered = ObfuscationPipeline::getRecommendedOrder(Enabled);
 
@@ -326,7 +330,7 @@ namespace llvm {
 			// ================================================================
 			// Budget-aware per-pass execution
 			// ================================================================
-			unsigned InitialInsts = llvm::obf::countInstructions(F);
+			unsigned InitialInsts = OriginalInsts ? OriginalInsts : llvm::obf::countInstructions(F);
 			llvm::obf::IRBudget Budget = llvm::obf::IRBudget::fromConfig(
 				InitialInsts, Cfg.budgetMultiplier, Cfg.budgetHardCap);
 
@@ -354,7 +358,7 @@ namespace llvm {
 			bool AnyChanged = false;
 			uint64_t FnSeed = Cache.getFunctionSeed(F);
 
-			for (size_t Idx = 0; Idx < Entries.size(); ++Idx) {
+			for (size_t Idx = Start; Idx < Entries.size(); ++Idx) {
 				const auto& Entry = Entries[Idx];
 
 				// --- Budget gate: skip if exhausted ---
@@ -397,7 +401,8 @@ namespace llvm {
 				// byte-identical output for every default (no-budget-knobs)
 				// run is preserved.
 				Function* Snap = nullptr;
-				if (Budget.isEnabled() && Cfg.budgetHardCap > 0)
+				unsigned HardCap = Cfg.budgetHardCap ? Cfg.budgetHardCap : (unsigned)ObfIRBudgetMax;
+				if (Budget.isEnabled() && HardCap > 0)
 					Snap = snapshotFunction(F);
 
 				// --- Run the pass ---
@@ -412,7 +417,7 @@ namespace llvm {
 				// --- Transactional rollback: pass blew past the hard cap ---
 				if (Snap) {
 					unsigned PostRunInsts = llvm::obf::countInstructions(F);
-					if (PostRunInsts > Cfg.budgetHardCap) {
+					if (PostRunInsts > HardCap) {
 						restoreFunctionSnapshot(F, Snap);
 						Snap->eraseFromParent();
 						Snap = nullptr;
@@ -422,7 +427,7 @@ namespace llvm {
 
 						if (ObfVerbose)
 							errs() << "[budget] " << F.getName() << ": ROLLBACK '" << Entry.Name
-								<< "' (" << PostRunInsts << " > cap " << Cfg.budgetHardCap
+								<< "' (" << PostRunInsts << " > cap " << HardCap
 								<< "), skipping its changes\n";
 
 						if (llvm::ObfNoSkips) {
@@ -473,6 +478,16 @@ namespace llvm {
 				// --- Record post-pass instruction count ---
 				unsigned AfterInsts = llvm::obf::countInstructions(F);
 				Budget.recordPassEnd(AfterInsts, Changed);
+
+				// VM 仅完成 prepare；后置变换必须等模块提交正式 wrapper 后执行。
+				if (Entry.Name == "vm" && VMPlanCoordinator::active() &&
+					F.getMetadata("obf.vm.caller")) {
+					auto& C = F.getContext();
+					F.setMetadata("obf.vm.resume", MDNode::get(C, {
+						ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(C), Idx + 1)),
+						ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(C), InitialInsts))}));
+					break;
+				}
 
 				// --- Optional per-pass CFG snapshot (diff-colored vs previous stage) ---
 				if (Reporting && Sink && !ReportDir.empty()) {
@@ -663,7 +678,7 @@ namespace llvm {
 
 			VMPlanCoordinator Coordinator;
 			VMPlanCoordinator* PreviousCoordinator = VMPlanCoordinator::setActive(&Coordinator);
-			PreservedAnalyses PA = MPM.run(M, MAM);
+			MPM.run(M, MAM);
 			VMPlanCoordinator::setActive(PreviousCoordinator);
 			// Task 4: a strict sensitive candidate that never prepared must fail
 			// the build before commit, not silently vanish.
@@ -671,6 +686,22 @@ namespace llvm {
 			if (!Coordinator.freeze() || !Coordinator.commit())
 				return PreservedAnalyses::none();
 			Coordinator.verifySensitiveCommits();
+			// 只遍历原候选，不重新驱动引擎和生成的 helper。
+			auto& FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+			SmallVector<Function*, 8> Resume;
+			for (Function& F : M)
+				if (F.getMetadata("obf.vm.resume")) Resume.push_back(&F);
+			for (Function* F : Resume) {
+				auto* MD = F->getMetadata("obf.vm.resume");
+				unsigned Next = cast<ConstantInt>(cast<ConstantAsMetadata>(MD->getOperand(0))->getValue())->getZExtValue();
+				unsigned Initial = cast<ConstantInt>(cast<ConstantAsMetadata>(MD->getOperand(1))->getValue())->getZExtValue();
+				F->setMetadata("obf.vm.resume", nullptr);
+				FAM.invalidate(*F, PreservedAnalyses::none());
+				ObfuscationFunctionDriverPass(Next, Initial).run(*F, FAM);
+				FAM.invalidate(*F, PreservedAnalyses::none());
+			}
+			if (llvm::obf::isReportEnabled())
+				Coordinator.finalizeReports(MAM.getResult<ObfReportAnalysis>(M));
 			// Task 5: post-commit structural proof over the final module.
 			if (!verifyCommittedSensitiveRegions(M, errs()))
 				report_fatal_error(
@@ -682,6 +713,7 @@ namespace llvm {
 				ModuleAnalysisManager& MAMRef = MAM;
 				ElfIntegrityPass().run(M, MAMRef);
 			}
+			llvm::obf::ObfVerifyModulePass("post-commit-final").run(M, MAM);
 
 			// Emit JSON report at end of module pipeline (if configured).
 			if (llvm::obf::isReportEnabled()) {
@@ -693,7 +725,7 @@ namespace llvm {
 					errs() << "[obf] graph: " << toString(std::move(E)) << "\n";
 			}
 
-			return PA;
+			return PreservedAnalyses::none();
 		}
 
 		static bool isRequired() { return true; }

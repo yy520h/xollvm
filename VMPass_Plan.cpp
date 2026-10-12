@@ -1,6 +1,9 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
+#include "llvm/Transforms/Obfuscator/IRBudget.h"
+#include "llvm/Transforms/Obfuscator/ObfReport.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/Function.h"
@@ -164,7 +167,11 @@ bool VMPlanCoordinator::commit() {
 			Candidate->Impl->setFullHandlerRequirements();
 		else
 			Candidate->Impl->setHandlerRequirements(Plan->Requirements);
+		ValueToValueMapTy Map;
+		Function* Snapshot = CloneFunction(Candidate->Fn, Map);
+		Snapshot->setLinkage(GlobalValue::InternalLinkage);
 		if (!Candidate->Impl->commit()) {
+			Snapshot->eraseFromParent();
 			if (Candidate->Required && Candidate->SensitiveStrict)
 				report_fatal_error(Twine("obfuscator: sensitive region '") +
 					Candidate->Region + "': VM commit failed for '" +
@@ -174,6 +181,33 @@ bool VMPlanCoordinator::commit() {
 					/*gen_crash_diag=*/false);
 			return false;
 		}
+		// prepare 不增长原函数；硬预算必须在正式 wrapper 生成后检查。
+		auto Cfg = AnnotationParser::parseAnnotations(Candidate->Fn);
+		unsigned Cap = Cfg.budgetHardCap ? Cfg.budgetHardCap : (unsigned)ObfIRBudgetMax;
+		auto Budget = obf::IRBudget::fromConfig(obf::countInstructions(*Snapshot),
+			Cfg.budgetMultiplier, Cfg.budgetHardCap);
+		if (Budget.isEnabled() && Cap && obf::countInstructions(*Candidate->Fn) > Cap) {
+			if ((Candidate->Required && Candidate->SensitiveStrict) || ObfNoSkips)
+				report_fatal_error("obfuscator: VM wrapper exceeds hard IR budget", false);
+			Function& F = *Candidate->Fn;
+			auto Linkage = F.getLinkage();
+			auto Attrs = Snapshot->getAttributes();
+			F.deleteBody();
+			F.setLinkage(Linkage);
+			ValueToValueMapTy Back;
+			for (Argument& A : F.args()) Back[Snapshot->getArg(A.getArgNo())] = &A;
+			SmallVector<ReturnInst*, 8> Returns;
+			CloneFunctionInto(&F, Snapshot, Back, CloneFunctionChangeType::LocalChangesOnly, Returns);
+			F.setAttributes(Attrs);
+			F.setMetadata("obf.vm.caller", nullptr);
+			F.setMetadata("obf.antidebug.deferred", nullptr);
+			Candidate->Accepted = false;
+			Candidate->SkipReason = "budget_rollback";
+			Candidate->Impl->Committed = false;
+		}
+		Snapshot->eraseFromParent();
+		Candidate->CommittedInsts = obf::countInstructions(*Candidate->Fn);
+		if (!Candidate->Accepted) continue;
 		// Post-commit proof: the wrapper body now exists and carries a sensitive
 		// region marker so post-validation can require it.
 		Function* Committed = Candidate->Impl->F.getParent()
@@ -185,6 +219,27 @@ bool VMPlanCoordinator::commit() {
 		}
 	}
 	return true;
+}
+
+void VMPlanCoordinator::finalizeReports(obf::ObfReportSink& Sink) const {
+	for (const auto& Candidate : Candidates) {
+		if (!Candidate->Impl) continue;
+		for (auto& R : Sink.Functions) {
+			if (R.Name != Candidate->Fn->getName()) continue;
+			obf::DifficultyComponents Before;
+			Before.Cyclomatic = R.Difficulty.CyclomaticBefore;
+			R.Difficulty = obf::scoreDifficulty(Before, obf::computeDifficultyComponents(*Candidate->Fn));
+			for (auto& P : R.Passes) {
+				if (P.Id != "vm") continue;
+				P.Skipped = !Candidate->Accepted;
+				P.SkipReason = Candidate->SkipReason;
+				P.Changed = Candidate->Impl->Committed;
+				P.InstsAfter = Candidate->CommittedInsts;
+				P.BudgetUtilAfter = R.BudgetEnabled && R.BudgetLimit
+					? static_cast<double>(P.InstsAfter) / R.BudgetLimit : 0;
+			}
+		}
+	}
 }
 
 bool VMPlanCoordinator::verifyRequiredCandidates() const {

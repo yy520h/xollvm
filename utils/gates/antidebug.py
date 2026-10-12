@@ -36,13 +36,13 @@ def antidebug_tracer_symbols(ir: str) -> Optional[str]:
 def antidebug_dynamic_singleton(ir: str) -> Optional[str]:
     checks = {
         "state": ir.count("__obf_antidebug_monitor_state"),
-        "monitor": ir.count("@__obf_antidebug_monitor("),
-        "ctor": ir.count("@__obf_antidebug_monitor_ctor("),
+        "monitor": len(re.findall(r"define internal ptr @__obf_antidebug_monitor(?:\.[\d.]+)?\(", ir)),
+        "ctor": len(re.findall(r"define internal void @__obf_antidebug_monitor(?:_ctor|\.[\d.]+_ctor)\(", ir)),
         "pthread": ir.count("call i32 @pthread_create"),
     }
     bad = {key: value for key, value in checks.items() if value < 1}
     if bad:
         return f"dynamic monitor artifacts missing: {bad}"
-    if checks["state"] > 8 or checks["pthread"] != 1:
+    if checks["monitor"] != 1 or checks["ctor"] != 1 or checks["pthread"] != 1:
         return f"dynamic monitor artifacts duplicated: {checks}"
     return None

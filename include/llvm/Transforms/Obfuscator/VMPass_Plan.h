@@ -12,6 +12,8 @@
 
 namespace llvm {
 
+namespace obf { struct ObfReportSink; }
+
 struct VMImpl;
 
 struct VMPreparedCandidate {
@@ -24,6 +26,7 @@ struct VMPreparedCandidate {
 	std::unique_ptr<VMImpl> Impl;
 	std::string SkipReason;
 	bool Accepted = false;
+	unsigned CommittedInsts = 0;
 
 	// Sensitive-decision metadata (Task 4). A required candidate was named by
 	// a `sensitive(strict=1)` region and must not silently vanish.
@@ -52,6 +55,7 @@ public:
 	VMPreparedCandidate* addPrepared(std::unique_ptr<VMImpl> Impl,
 		const VMPassConfig& Config, const EngineConfigKey& Key);
 	bool commit();
+	void finalizeReports(obf::ObfReportSink& Sink) const;
 	static VMPlanCoordinator* active();
 	static VMPlanCoordinator* setActive(VMPlanCoordinator* Coordinator);
 	unsigned candidateCount() const { return Candidates.size(); }

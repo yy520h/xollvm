@@ -128,7 +128,7 @@ jobs:
             -DCLANG_INCLUDE_TESTS=OFF ^
             -DCLANG_ENABLE_STATIC_ANALYZER=OFF ^
             -DCLANG_ENABLE_ARCMT=OFF ^
-            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt" ^
+            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt;xollvm-elf-hardener" ^
             -DLLVM_ENABLE_ASSERTIONS=OFF ^
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ^
             -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
@@ -160,7 +160,7 @@ jobs:
             -DCLANG_INCLUDE_TESTS=OFF \
             -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
             -DCLANG_ENABLE_ARCMT=OFF \
-            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt" \
+            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt;xollvm-elf-hardener" \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
@@ -221,6 +221,16 @@ jobs:
           EOF
           "$CLANG" -O2 -mllvm -enable-obfuscation -emit-llvm -S plain.c -o plain_ep.ll
           "$OPT" -passes=verify plain_ep.ll -disable-output
+
+      - name: 验证发布工具完整性
+        shell: bash
+        run: |
+          for tool in clang opt xollvm-elf-hardener; do
+            exe="install/bin/$tool"
+            [ -x "$exe.exe" ] && exe="$exe.exe"
+            [ -x "$exe" ] || { echo "缺少发布工具: $tool"; exit 1; }
+            "$exe" --help >/dev/null
+          done
 
       # ---------- 打包 ----------
       - name: 打包（Linux）

@@ -22,12 +22,20 @@ static bool supportsProcAntiDebug(const Module& M) {
 
 namespace {
 
+std::string configSuffix(const AntiDebugConfig& Cfg) {
+	return "." + std::to_string(Cfg.tracerPid || Cfg.ptrace) +
+		std::to_string(Cfg.maps) + std::to_string(Cfg.timing) +
+		std::to_string(Cfg.dynamic) + "." + std::to_string(Cfg.dynamic ? Cfg.intervalMs : 0) +
+		"." + std::to_string(Cfg.timing ? Cfg.thresholdNs : 0);
+}
+
 struct AntiDebugSymbols {
 	FunctionCallee Open;
 	FunctionCallee Read;
 	FunctionCallee Close;
 	FunctionCallee Clock;
 	FunctionCallee PthreadCreate;
+	FunctionCallee PthreadJoin;
 	FunctionCallee Sleep;
 };
 
@@ -53,32 +61,36 @@ AntiDebugSymbols getSymbols(Module& M, const AntiDebugConfig& Cfg) {
 	if (Cfg.dynamic) {
 		S.PthreadCreate = M.getOrInsertFunction("pthread_create",
 			FunctionType::get(I32, {Ptr, Ptr, Ptr, Ptr}, false));
+		S.PthreadJoin = M.getOrInsertFunction("pthread_join",
+			FunctionType::get(I32, {M.getDataLayout().getIntPtrType(C), Ptr}, false));
 		S.Sleep = M.getOrInsertFunction("usleep", FunctionType::get(I32, {I32}, false));
 	}
 	return S;
 }
 
 GlobalVariable* getOrCreateMonitorState(Module& M, const AntiDebugConfig& Cfg) {
-	if (auto* Existing = M.getGlobalVariable("__obf_antidebug_monitor_state", true))
+	std::string Name = "__obf_antidebug_monitor_state" + configSuffix(Cfg);
+	if (auto* Existing = M.getGlobalVariable(Name, true))
 		return Existing;
 	LLVMContext& C = M.getContext();
 	Type* I32 = Type::getInt32Ty(C);
 	ArrayType* StateTy = ArrayType::get(I32, 4);
 	Constant* Init = ConstantArray::get(StateTy, {
 		ConstantInt::get(I32, 0), ConstantInt::get(I32, 0),
-		ConstantInt::get(I32, 0), ConstantInt::get(I32, Cfg.intervalMs * 1000u)});
+		ConstantInt::get(I32, 0), ConstantInt::get(I32, Cfg.intervalMs)});
 	return new GlobalVariable(M, StateTy, false, GlobalValue::InternalLinkage,
-		Init, "__obf_antidebug_monitor_state");
+		Init, Name);
 }
 
 Function* getOrCreateMonitor(Module& M, AntiDebugConfig& Cfg,
 	GlobalVariable* State, GlobalVariable* Response, AntiDebugSymbols& S) {
-	if (auto* Existing = M.getFunction("__obf_antidebug_monitor")) return Existing;
+	std::string Name = "__obf_antidebug_monitor" + configSuffix(Cfg);
+	if (auto* Existing = M.getFunction(Name)) return Existing;
 	LLVMContext& C = M.getContext();
 	Type* Ptr = PointerType::getUnqual(C);
 	FunctionType* FT = FunctionType::get(Ptr, {Ptr}, false);
 	Function* Fn = Function::Create(FT, GlobalValue::InternalLinkage,
-		"__obf_antidebug_monitor", &M);
+		Name, &M);
 	BasicBlock* Entry = BasicBlock::Create(C, "obf.ad.monitor.entry", Fn);
 	BasicBlock* Loop = BasicBlock::Create(C, "obf.ad.monitor.loop", Fn);
 	BasicBlock* Exit = BasicBlock::Create(C, "obf.ad.monitor.exit", Fn);
@@ -101,29 +113,42 @@ Function* getOrCreateMonitor(Module& M, AntiDebugConfig& Cfg,
 		Detected = B.CreateOr(Detected, emitMaps(B, S), "obf.ad.monitor.any");
 	if (Cfg.timing)
 		Detected = B.CreateOr(Detected, emitTiming(B, S, Cfg.thresholdNs), "obf.ad.monitor.any");
-	Value* ResponsePtr = B.CreateGEP(State->getValueType(), State,
-		{B.getInt32(0), B.getInt32(1)});
-	cast<StoreInst>(B.CreateStore(B.CreateSelect(Detected, B.getInt32(1), B.getInt32(0)), ResponsePtr))
-		->setAtomic(AtomicOrdering::Monotonic);
-	cast<StoreInst>(B.CreateStore(B.CreateSelect(Detected, B.getInt32(1), B.getInt32(0)), Response))
-		->setAtomic(AtomicOrdering::Monotonic);
+	B.CreateAtomicRMW(AtomicRMWInst::Or, Response,
+		B.CreateZExt(Detected, B.getInt32Ty()), MaybeAlign(4), AtomicOrdering::Monotonic);
 	Value* IntervalPtr = B.CreateGEP(State->getValueType(), State,
 		{B.getInt32(0), B.getInt32(3)});
-	B.CreateCall(S.Sleep, {B.CreateLoad(Type::getInt32Ty(C), IntervalPtr)});
-	B.CreateBr(Loop);
+	Value* Interval = B.CreateLoad(B.getInt32Ty(), IntervalPtr);
+	BasicBlock* Wait = BasicBlock::Create(C, "obf.ad.monitor.wait", Fn);
+	BasicBlock* Sleep = BasicBlock::Create(C, "obf.ad.monitor.sleep", Fn);
+	B.CreateBr(Wait);
+	B.SetInsertPoint(Wait);
+	PHINode* Remaining = B.CreatePHI(B.getInt32Ty(), 2, "remaining.ms");
+	Remaining->addIncoming(Interval, Check);
+	auto* WaitingStop = B.CreateLoad(B.getInt32Ty(), StopPtr);
+	WaitingStop->setAtomic(AtomicOrdering::Monotonic);
+	B.CreateCondBr(B.CreateICmpNE(WaitingStop, B.getInt32(0)), Exit, Sleep);
+	B.SetInsertPoint(Sleep);
+	// 分段休眠使正常退出不受用户配置的长轮询间隔阻塞。
+	Value* Chunk = B.CreateSelect(B.CreateICmpUGT(Remaining, B.getInt32(10)),
+		B.getInt32(10), Remaining);
+	B.CreateCall(S.Sleep, {B.CreateMul(Chunk, B.getInt32(1000))});
+	Value* Rest = B.CreateSub(Remaining, Chunk);
+	Remaining->addIncoming(Rest, Sleep);
+	B.CreateCondBr(B.CreateICmpEQ(Rest, B.getInt32(0)), Loop, Wait);
 	B.SetInsertPoint(Exit);
 	B.CreateRet(ConstantPointerNull::get(cast<PointerType>(Ptr)));
 	return Fn;
 }
 
 void createMonitorCtor(Module& M, GlobalVariable* State, Function* Monitor,
-	AntiDebugSymbols& S) {
-	if (M.getFunction("__obf_antidebug_monitor_ctor")) return;
+	GlobalVariable* Response, AntiDebugSymbols& S) {
+	std::string Name = Monitor->getName().str() + "_ctor";
+	if (M.getFunction(Name)) return;
 	LLVMContext& C = M.getContext();
 	Type* I32 = Type::getInt32Ty(C);
 	Type* Ptr = PointerType::getUnqual(C);
 	Function* Ctor = Function::Create(FunctionType::get(Type::getVoidTy(C), false),
-		GlobalValue::InternalLinkage, "__obf_antidebug_monitor_ctor", &M);
+		GlobalValue::InternalLinkage, Name, &M);
 	BasicBlock* Entry = BasicBlock::Create(C, "obf.ad.ctor.entry", Ctor);
 	IRBuilder<> B(Entry);
 	Value* StartedPtr = B.CreateGEP(State->getValueType(), State,
@@ -135,14 +160,40 @@ void createMonitorCtor(Module& M, GlobalVariable* State, Function* Monitor,
 	BasicBlock* Exit = BasicBlock::Create(C, "obf.ad.ctor.exit", Ctor);
 	B.CreateCondBr(B.CreateICmpEQ(Started, B.getInt32(0)), Start, Exit);
 	B.SetInsertPoint(Start);
-	cast<StoreInst>(B.CreateStore(B.getInt32(1), StartedPtr))->setAtomic(AtomicOrdering::Monotonic);
-	AllocaInst* Thread = B.CreateAlloca(Type::getInt64Ty(C), nullptr, "obf.ad.thread");
-	B.CreateCall(S.PthreadCreate, {Thread,
+	Type* ThreadTy = M.getDataLayout().getIntPtrType(C);
+	auto* Thread = new GlobalVariable(M, ThreadTy, false, GlobalValue::InternalLinkage,
+		ConstantInt::get(ThreadTy, 0), Monitor->getName() + ".thread");
+	Value* Rc = B.CreateCall(S.PthreadCreate, {Thread,
 		ConstantPointerNull::get(cast<PointerType>(Ptr)), Monitor, State});
+	Value* Ok = B.CreateICmpEQ(Rc, B.getInt32(0));
+	cast<StoreInst>(B.CreateStore(B.CreateZExt(Ok, I32), StartedPtr))->setAtomic(AtomicOrdering::Monotonic);
+	// 监控启动失败不能悄悄降级为成功状态。
+	B.CreateAtomicRMW(AtomicRMWInst::Or, Response, B.CreateZExt(B.CreateNot(Ok), I32),
+		MaybeAlign(4), AtomicOrdering::Monotonic);
 	B.CreateBr(Exit);
 	B.SetInsertPoint(Exit);
 	B.CreateRetVoid();
 	appendToGlobalCtors(M, Ctor, 65535, nullptr);
+	Function* Dtor = Function::Create(FunctionType::get(B.getVoidTy(), false),
+		GlobalValue::InternalLinkage, Monitor->getName() + "_dtor", &M);
+	BasicBlock* Stop = BasicBlock::Create(C, "stop", Dtor);
+	BasicBlock* Join = BasicBlock::Create(C, "join", Dtor);
+	BasicBlock* Done = BasicBlock::Create(C, "done", Dtor);
+	B.SetInsertPoint(Stop);
+	StartedPtr = B.CreateGEP(State->getValueType(), State, {B.getInt32(0), B.getInt32(2)});
+	Value* StopPtr = B.CreateGEP(State->getValueType(), State, {B.getInt32(0), B.getInt32(0)});
+	cast<StoreInst>(B.CreateStore(B.getInt32(1), StopPtr))->setAtomic(AtomicOrdering::Monotonic);
+	auto* HasThread = B.CreateLoad(I32, StartedPtr);
+	HasThread->setAtomic(AtomicOrdering::Monotonic);
+	B.CreateCondBr(B.CreateICmpNE(HasThread, B.getInt32(0)), Join, Done);
+	B.SetInsertPoint(Join);
+	B.CreateCall(S.PthreadJoin, {B.CreateLoad(ThreadTy, Thread),
+		ConstantPointerNull::get(cast<PointerType>(Ptr))});
+	cast<StoreInst>(B.CreateStore(B.getInt32(0), StartedPtr))->setAtomic(AtomicOrdering::Monotonic);
+	B.CreateBr(Done);
+	B.SetInsertPoint(Done);
+	B.CreateRetVoid();
+	appendToGlobalDtors(M, Dtor, 65535, nullptr);
 }
 
 Value* hasToken(IRBuilder<>& B, Value* Buffer, Value* Length, StringRef Token) {
@@ -301,13 +352,14 @@ Value* emitTiming(IRBuilder<>& B, AntiDebugSymbols& S, uint64_t Threshold) {
 
 } // namespace
 
-GlobalVariable* llvm::getOrCreateAntiDebugResponse(Module& M) {
+GlobalVariable* llvm::getOrCreateAntiDebugResponse(Module& M, const AntiDebugConfig& Cfg) {
 	LLVMContext& C = M.getContext();
-	if (auto* Existing = M.getGlobalVariable("__obf_antidebug_response", true))
+	std::string Name = "__obf_antidebug_response" + configSuffix(Cfg);
+	if (auto* Existing = M.getGlobalVariable(Name, true))
 		return Existing;
 	return new GlobalVariable(M, Type::getInt32Ty(C), false,
 		GlobalValue::InternalLinkage, ConstantInt::get(Type::getInt32Ty(C), 0),
-		"__obf_antidebug_response");
+		Name);
 }
 
 PreservedAnalyses AntiDebugPass::run(Function& F, FunctionAnalysisManager& AM) {
@@ -338,13 +390,12 @@ bool llvm::applyAntiDebug(Function& F, AntiDebugConfig Cfg) {
 	if (!supportsProcAntiDebug(M) && (Cfg.tracerPid || Cfg.ptrace || Cfg.maps || Cfg.dynamic))
 		return false;
 	AntiDebugSymbols S = getSymbols(M, Cfg);
+	GlobalVariable* Response = getOrCreateAntiDebugResponse(M, Cfg);
 	if (Cfg.dynamic) {
 		GlobalVariable* State = getOrCreateMonitorState(M, Cfg);
-		GlobalVariable* Response = getOrCreateAntiDebugResponse(M);
 		Function* Monitor = getOrCreateMonitor(M, Cfg, State, Response, S);
-		createMonitorCtor(M, State, Monitor, S);
+		createMonitorCtor(M, State, Monitor, Response, S);
 	}
-	GlobalVariable* Response = getOrCreateAntiDebugResponse(M);
 	BasicBlock* Entry = &F.getEntryBlock();
 	IRBuilder<> B(&*Entry->getFirstInsertionPt());
 	Value* Detected = B.getFalse();
@@ -353,13 +404,14 @@ bool llvm::applyAntiDebug(Function& F, AntiDebugConfig Cfg) {
 		Detected = B.CreateOr(Detected, emitTracerPid(B, S), "obf.ad.any");
 	if (Cfg.maps) Detected = B.CreateOr(Detected, emitMaps(B, S), "obf.ad.any");
 	if (Cfg.timing) Detected = B.CreateOr(Detected, emitTiming(B, S, Cfg.thresholdNs), "obf.ad.any");
-	B.CreateStore(B.CreateSelect(Detected, B.getInt32(1), B.getInt32(0)), Response)->setVolatile(true);
+	B.CreateAtomicRMW(AtomicRMWInst::Or, Response, B.CreateZExt(Detected, B.getInt32Ty()),
+		MaybeAlign(4), AtomicOrdering::Monotonic);
 	if (!Cfg.responseCorrupt) return true;
 	BasicBlock* Body = Entry->splitBasicBlock(B.GetInsertPoint(), "obf.ad.body");
 	Entry->getTerminator()->eraseFromParent();
 	IRBuilder<> Guard(Entry);
 	Value* Flag = Guard.CreateLoad(Type::getInt32Ty(M.getContext()), Response, "obf.ad.response");
-	cast<LoadInst>(Flag)->setVolatile(true);
+	cast<LoadInst>(Flag)->setAtomic(AtomicOrdering::Monotonic);
 	BasicBlock* Fail = BasicBlock::Create(M.getContext(), "obf.ad.fail", &F, Body);
 	Guard.CreateCondBr(Guard.CreateICmpNE(Flag, Guard.getInt32(0)), Fail, Body);
 	IRBuilder<> FailBuilder(Fail);

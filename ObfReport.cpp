@@ -33,7 +33,27 @@ using namespace llvm;
 
 namespace llvm::obf {
 
-	void ObfReportSink::add(FunctionReport&& R) { Functions.push_back(std::move(R)); }
+	void ObfReportSink::add(FunctionReport&& R) {
+		// VM 的准备与提交后阶段属于同一函数报告。
+		for (auto& Existing : Functions) {
+			if (Existing.Name != R.Name) continue;
+			Existing.Passes.insert(Existing.Passes.end(),
+				std::make_move_iterator(R.Passes.begin()), std::make_move_iterator(R.Passes.end()));
+			Existing.CfgPerPass.insert(Existing.CfgPerPass.end(),
+				std::make_move_iterator(R.CfgPerPass.begin()), std::make_move_iterator(R.CfgPerPass.end()));
+			Existing.InstsAfter = R.InstsAfter;
+			Existing.BudgetRemaining = R.BudgetRemaining;
+			Existing.BudgetUtilization = R.BudgetUtilization;
+			R.Difficulty.CyclomaticBefore = Existing.Difficulty.CyclomaticBefore;
+			R.Difficulty.CyclomaticDelta = static_cast<int64_t>(R.Difficulty.CyclomaticAfter)
+				- R.Difficulty.CyclomaticBefore;
+			Existing.Difficulty = R.Difficulty;
+			Existing.CfgAfterDot = std::move(R.CfgAfterDot);
+			Existing.VM = std::move(R.VM);
+			return;
+		}
+		Functions.push_back(std::move(R));
+	}
 
 	void GraphModel::addNode(GraphNode N) {
 		for (GraphNode& Existing : Nodes)
