@@ -28,8 +28,7 @@
 #define OBF_ANNOTATIONS_H
 
 /*
- * Zone 卡密授权：
- * OBF("zoneauth(capability=main, policy=fail_closed), vm(...)")
+ * Zone 卡密授权由最终项目的 zone_runtime 集成；zoneauth 注解已移除。
  *
  * 目标必须将 zone_runtime/zone_wrapper.cpp、官方 Zone 静态 SDK 及其所需的
  * 静态依赖一起链接。卡密在运行时输入，不会存储在注解或编译器选项中。
@@ -59,6 +58,47 @@
 #  define OBF_FN(spec)
 #endif
 
+/*
+ * 敏感决策边界：sensitive(region=<标识>, strict=<0|1>)
+ *
+ * 把一次敏感判断（验签、比较、授权决策）连同它的成功/失败动作收进一个
+ * 完整函数，并注解该函数。编译器会：
+ *   - 校验区域边界（结果不得从 return/store/未知调用/inline asm 逃逸，
+ *     且区域内必须有基于结果的成功/失败分支）；
+ *   - strict=1 时，边界错误或无法虚拟化一律编译失败（report_fatal_error）；
+ *   - 要求该函数同时启用 vm（否则报错）；
+ *   - 校验通过后附加 !obf.sensitive.validated，并在 VM 提交后附加
+ *     !obf.sensitive.committed，作为提交后结构门禁的依据。
+ *
+ * 写法要点：
+ *   - region 是诊断用的稳定标识，不参与安全判断；
+ *   - strict=1 时函数必须能被 VM 化：不能含 EH/invoke、callbr、indirectbr、
+ *     musttail、naked，且需满足 vm 的 minBlocks/maxBlocks；
+ *   - 区域内不要用会抛异常的构造（std::string/std::vector）或返回 bool
+ *     （-O0 会生成 i1 槽，VM 不支持）——把资源准备放在注解函数之外。
+ *
+ * 示例：
+ *   OBF("sensitive(region=auth,strict=1), vm(preset=max)")
+ *   int verifyAndAuthorize(const unsigned char* data, unsigned long size);
+ * 局部内存的 GEP/指针转换派生地址也会递归检查，并传播其 load 污点。
+ *
+ * 最终 ELF 完整性：含严格敏感区域的模块会发射 .text.xollvm.integrity
+ * manifest 占位与运行时校验 ctor；由后链接工具 xollvm-elf-hardener 回填
+ * 摘要与范围。链接包装器（demo/jni/ndk-linker-wrapper/clang++）在链接后
+ * 自动 audit + seal。相关环境变量：
+ *   XOLLVM_ELF_HARDENER          xollvm-elf-hardener 路径（链接时必需）
+ *   XOLLVM_ELF_ZERO_THRESHOLD    可执行段零洞阈值，默认 512（含）
+ *   XOLLVM_REAL_CLANG            NDK clang++（真实链接器）
+ *   XOLLVM_OBFUSCATOR_CLANG      xollvm clang++（编译阶段）
+ *
+ * 退出码（xollvm-elf-hardener）：0 通过 / 2 malformed / 3 策略违规。
+ *
+ * 范围说明：manifest 自身参与摘要（窗口置零），覆盖 EHDR+程序头及全部
+ * 文件支持的可执行 PT_LOAD；seal 后不能 strip 或修改这些字节。
+ * verify 另校验版本、VA、范围数量和全部范围槽；文件尾追加数据应由 APK/包
+ * 签名负责。动态符号（如外部 API）仍可能保留在 .dynsym，这是已知事实。
+ */
+
 /*===----------------------------------------------------------------------===*\
 |*  内置预设                                                                    *|
 |*                                                                            *|
@@ -80,6 +120,9 @@
  * 并叠加静态混淆 Pass。体积最大、速度最慢，仅用于确实需要保护的少数函数，
  * 例如授权检查或信任根检查。 */
 #define OBF_MAX         OBF("vm(preset=max), mba, bcf, flattening, strenc, adec, shield")
+
+/* 敏感决策边界（strict）：验签/比较/授权函数。region 名称按项目自定。 */
+#define OBF_SENSITIVE(region) OBF("sensitive(region=" region ",strict=1), vm(preset=max)")
 
 /* 使用各项技术默认参数的快捷宏。 */
 #define OBF_VM          OBF("vm")
@@ -293,8 +336,9 @@
  *   运行时（客户端）：
  *     cloud_value_manager 首次 dispatch 时同步拉取当前 window 的 V（避免首跑
  *     用全零 V 必崩），之后按 VM_DISPATCH_PREFETCH_SEC 异步预取；按
- *     window_id 分桶，用 HMAC-SHA256(V, window_le64) 取低 VM_DISPATCH_OFFSET_MASK
+ *     当前 window_id 计算 HMAC-SHA256(V, window_le64)，取低 VM_DISPATCH_OFFSET_MASK
  *     位作为偏移。V 通过 zone_wrapper 的既有登录/租约/capability 线路取得。
+ *     跨窗口刷新失败仍使用当前窗口计算，不能沿用缓存窗口延长旧 V 有效期。
  *
  *   云端：
  *     持有固定密钥 k，为每个 window 搜索一个 V 使 HMAC(V, window) & MASK == 0，
@@ -306,10 +350,9 @@
  *     dispatchOffsetMask。12-bit(0xFFF) 云端约 2^12 次 HMAC（毫秒级）；
  *     位宽越大越安全但云端搜索越贵，过大会超时。
  *
- *   排错：
- *     编译期调试打印默认关闭。仅本地排错时，链接调试版 zone SDK
- *     （ndk-build XOLLVM_ZONE_DEBUG_PKT=1）可打印收发数据包（含明文请求/
- *     响应），发布构建绝不包含这些代码。
+  *   排错：
+  *     编译器只负责注入 cloud dispatch 外部符号引用。调试打印、授权登录、
+  *     心跳和退出清理由最终项目自行集成的 zone_runtime 负责。
  *--------------------------------------------------------------------------*/
 
 /*----------------------------------------------------------------------------
@@ -352,7 +395,7 @@
  *   dynamic 按有效配置复用模块内线程和响应状态；不同配置独立，异常锁存。
  *
  *   tracerPid     [0/1]       检测 /proc/self/status 中的 TracerPid
- *   ptrace        [0/1]       每线程首次入口执行 PTRACE_TRACEME，复用结果
+ *   ptrace        [0/1]       兼容为只读 TracerPid 检测，不执行 PTRACE_TRACEME
  *   timing        [0/1]       检测运行时间异常
  *   maps          [0/1]       检查 /proc/self/maps 中明确的调试器名称
  *   integrity     [0/1]       与 vm 组合时启用字节码完整性构造函数
@@ -373,9 +416,10 @@
  *   debuggerProcess/iptables，其余探测读取失败时跳过。rootRequired=1 先检查
  *   geteuid()==0；权限不足直接触发响应，启用项读取/解析失败也触发响应。
  *   proxy 不读取 Android 系统代理设置；VPN/工具名/端口均为特征检测。
- *   dynamic 在入口与后台检测；线程退出用停止标志和 join 回收。ptrace 仅在
- *   入口执行，integrity 仅在 VM 初始化执行；后台需配合其他轮询检测器使用。
- *   PTRACE_TRACEME 会改变线程跟踪状态，可能使后续 tracerPid 检测命中父进程。
+ *   dynamic 在入口与后台检测；线程退出用停止标志和 join 回收；创建失败锁存。
+ *   ptrace=1 与 tracerPid 共用只读检测，不改变父子跟踪和信号关系。
+ *   普通 MT/root 终端不等于调试器附加；默认不因 root 身份拒绝运行。
+ *   与 vm 组合时 guard 在正式 wrapper 提交后插入，integrity 在 VM 初始化执行。
  *   responseCorrupt=0 只记录状态；报告 anti_debug 记录请求配置，目标/权限门控
  *   仍可能跳过检测。完整性检测沿用 VM 的字节码损坏响应。
  *

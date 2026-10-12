@@ -144,7 +144,7 @@ VM 主入口在 `VMPass.cpp` 的 `VMPass::run`。整体流程：
 
 - 含 EH pad / invoke / callbr / 已有 indirectbr / naked 属性的函数。
 - 基本块数超出 `[minBlocks, maxBlocks]` 的函数。
-- **多值返回函数**：返回值返回的 `ret` 多于 1 个时直接 bail（`multi-value-return`）。这是对 `computeReturnInfo` 只记录第一个返回槽这一已知限制的保守缓解，见 §8.1。
+- **多值返回函数**：已通过独立返回存储 ABI 支持；EH pad / invoke / musttail / callbr / 已有 indirectbr / naked 仍被拒绝，见 §8.1。
 
 ### 5.3 Engine 分组
 
@@ -237,22 +237,22 @@ zone_runtime 源码。
 
 ### 7.4 交付边界
 
-LLVM 工具链与 Zone runtime archive 是两个交付面：
+LLVM 工具链与最终项目自行集成的 Zone runtime 是两个交付面：
 
 - `clang`/`opt`/插件属于编译工具链。
-- `libxollvm_zone_sdk_private.a`（release）与 `libxollvm_zone_sdk_private_dbg.a`（调试）属于最终目标程序的链接依赖。
-- 主 LLVM 安装树不自动打包 Zone archive，需保留对应构建目录或单独打包。
-- 最终链接用 `zone_runtime/xollvm-zone-clang` 包装器按 IR 中的 `.xollvm.zone.link` marker 选择 bundled/external 依赖。
+- Zone runtime 源码、curl/zlib/OpenSSL 源码及其构建规则属于最终项目，不再由 XOLLVM 提供。
+- XOLLVM 不再打包 Zone archive，也不再提供 `zoneauth` 编译器参数或自动链接包装器。
+- `cloudDispatch` 需要的 `__zone_get_dispatch_offset()` 外部符号由最终项目自行集成的 runtime 提供。
 
 ## 8. 已发现问题与风险
 
-> 说明：以下问题来自静态分析。其中「多返回错误值」因 §5.2 的资格检查已被**缓解**（该形状函数被跳过不做 VM），其余多数为未缓解或部分缓解。
+> 说明：以下问题来自静态分析。其中「多返回错误值」已由统一返回存储 ABI 修复，其余多数为未缓解或部分缓解。
 
 ### 8.1 VM 正确性
 
 | # | 问题 | 位置 | 等级 | 状态 |
 | --- | --- | --- | --- | --- |
-| 1 | 多返回函数 wrapper 固定读第一个返回槽 | `VMPass_Wrapper.cpp computeReturnInfo()` | 高（设计上） | **已被 isVMEligible 的 multi-value-return bail 缓解**；属已知限制而非未修复 bug。长期可统一 return slot 后放开限制 |
+| 1 | 多返回函数 wrapper 固定读第一个返回槽 | `VMPass_Wrapper.cpp computeReturnInfo()` | 高（设计上） | **已修复**：所有 `OP_RET_*` handler 将实际执行的返回值写入 wrapper 独立返回存储，wrapper 不再依赖第一个返回槽；i1/i32/i64/ptr/float/double 多返回差分测试通过 |
 | 2 | CALL handler 用 PtrTy/DoubleTy 统一重建调用签名，未保留真实 ABI（float 被当 double 调） | `VMPass_Handlers.cpp buildCall2()` | 高 | **已修复**：float 参数用真实 float 类型调用，不再升 double；同步修复 `ensureCallFTyCases()` |
 | 3 | CALL 按固定 MaxArgs 预读参数槽字节，与 `nargs` 无关，可能越界读取字节码 | `VMPass_Handlers.cpp buildCall2()` | 高 | **已修复**：只按真实形参数预读参数字节，超过 NArgs 的槽位不读取 |
 | 4 | `FCMP_TRUE`（谓词 15）verifier 接受但 handler 默认返回 0 | `VMPass_Verifier.cpp` / `VMPass_Handlers.cpp` | 高 | **已修复**：handler 与 nested helper 均添加 FCMP_TRUE case，返回 i32 1 |
@@ -317,7 +317,7 @@ LLVM 工具链与 Zone runtime archive 是两个交付面：
 2. CALL 按 `nargs` 读取参数槽，emitter/verifier/handler 三处统一指令长度。
 3. 修复 `FCMP_TRUE` 及全部浮点谓词映射。
 4. 对无法保持精确语义的 intrinsic（fma/fabs/copysign/minnum/maxnum/memset0）改为拒绝虚拟化或按 LLVM 语义精确实现。
-5.（可选增强）统一多返回函数的 return slot，放开 multi-value-return 限制。
+5. 保持多返回统一返回存储 ABI 的行为回归，覆盖新增返回类型和 engine 配置。
 
 ### P2 — 运行时并发与跨平台
 
