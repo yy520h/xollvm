@@ -173,7 +173,7 @@ def vm_demand_invalid_dispatch(ir: str) -> Optional[str]:
         if not fetches:
             return "VM engine has no inspectable opcode fetch"
         for body in fetches:
-            check = re.search(r"%([\w.$]+)\s*=\s*icmp uge i32 %vm\.oidx\d*, 56\b", body)
+            check = re.search(r"%([\w.$]+)\s*=\s*icmp uge i32 %vm\.oidx\d*, 96\b", body)
             if check is None:
                 return "VM fetch lacks an opcode-domain bounds check"
             branch = re.search(r"br i1 %" + re.escape(check.group(1))
@@ -218,8 +218,8 @@ def vm_demand_incompatible_engines(ir: str) -> Optional[str]:
 
 @register("vm_engine_exists")
 def vm_engine_exists(ir: str) -> Optional[str]:
-    if "define internal void @__vm_engine(" not in ir:
-        return "@__vm_engine function not found — shared engine not created"
+    if not _engine_bodies(ir):
+        return "VM engine function not found — shared engine not created"
     return None
 
 
@@ -260,21 +260,21 @@ def vm_wrapper_is_thin(ir: str) -> Optional[str]:
 
 @register("vm_engine_has_handlers")
 def vm_engine_has_handlers(ir: str) -> Optional[str]:
-    engine = extract_fn_body(ir, "__vm_engine")
-    if engine is None:
-        return "__vm_engine function body not found"
-    if not re.search(r"vm\.opc\.[A-Za-z0-9_.]+\b", engine):
-        return "__vm_engine has no opcode handler blocks"
+    engines = _engine_bodies(ir)
+    if not engines:
+        return "VM engine function body not found"
+    if any(not re.search(r"vm\.opc\.[A-Za-z0-9_.]+\b", engine) for engine in engines):
+        return "VM engine has no opcode handler blocks"
     return None
 
 
 @register("vm_engine_indirectbr")
 def vm_engine_indirectbr(ir: str) -> Optional[str]:
-    engine = extract_fn_body(ir, "__vm_engine")
-    if engine is None:
-        return "__vm_engine function body not found"
-    if "indirectbr" not in engine:
-        return "__vm_engine has no indirectbr — dispatch not indirect"
+    engines = _engine_bodies(ir)
+    if not engines:
+        return "VM engine function body not found"
+    if any("indirectbr" not in engine for engine in engines):
+        return "VM engine has no indirectbr — dispatch not indirect"
     return None
 
 

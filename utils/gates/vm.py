@@ -7,6 +7,7 @@ from typing import Optional
 
 from . import register
 from ._ir import extract_fn_body
+from .vm_engine import _engine_bodies
 
 
 @register("vm_dispatch_present")
@@ -32,8 +33,9 @@ def vm_bytecode_global(ir: str) -> Optional[str]:
 
 @register("vm_ophandlers_global")
 def vm_ophandlers_global(ir: str) -> Optional[str]:
-    if not re.search(r"vm\.ophandlers\b", ir):
-        return "no vm.ophandlers global found"
+    if not re.search(r"^@[\w.$]+\.vm\.ophandlers\s*=", ir, re.MULTILINE):
+        if not re.search(r'^@[\w.$]+\.vm\.targets\s*=[^\n]*blockaddress\(@__vm_engine[\w.$]*, [^\n]*section "\.obf\.vm\.targets"', ir, re.MULTILINE):
+            return "no VM handler table or encoded handler descriptor found"
     return None
 
 
@@ -159,8 +161,8 @@ def vm_lazydecrypt_keystream_call(ir: str) -> Optional[str]:
     # *definition*) is linked in whenever useAES=1, lazy or not, so a bare
     # substring match on the callee name would always pass. Require an
     # actual `call` instruction instead — only the lazy fetch path emits one.
-    if not re.search(r"\bcall\b[^\n]*@__obf_aes_ctr_keystream_block\s*\(", ir):
-        return ("no call to __obf_aes_ctr_keystream_block found — "
+    if not re.search(r"\bcall\b[^\n]*@(?:__obf_aes_ctr_keystream_block|__vm_whitebox_ctr_block)\s*\(", ir):
+        return ("no call to AES/whitebox CTR keystream block found — "
                 "lazy per-block fetch path not emitted")
     return None
 
@@ -219,11 +221,11 @@ def vm_nestedvm_helper_virtualized(ir: str) -> Optional[str]:
     # referencing the PLAIN engine (@__vm_engine), never the nesting engine.
     # A helper left un-virtualized would still be a bare switch/ret function
     # with no .vm.ophandlers table at all.
-    tables = re.findall(r"@__vm_h_\w+\.vm\.ophandlers\s*=[^\n]*", ir)
+    tables = re.findall(r"^@__vm_h_[\w.$]+\.vm\.(?:ophandlers|targets)\s*=[^\n]*", ir, re.MULTILINE)
     if not tables:
         return "no @__vm_h_*.vm.ophandlers table found — nested helper was never virtualized"
     for line in tables:
-        if re.search(r"@__vm_engine(?!\.nest)\b", line):
+        if re.search(r"blockaddress\(@__vm_engine(?:\.p\d+)?,", line):
             return None
     return "nested helper handler table(s) do not reference the plain @__vm_engine"
 
@@ -237,12 +239,13 @@ def vm_threaded_no_central_dispatch(ir: str) -> Optional[str]:
     # the single indirectbr a central-dispatch build has (one per handler).
     if re.search(r"\bvm\.fetch\b", ir):
         return "vm.fetch block found — central dispatch was not threaded away"
-    engine = extract_fn_body(ir, "__vm_engine")
-    if engine is None:
-        return "__vm_engine function body not found"
-    n = len(re.findall(r"\bindirectbr\b", engine))
-    if n <= 1:
-        return f"__vm_engine has only {n} indirectbr(s) — dispatch was not inlined per-handler"
+    engines = _engine_bodies(ir)
+    if not engines:
+        return "VM engine function body not found"
+    for engine in engines:
+        n = len(re.findall(r"\bindirectbr\b", engine))
+        if n <= 1:
+            return f"VM engine has only {n} indirectbr(s) — dispatch was not inlined per-handler"
     return None
 
 
@@ -335,36 +338,98 @@ def vm_no_keyeddisp(ir: str) -> Optional[str]:
     return None
 
 
+def _binding_dependencies(body: str) -> dict[str, set[str]]:
+    # reg2mem 的 load 只依赖实际可达的最后一次 store，不能把已覆盖旧值算进去。
+    definitions, stores, predecessors = {}, {}, {}
+    block = "<entry>"
+    for position, line in enumerate(body.splitlines()):
+        label = re.match(r'^([\w.$]+):', line)
+        if label:
+            block = label[1]
+        for target in re.findall(r'\blabel %([\w.$]+)', line):
+            predecessors.setdefault(target, set()).add(block)
+        assignment = re.match(r'\s*(%[\w.$]+)\s*=\s*(.*)', line)
+        if assignment:
+            definitions[assignment[1]] = (assignment[2], block, position)
+        store = re.search(r'\bstore(?: volatile)? (?:i\d+|ptr) ([^,]+), ptr (%[\w.$]+)', line)
+        if store:
+            stores.setdefault((block, store[2]), []).append((position, store[1]))
+
+    def reaching_values(slot, block, before):
+        values, visited, pending = set(), set(), [(block, before)]
+        while pending:
+            current, limit = pending.pop()
+            key = (current, limit)
+            if key in visited:
+                continue
+            visited.add(key)
+            last = next((value for position, value in reversed(stores.get((current, slot), ()))
+                         if position < limit), None)
+            if last is not None:
+                values.update(re.findall(r'[%@][\w.$]+', last))
+            else:
+                pending.extend((pred, float('inf')) for pred in predecessors.get(current, ()))
+        return values
+
+    dependencies = {}
+    for lhs, (rhs, block, position) in definitions.items():
+        load = re.match(r'load(?: volatile)? (?:i\d+|ptr), ptr (%[\w.$]+)', rhs)
+        if load:
+            dependencies[lhs] = reaching_values(load[1], block, position)
+            # 非栈指针（如 GEP 到 handler table）仍需追踪地址来源。
+            pointer_def = definitions.get(load[1], ('', '', 0))[0]
+            if not pointer_def.startswith('alloca '):
+                dependencies[lhs].add(load[1])
+        else:
+            dependencies[lhs] = set(re.findall(r'[%@][\w.$]+', rhs))
+    return dependencies
+
+
 @register("vm_bindadeb_ctor_present")
 def vm_bindadeb_ctor_present(ir: str) -> Optional[str]:
-    # bindAntiDebug: buildAntiDebugKeyBindCtor() emits a per-function
-    # .init_array constructor (name suffix .vm.adbind.ctor, priority 100 --
-    # ahead of the AES decrypt ctor at 65535) that computes a debugger-
-    # detection bit via IsDebuggerPresent/CheckRemoteDebuggerPresent/
-    # NtQueryInformationProcess and XORs it into the masked AES round-key
-    # global in the vm.adbind.combine block. Both the ctor and the detection
-    # call must be present together, or this could just be buildAntiDebugGate's
-    # unrelated dispatch-level gate (which also calls IsDebuggerPresent under
-    # plain hardened+antiDebug, independent of bindAntiDebug).
-    m = re.search(r"define[^\n]*@([\w.]+\.vm\.adbind\.ctor)\b", ir)
-    if not m:
-        return "no .vm.adbind.ctor constructor found"
-    body = extract_fn_body(ir, m.group(1))
-    if body is None:
-        return "vm.adbind.ctor matched but function body extraction failed"
-    if "IsDebuggerPresent" not in body:
-        return "vm.adbind.ctor found but no IsDebuggerPresent call inside it"
-    if not re.search(r"vm\.adbind\.combine\b", body):
-        return "vm.adbind.ctor found but no vm.adbind.combine (mask-XOR) block"
-    return None
+    # 验证真实引擎调用，不能把接收污染 salt 的任意 logger 调用算作绑定。
+    engine_tables = set()
+    for symbol, initializer in re.findall(r'^(@[\w.$]+)\s*=([^\n]+)', ir, re.MULTILINE):
+        if re.search(r'\bptr @__vm_engine(?:\.nest)?(?:\.p\d+)?\b', initializer):
+            engine_tables.add(symbol)
+    for name in re.findall(r"^define[^\n]*@([\w.$]+)\(", ir, re.MULTILINE):
+        if name.startswith("__vm_engine"):
+            continue
+        body = extract_fn_body(ir, name) or ""
+        if "vm.ad.bind." not in body:
+            continue
+        flags = set(re.findall(r"(%[\w.$]+)\s*=\s*load atomic i32, ptr @__obf_antidebug_response[\w.]*\b", body))
+        dependencies = _binding_dependencies(body)
+
+        def ancestors(value):
+            seen, pending = set(), [value]
+            while pending:
+                value = pending.pop()
+                if value not in seen:
+                    seen.add(value)
+                    pending.extend(dependencies.get(value, ()))
+            return seen
+
+        for callee, args in re.findall(r"call void ([%@][\w.$]+)\(([^\n]+)\)", body):
+            if not re.fullmatch(r'@__vm_engine(?:\.nest)?(?:\.p\d+)?', callee):
+                if not ancestors(callee).intersection(engine_tables):
+                    continue
+            parts = args.split(",")
+            if len(parts) < 8:
+                continue
+            salt = re.search(r"i32 (%[\w.$]+)", parts[7])
+            if salt is None:
+                continue
+            seen = ancestors(salt.group(1))
+            if seen.intersection(flags) and any(v.startswith("%vm.ad.bind.poison") for v in seen):
+                return None
+    return "no atomic anti-debug response bound to the VM engine salt"
 
 
 @register("vm_no_bindadeb_ctor")
 def vm_no_bindadeb_ctor(ir: str) -> Optional[str]:
-    # Inverse of vm_bindadeb_ctor_present — proves the ctor is absent when
-    # bindAntiDebug=0.
-    if re.search(r"vm\.adbind\.", ir):
-        return "vm.adbind.* found but bindAntiDebug=0"
+    if re.search(r"vm\.(?:adbind|ad\.bind)\.", ir):
+        return "VM anti-debug binding found but bindAntiDebug=0"
     return None
 
 
@@ -416,6 +481,9 @@ def vm_randisa_permuted(ir: str) -> Optional[str]:
 # value in the fixed emission order EQ,NE,UGT,UGE,ULT,ULE,SGT,SGE,SLT,SLE =
 # 32..41. Without randISA that sequence is exactly this ascending run.
 _RANDISA_ICMP_CANON = [32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
+_RANDISA_ICMP_IDENTITY = dict(zip(
+    ("eq", "ne", "ugt", "uge", "ult", "ule", "sgt", "sge", "slt", "sle"),
+    _RANDISA_ICMP_CANON))
 
 
 def _icmp_pred_sequence(ir: str):
@@ -444,6 +512,11 @@ def vm_no_randisa(ir: str) -> Optional[str]:
            if _RANDISA_IDENTITY.get(name) != val}
     if bad:
         return f"OP_BINOP subop encoding is permuted but randISA=0: {sorted(bad.items())}"
+    predicates = _labeled_case_map(ir, "vm.ic.", _RANDISA_ICMP_IDENTITY)
+    bad = {name: val for name, val in predicates.items()
+           if _RANDISA_ICMP_IDENTITY[name] != val}
+    if bad:
+        return f"ICmp predicate dispatch is permuted but randISA=0: {sorted(bad.items())}"
     seq = _icmp_pred_sequence(ir)
     if seq is not None and seq != _RANDISA_ICMP_CANON:
         return f"ICmp predicate dispatch is permuted but randISA=0: {seq}"
@@ -463,12 +536,13 @@ def vm_no_randisa(ir: str) -> Optional[str]:
 
 @register("vm_randisa_icmp_permuted")
 def vm_randisa_icmp_permuted(ir: str) -> Optional[str]:
-    # randISA broadening: the ICmp predicate byte encoding is permuted module-
-    # uniformly per build, so the OP_ICMP/OP_ICMP64 handler select-chain tests
-    # the decoded predicate against a NON-canonical ordering of 32..41. Proves
-    # the predicate permutation reached the handler (not a silent no-op).
+    # 按语义标签比较裁剪后 switch 的物理编码，仍拒绝恒等编码及缺失 dispatch。
+    predicates = _labeled_case_map(ir, "vm.ic.", _RANDISA_ICMP_IDENTITY)
+    if predicates:
+        if all(_RANDISA_ICMP_IDENTITY[name] == val for name, val in predicates.items()):
+            return f"ICmp predicate encoding is canonical ({sorted(predicates.items())}) — randISA not applied"
     seq = _icmp_pred_sequence(ir)
-    if seq is None:
+    if seq is None and not predicates:
         return "no OP_ICMP predicate dispatch found — cannot verify randISA permutation"
     if seq == _RANDISA_ICMP_CANON:
         return (f"ICmp predicate dispatch is the canonical order {seq} — "
@@ -613,8 +687,10 @@ def vm_perfn_engine(ir: str) -> Optional[str]:
     # __vm_h_* nested helpers). A pooled build has far fewer engines than
     # functions, so this only holds under perFnEngine.
     engines = set(re.findall(r"^define\b[^\n]*@(__vm_engine(?:\.nest)?(?:\.p\d+)?)\(", ir, re.M))
-    tables = set(re.findall(r"@(\w+)\.vm\.ophandlers\b", ir))
+    tables = set(re.findall(r"^@([\w.$]+)\.vm\.(?:ophandlers|targets)\s*=", ir, re.MULTILINE))
     userfns = {t for t in tables if not t.startswith("__vm_h_")}
+    if not userfns:
+        return "no per-function VM handler tables found"
     if len(engines) < len(userfns):
         return (f"{len(engines)} distinct engines for {len(userfns)} virtualized "
                 "functions — not a per-function engine build")

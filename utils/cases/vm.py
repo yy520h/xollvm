@@ -111,11 +111,7 @@ VM_KEYEDDISP_GATES = ["vm_keyeddisp_ip_xor"]
 # already carries (mismatched fusion would produce a wrong answer).
 VM_SUPEROPS_GATES = ["vm_superops_muladd_present", "vm_superops_shladd_present", "vm_superops_cmpsel_present", "vm_superops_andcmpz_present"]
 
-# bindAntiDebug: folds debugger detection into the AES round-key mask global
-# via a dedicated .init_array ctor instead of salt-poisoning traps. Purely a
-# .init_array addition -- doesn't touch dispatch/handler structure, so it
-# composes with any of the CORE/ENGINE/THREADED gate sets above. Requires
-# hardened=1 (implies antiDebug=1).
+# 绑定用例显式开启 TracerPid，gate 检查响应实际进入引擎 salt。
 VM_BINDADEB_GATES = ["vm_bindadeb_ctor_present"]
 
 # randISA: the BinSubop byte encoding (OP_BINOP/OP_BINOP64 subop) is permuted
@@ -125,9 +121,7 @@ VM_BINDADEB_GATES = ["vm_bindadeb_ctor_present"]
 # sets. Needs a program with int binops (the switch must exist to inspect);
 # not attached to pure-float cases or nestedVM cases (which route OP_BINOP to a
 # helper call, so the main handler has no subop switch to inspect).
-VM_RANDISA_GATES = ["vm_randisa_permuted", "vm_randisa_icmp_permuted",
-                    "vm_randisa_cast_permuted", "vm_randisa_fbinsubop_permuted",
-                    "vm_randisa_fcmp_permuted"]
+VM_RANDISA_GATES = ["vm_randisa_permuted"]
 
 # enginePoolSize>1 builds several distinct shared engines (@__vm_engine[.pN]);
 # this proves more than one materialised. Attached to the multi-function pool
@@ -150,7 +144,8 @@ def register(reg: Registry, **_opts) -> None:
              ann_override=vm_v7,
              gates=VM_CORE_GATES + ["vm_enc_ctor", "vm_no_threaded_dispatch",
                     "vm_no_keyeddisp", "vm_no_bindadeb_ctor",
-                    "vm_no_enginepool", "vm_no_metamorph_engines"] + VM_RANDISA_GATES,
+                     "vm_no_enginepool", "vm_no_metamorph_engines",
+                     "vm_randisa_icmp_permuted"] + VM_RANDISA_GATES,
              extra_opts=_DBG, category="vm")
     reg.add(name="rt_vm_v7_basic_randisa_disabled", passes=["vm"],
             ann_override="obf: vm(minBlocks=1,obfRegIdx=1,encBytecode=1,randISA=0)",
@@ -197,7 +192,7 @@ def register(reg: Registry, **_opts) -> None:
             src_override=render_vm_v7_casts_program(vm_v7))
     reg.add(name="rt_vm_v7_icmp", passes=["vm"],
             ann_override=vm_v7,
-            gates=VM_CORE_GATES + ["vm_enc_ctor"],
+            gates=VM_CORE_GATES + ["vm_enc_ctor", "vm_randisa_icmp_permuted"],
             extra_opts=_DBG, category="vm",
             src_override=render_vm_v7_icmp_program(vm_v7))
     reg.add(name="rt_vm_v7_multiblock", passes=["vm"],
@@ -214,13 +209,13 @@ def register(reg: Registry, **_opts) -> None:
 
     # ── Float register file tests (Step 01.3) ──
     reg.add(name="rt_vm_v7_float_basic", passes=["vm"],
-            ann_override=vm_v7, gates=VM_FLOAT_GATES, category="vm",
+            ann_override=vm_v7, gates=VM_FLOAT_GATES + ["vm_randisa_fbinsubop_permuted"], category="vm",
             src_override=render_vm_v7_float_basic_program(vm_v7))
     reg.add(name="rt_vm_v7_float_cast", passes=["vm"],
             ann_override=vm_v7, gates=VM_FLOAT_GATES, category="vm",
             src_override=render_vm_v7_float_cast_program(vm_v7))
     reg.add(name="rt_vm_v7_float_fcmp_select", passes=["vm"],
-            ann_override=vm_v7, gates=VM_FLOAT_GATES, category="vm",
+            ann_override=vm_v7, gates=VM_FLOAT_GATES + ["vm_randisa_fcmp_permuted"], category="vm",
             src_override=render_vm_v7_float_fcmp_program(vm_v7))
     reg.add(name="rt_vm_v7_float_mem", passes=["vm"],
             ann_override=vm_v7, gates=VM_FLOAT_GATES, category="vm",
@@ -941,7 +936,7 @@ def register(reg: Registry, **_opts) -> None:
     vm_v7_bd_multi = ann_extra("vm_v7_bindadeb_multi_fn")
     vm_v7_bd_stack = ann_extra("vm_v7_bindadeb_stack")
 
-    reg.add(name="rt_vm_v7_bindadeb_multi_fn", passes=["vm"],
+    reg.add(name="rt_vm_v7_bindadeb_multi_fn", passes=["vm", "antidebug"],
             ann_override=vm_v7_bd_multi,
             gates=VM_SHARED_GATES + VM_BINDADEB_GATES + [
                 "vm_enc_ctor", "vm_callees_global", "vm_multi_fn_shared",
@@ -950,7 +945,7 @@ def register(reg: Registry, **_opts) -> None:
             ],
             extra_opts=_DBG, category="vm",
             src_override=render_vm_v7_multi_fn_aes_program(vm_v7_bd_multi))
-    reg.add(name="rt_vm_v7_bindadeb_i64", passes=["vm"],
+    reg.add(name="rt_vm_v7_bindadeb_i64", passes=["vm", "antidebug"],
             ann_override=vm_v7_bd,
             gates=VM_CORE_GATES + VM_BINDADEB_GATES + [
                 "vm_enc_ctor", "vm_hardened_mba", "vm_hardened_dead_blocks",
@@ -958,7 +953,7 @@ def register(reg: Registry, **_opts) -> None:
             ],
             extra_opts=_DBG, category="vm",
             src_override=render_vm_v7_i64_ops_program(vm_v7_bd))
-    reg.add(name="rt_vm_v7_bindadeb_float", passes=["vm"],
+    reg.add(name="rt_vm_v7_bindadeb_float", passes=["vm", "antidebug"],
             ann_override=vm_v7_bd,
             gates=VM_CORE_GATES + VM_BINDADEB_GATES + [
                 "vm_fregs_alloca", "vm_enc_ctor",
@@ -967,7 +962,7 @@ def register(reg: Registry, **_opts) -> None:
             ],
             extra_opts=_DBG, category="vm",
             src_override=render_vm_v7_float_basic_program(vm_v7_bd))
-    reg.add(name="rt_vm_v7_bindadeb_switch", passes=["vm"],
+    reg.add(name="rt_vm_v7_bindadeb_switch", passes=["vm", "antidebug"],
             ann_override=vm_v7_bd,
             gates=VM_CORE_GATES + VM_BINDADEB_GATES + [
                 "vm_enc_ctor", "vm_hardened_mba", "vm_hardened_dead_blocks",
@@ -981,7 +976,7 @@ def register(reg: Registry, **_opts) -> None:
     # also makes hardenVMEngine's dead-block/pre-dispatch-split hardening a
     # structural no-op (cf. rt_vm_v7_threaded_hardened) -- MBA and handler-entry
     # guards stay active and are still checked.
-    reg.add(name="rt_vm_v7_bindadeb_stack", passes=["vm"],
+    reg.add(name="rt_vm_v7_bindadeb_stack", passes=["vm", "antidebug"],
             ann_override=vm_v7_bd_stack,
             gates=VM_THREADED_SHARED_GATES + VM_THREADED_GATES + VM_BINDADEB_GATES
                 + VM_KEYEDDISP_GATES + VM_AES_GATES + VM_LAZYDECRYPT_GATES
@@ -990,7 +985,7 @@ def register(reg: Registry, **_opts) -> None:
                    "vm_hardened_mba", "vm_hardened_handler_guards"],
             extra_opts=_DBG, category="vm",
             src_override=render_vm_v7_switch_dispatch_program(vm_v7_bd_stack))
-    reg.add(name="rt_vm_v7_bindadeb_determinism", passes=["vm"],
+    reg.add(name="rt_vm_v7_bindadeb_determinism", passes=["vm", "antidebug"],
             ann_override=vm_v7_bd,
             extra_opts=_DBG, gates=["seed_determinism"], category="vm",
             src_override=render_vm_v7_multi_function_program(vm_v7_bd))
@@ -1174,7 +1169,7 @@ def register(reg: Registry, **_opts) -> None:
             extra_opts=_DBG, gates=["seed_determinism"], category="vm",
             src_override=render_vm_v7_enginepool_program(vm_v7_pf))
 
-    # ── preset=<light|medium|high|max> config-surface shortcut ──
+    # ── preset=<medium|high|max> config-surface shortcut ──
     # Resolved in VMPassConfig::fromPassConfig before the explicit-knob getBool/
     # getUInt calls, so this is a pure config-resolution convenience, not a new
     # hardening feature: no new opcodes, no new IR marker. Gates below reuse the
@@ -1182,16 +1177,10 @@ def register(reg: Registry, **_opts) -> None:
     # medium is the acceptance case: it must resolve to exactly today's
     # defaults, so its gate set intentionally mirrors rt_vm_v7_basic's (proving
     # equivalence), not the fuller multi-fn shared-engine gate set.
-    vm_v7_preset_light = ann_extra("vm_v7_preset_light")
     vm_v7_preset_medium = ann_extra("vm_v7_preset_medium")
     vm_v7_preset_high = ann_extra("vm_v7_preset_high")
     vm_v7_preset_max = ann_extra("vm_v7_preset_max")
 
-    reg.add(name="rt_vm_v7_preset_light_multi_fn", passes=["vm"],
-            ann_override=vm_v7_preset_light,
-            gates=VM_CORE_GATES + ["vm_enc_ctor"],
-            extra_opts=_DBG, category="vm",
-            src_override=render_vm_v7_multi_fn_aes_program(vm_v7_preset_light))
     reg.add(name="rt_vm_v7_preset_medium_multi_fn", passes=["vm"],
             ann_override=vm_v7_preset_medium,
             gates=VM_CORE_GATES + ["vm_enc_ctor", "vm_no_threaded_dispatch", "vm_no_keyeddisp"],
@@ -1221,14 +1210,10 @@ def register(reg: Registry, **_opts) -> None:
                 + VM_LAZYDECRYPT_GATES + VM_CONSTINSTREAM_GATES
                 + ["vm_nestedvm_helper_virtualized"]
                 + VM_SUPEROPS_GATES + VM_KEYEDDISP_GATES
-                + VM_BINDADEB_GATES + VM_THREADED_GATES,
+                 + ["vm_no_bindadeb_ctor"] + VM_THREADED_GATES,
             extra_opts=_DBG, category="vm",
             src_override=render_vm_v7_multi_fn_aes_program(vm_v7_preset_max))
 
-    reg.add(name="rt_vm_v7_preset_light_determinism", passes=["vm"],
-            ann_override=vm_v7_preset_light,
-            extra_opts=_DBG, gates=["seed_determinism"], category="vm",
-            src_override=render_vm_v7_multi_function_program(vm_v7_preset_light))
     reg.add(name="rt_vm_v7_preset_medium_determinism", passes=["vm"],
             ann_override=vm_v7_preset_medium,
             extra_opts=_DBG, gates=["seed_determinism"], category="vm",

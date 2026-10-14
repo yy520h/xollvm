@@ -834,6 +834,10 @@ namespace {
     // StrEncImpl::encryptStrings
 
     bool StrEncImpl::encryptStrings(Module& M, StrEncCtx& Ctx) {
+        // 无候选时不能先链接 stub 或生成密钥，否则留下无用依赖并错误保留分析。
+        if (llvm::none_of(M.globals(), [&](GlobalVariable& GV) {
+            return shouldEncrypt(GV, Ctx.Cfg.minLength);
+        })) return false;
         //  link the AES stub
         Function* DecryptFn = linkStub(M);
         if (!DecryptFn) {
@@ -1001,6 +1005,10 @@ namespace {
     // post-link patch tool, out of scope for an IR pass.
 
     bool StrEncImpl::encryptStringsChaCha(Module& M, StrEncCtx& Ctx) {
+        // 无候选时跳过整个 crypto 接入，避免未定义的 AES 密钥提供函数。
+        if (llvm::none_of(M.globals(), [&](GlobalVariable& GV) {
+            return shouldEncrypt(GV, Ctx.Cfg.minLength);
+        })) return false;
         // link the stub (brings in __strenc_chacha_decrypt alongside the rest)
         Function* LinkedDecFn = linkStub(M);
         if (!LinkedDecFn) {

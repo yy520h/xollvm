@@ -10,7 +10,7 @@ def extract_fn_body(ir: str, fn_name: str) -> Optional[str]:
     """Return the text between 'define ... @fn_name' and its closing '}',
     or None if the function is not defined (only declared, or absent)."""
     pattern = re.compile(
-        r"^define\b[^\n]*@" + re.escape(fn_name) + r"\b[^\n]*\{",
+        r'^define\b[^\n]*@(?:' + re.escape(fn_name) + r'|"' + re.escape(fn_name) + r'")\([^\n]*\{',
         re.MULTILINE,
     )
     m = pattern.search(ir)

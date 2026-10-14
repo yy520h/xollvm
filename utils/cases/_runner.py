@@ -206,11 +206,6 @@ def run_test(
     tdir = work / tc.name
     tdir.mkdir(parents=True, exist_ok=True)
 
-    test_report_root: Optional[Path] = None
-    if report_enabled or tc.witness_required:
-        test_report_root = report_root / tc.name
-        test_report_root.mkdir(parents=True, exist_ok=True)
-
     # Effective skip-strictness:
     #   explicit per-test value wins; otherwise --strict-skips applies to
     #   multi-pass tests (>= 2 passes) only. Single-pass tests are
@@ -219,6 +214,12 @@ def run_test(
         eff_no_skips = bool(tc.expect_no_skips)
     else:
         eff_no_skips = bool(strict_skips and len(tc.passes) >= 2)
+
+    # 白名单检查也要生成报告，否则预算回滚无法校验实际跳过原因。
+    test_report_root: Optional[Path] = None
+    if report_enabled or tc.witness_required or (eff_no_skips and tc.allowed_skip_reasons):
+        test_report_root = report_root / tc.name
+        test_report_root.mkdir(parents=True, exist_ok=True)
 
     def _report_opts(label: str) -> tuple[list[str], Optional[Path]]:
         base_opts = list(tc.extra_opts or [])

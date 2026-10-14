@@ -62,18 +62,50 @@ def compile_src_to_ll(tools: Tools, src: Path, out: Path, *, is_cpp: bool, v: bo
 def compile_ll_to_exe(tools: Tools, ll: Path, exe: Path, opt: str, *, is_cpp: bool, v: bool = False) -> None:
     compiler = clang_for_lang(tools, is_cpp)
     extra = ["-std=c++17"] if is_cpp else []
+    ir = ll.read_text(encoding="utf-8")
+    android = "android" in ir and tools.host_clang is not None
+    link_opts = ["-Wl,--rosegment"] if android else []
+    if android and is_cpp:
+        # Termux 只有共享 libc++；用 NDK driver 链接其静态运行库。
+        if tools.android_clangxx is None:
+            raise RuntimeError("Android C++ runtime tests require an NDK static libc++; set XOLLVM_NDK")
+        compiler = tools.android_clangxx
+        triple = re.search(r'^target triple = "([^"]+)"', ir, re.MULTILINE)
+        if triple is None:
+            raise RuntimeError("Android C++ IR target triple missing")
+        link_opts.append(f"--target={triple.group(1)}")
+        link_opts.append("-static-libstdc++")
     if tools.host_clang is not None:
         obj = exe.with_suffix(".o")
         run_cmd([
             str(tools.clang), f"-{opt}", "-fPIC", "-c", str(ll), "-o", str(obj),
         ], verbose=v)
         run_cmd([
-            str(compiler), str(obj), "-lm", *extra, "-o", str(exe),
+            str(compiler), str(obj), "-lm", *extra, *link_opts, "-o", str(exe),
         ], verbose=v)
+        _finalize_vm_elf(tools, ir, exe, v=v)
         return
     run_cmd([
         str(tools.clang), f"-{opt}", *extra, str(ll), "-o", str(exe),
     ], verbose=v)
+    _finalize_vm_elf(tools, ir, exe, v=v)
+
+
+def _finalize_vm_elf(tools: Tools, ir: str, exe: Path, *, v: bool) -> None:
+    # encodedTargets 必须完成链接后编码；integrity 的摘要只能在最终 ELF 上封装。
+    encoded = 'section ".obf.vm.targets"' in ir
+    integrity = "@__xollvm_elf_integrity_manifest" in ir
+    if not encoded and not integrity:
+        return
+    hardener = tools.opt.with_name("xollvm-elf-hardener")
+    if not hardener.is_file():
+        raise RuntimeError(f"required VM ELF delivery tool missing: {hardener}")
+    if encoded:
+        run_cmd([str(hardener), "targets", "--input", str(exe), "--output", str(exe)], verbose=v)
+    run_cmd([str(hardener), "audit", "--input", str(exe)], verbose=v)
+    if integrity:
+        run_cmd([str(hardener), "seal", "--input", str(exe), "--output", str(exe)], verbose=v)
+        run_cmd([str(hardener), "verify", "--input", str(exe)], verbose=v)
 
 
 def run_obfuscation(

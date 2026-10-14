@@ -3,6 +3,7 @@ import json
 import subprocess
 import pytest
 from vm_hardening_support import annotation, transform, tools
+from gates import run_gate
 
 
 def transform_report(tmp_path, spec):
@@ -41,7 +42,7 @@ def test_explicit_disable_overrides_max(tmp_path):
     assert vm['nested_helpers'] == 0
 
 
-@pytest.mark.parametrize('spec', ['vm(preset=typo)', 'vm(whiteboxAES=garbage)',
+@pytest.mark.parametrize('spec', ['vm(preset=light)', 'vm(preset=typo)', 'vm(whiteboxAES=garbage)',
     'vm(handlerVariants=notanumber)', 'vm(wrapperFamily=typo)', 'vm(whiteboxAES=1,encBytecode=0)'])
 def test_bad_config_rejected(tmp_path, spec):
     src = tmp_path / 'bad.ll'
@@ -54,8 +55,12 @@ def test_bad_config_rejected(tmp_path, spec):
 @pytest.mark.parametrize('detector,enabled,reason', [('tracerPid=1', True, None),
     ('integrity=1', False, 'no_detection_source'), ('debuggerProcess=1', False, 'no_detection_source')])
 def test_binding_uses_effective_detection_source(tmp_path, detector, enabled, reason):
-    vm, _ = transform_report(tmp_path, f'vm(hardened=1,whiteboxAES=1,bindAntiDebug=1), antidebug({detector})')
+    vm, ir = transform_report(tmp_path, f'vm(hardened=1,whiteboxAES=1,bindAntiDebug=1), antidebug({detector})')
     assert vm['effective']['bindAntiDebug'] is enabled
+    if enabled:
+        assert run_gate('vm_bindadeb_ctor_present', obf_ir=ir.read_text()) is None
+    else:
+        assert run_gate('vm_no_bindadeb_ctor', obf_ir=ir.read_text()) is None
     if reason:
         assert vm['disabled_reasons']['bindAntiDebug'] == reason
 

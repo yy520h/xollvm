@@ -186,18 +186,14 @@ EXTRA_ANN: Dict[str, str] = {
     "vm_v7_superops_stack":    "vm(minBlocks=1,obfRegIdx=1,encBytecode=1,useAES=1,"
                                "superOps=1,threadedDispatch=1,keyedDispatch=1,"
                                "encDispatch=1,lazyDecrypt=1,constInStream=1,nestedVM=1)",
-    # bindAntiDebug: fold anti-debug detection (IsDebuggerPresent +
-    # CheckRemoteDebuggerPresent + NtQueryInformationProcess) into the AES
-    # round-key mask global at .init_array priority 100, instead of
-    # salt-poisoning traps a patched detection call can simply avoid
-    # triggering. Requires hardened (implies antiDebug).
-    "vm_v7_bindadeb":          "vm(minBlocks=1,obfRegIdx=1,encBytecode=1,hardened=1,bindAntiDebug=1)",
-    "vm_v7_bindadeb_multi_fn": "vm(minBlocks=1,obfRegIdx=1,encBytecode=1,hardened=1,bindAntiDebug=1)",
+    # 绑定需要显式检测源；hardened 本身不再隐式开启检测。
+    "vm_v7_bindadeb":          "vm(minBlocks=1,obfRegIdx=1,encBytecode=1,hardened=1,bindAntiDebug=1,budgetMultiplier=1000), antidebug(tracerPid=1)",
+    "vm_v7_bindadeb_multi_fn": "vm(minBlocks=1,obfRegIdx=1,encBytecode=1,hardened=1,bindAntiDebug=1,budgetMultiplier=1000), antidebug(tracerPid=1)",
     # Full composition proof: bindAntiDebug + threadedDispatch + keyedDispatch +
     # encDispatch + lazyDecrypt + constInStream + nestedVM + superOps together.
     "vm_v7_bindadeb_stack":    "vm(minBlocks=1,obfRegIdx=1,encBytecode=1,useAES=1,hardened=1,"
-                               "bindAntiDebug=1,threadedDispatch=1,keyedDispatch=1,encDispatch=1,"
-                               "lazyDecrypt=1,constInStream=1,nestedVM=1,superOps=1)",
+                               "bindAntiDebug=1,budgetMultiplier=1000,threadedDispatch=1,keyedDispatch=1,encDispatch=1,"
+                               "lazyDecrypt=1,constInStream=1,nestedVM=1,superOps=1), antidebug(tracerPid=1)",
     # randISA: per-build randomization of semantic operand-field encodings.
     # Permutes the BinSubop byte (OP_BINOP/OP_BINOP64) and the ICmp predicate
     # byte (OP_ICMP/OP_ICMP64) module-uniformly from the module seed, so the
@@ -250,7 +246,6 @@ EXTRA_ANN: Dict[str, str] = {
                          "lazyDecrypt=1,constInStream=1)",
     # preset=<name>: config-surface shortcut resolved in VMPassConfig::fromPassConfig
     # before explicit knobs (which still override). medium == today's defaults.
-    "vm_v7_preset_light":  "vm(minBlocks=1,preset=light)",
     "vm_v7_preset_medium": "vm(minBlocks=1,preset=medium)",
     "vm_v7_preset_high":   "vm(minBlocks=1,preset=high)",
     "vm_v7_preset_max":    "vm(minBlocks=1,preset=max)",
