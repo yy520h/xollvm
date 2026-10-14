@@ -41,6 +41,31 @@ def test_post_vm_split_survives_commit(tmp_path):
     assert re.search(r'^[-\w.]+\.split[^\n]*:', body, re.M), 'split transformed the discarded original body'
 
 
+def test_encrypted_vm_modules_link_without_duplicate_crypto_helpers(tmp_path):
+    ndk = Path('/data/user/0/com.termux/files/home/android-ndk-r30-ollvm-r23-beta3'
+               '/toolchains/llvm/prebuilt/linux-arm64')
+    clang = ndk / 'bin/clang'
+    if not clang.exists():
+        pytest.skip('NDK clang unavailable')
+    _, result = obfuscate(tmp_path, 'vm(encBytecode=1,lazyDecrypt=1,constInStream=1,hardened=1)')
+    objects = []
+    for index in range(2):
+        ir = tmp_path / f'module{index}.ll'
+        lowered = '\n'.join(line for line in result.stdout.splitlines()
+                            if not line.startswith('@llvm.global.annotations'))
+        ir.write_text(lowered.replace('@target', f'@target_{index}') + '\n')
+        obj = tmp_path / f'module{index}.o'
+        proc = subprocess.run([str(clang), '--target=aarch64-linux-android26',
+                               '-O0', '-c', str(ir), '-o', str(obj)],
+                              capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, proc.stderr
+        objects.append(str(obj))
+    linked = subprocess.run([str(clang), '--target=aarch64-linux-android26',
+                             '-nostdlib', '-r', *objects, '-o', str(tmp_path / 'linked.o')],
+                            capture_output=True, text=True, timeout=60)
+    assert linked.returncode == 0, linked.stderr
+
+
 def test_vm_wrapper_honors_hard_budget(tmp_path):
     body, _ = obfuscate(tmp_path, VM[:-1] + ',budgetMultiplier=100,budgetMax=10)')
     assert '!obf.vm.caller' not in body, 'oversized wrapper escaped budget rollback'

@@ -25,6 +25,7 @@
 #include "llvm/Transforms/Obfuscator/FunctionObfContextAnalysis.h"
 #include "llvm/Transforms/Obfuscator/SensitiveDecision.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
+#include "llvm/Transforms/Obfuscator/AntiDebug.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Metadata.h"
@@ -37,7 +38,7 @@ using namespace llvm;
 // VMPassConfig
 // ============================================================================
 
-VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC) {
+VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC, bool Normalize) {
 	VMPassConfig Cfg;
 	Cfg.enable = PC.enabled;
 
@@ -88,6 +89,9 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC) {
 			Cfg.rollingRegKey = true;
 			Cfg.bindAntiDebug = true;
 			Cfg.randISA = true;
+			Cfg.extendedISA = Cfg.operandLayout = Cfg.encodedTargets = true;
+			Cfg.whiteboxAES = Cfg.nestedVMHardened = true;
+			Cfg.wrapperFamily = "auto";
 			Cfg.perFnEngine = true;         // dedicated engine per virtualized fn
 			Cfg.metamorphicEngines = true;  // distinct handler body per engine
 			Cfg.handlerVariants = 4;        // M6: preset flip -- benchmarked K=4/8/16;
@@ -96,18 +100,28 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC) {
 			// 180s harness cap (K=8: opt ~65s ok, but 373x-bloat IR blows clang
 			// -O0 past 180s; K=16: opt itself exceeds 180s). See docs/VM.md
 			// "Handler Polymorphism II" for the full writeup.
+		} else {
+			report_fatal_error(Twine("vm: unknown preset '") + P + "'", false);
 		}
-		// Unknown preset name: silently ignore, falls through to defaults +
-		// explicit knobs.
 	}
 
 	auto getUInt = [&](StringRef K, unsigned& O) {
 		auto It = PC.params.find(K.str());
-		if (It != PC.params.end()) O = (unsigned)std::stoul(It->second);
+		if (It != PC.params.end()) {
+			uint64_t N = 0;
+			if (StringRef(It->second).getAsInteger(10, N) || N > UINT32_MAX)
+				report_fatal_error(Twine("vm: invalid unsigned value for ") + K, false);
+			O = static_cast<unsigned>(N);
+		}
 		};
 	auto getBool = [&](StringRef K, bool& O) {
 		auto It = PC.params.find(K.str());
-		if (It != PC.params.end()) O = (It->second != "0" && It->second != "false");
+		if (It != PC.params.end()) {
+			StringRef V = It->second;
+			if (V != "0" && V != "1" && V != "false" && V != "true")
+				report_fatal_error(Twine("vm: invalid boolean for ") + K, false);
+			O = V == "1" || V == "true";
+		}
 		};
 	getUInt("minBlocks", Cfg.minBlocks);
 	getUInt("maxBlocks", Cfg.maxBlocks);
@@ -137,6 +151,11 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC) {
 	getBool("cloudDispatch", Cfg.cloudDispatch);
 	getBool("superOps", Cfg.superOps);
 	getBool("randISA", Cfg.randISA);
+	getBool("operandLayout", Cfg.operandLayout);
+	getBool("extendedISA", Cfg.extendedISA);
+	getBool("encodedTargets", Cfg.encodedTargets);
+	getBool("whiteboxAES", Cfg.whiteboxAES);
+	if (Cfg.whiteboxAES && !Cfg.encBytecode) report_fatal_error("whiteboxAES requires encBytecode=1");
 	getUInt("enginePoolSize", Cfg.enginePoolSize);
 	getBool("metamorphicEngines", Cfg.metamorphicEngines);
 	getBool("perFnEngine", Cfg.perFnEngine);
@@ -145,8 +164,11 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC) {
 		const std::string& F = It->second;
 		if (F == "auto" || F == "split" || F == "arena" || F == "outlined")
 			Cfg.wrapperFamily = F;
+		else report_fatal_error("vm: unknown wrapperFamily", false);
 	}
 
+	// 请求报告保留依赖归一化之前的值，与实际引擎配置分开。
+	if (!Normalize) return Cfg;
 	// lazyDecrypt requires encBytecode — nothing to defer if bytecode isn't encrypted.
 	if (!Cfg.encBytecode) Cfg.lazyDecrypt = false;
 	// hardened requires encBytecode (meaningful only with encrypted bytecode)
@@ -156,8 +178,7 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC) {
 	if (!Cfg.encBytecode) Cfg.constInStream = false;
 	// hardened implies regEncrypt — encrypted registers complement MBA-obscured handlers
 	if (Cfg.hardened) Cfg.regEncrypt = true;
-	// bindAntiDebug requires hardened + antiDebug (its detection substrate)
-	if (!Cfg.hardened || !Cfg.antiDebug) Cfg.bindAntiDebug = false;
+	// 检测来源在合并独立 antidebug pass 后确定；此处保留请求。
 	if (Cfg.handlerVariants < 1) Cfg.handlerVariants = 1;
 	if (Cfg.handlerVariants > kMaxHandlerVariants) Cfg.handlerVariants = kMaxHandlerVariants;
 	if (Cfg.handlerDecoys > 3) Cfg.handlerDecoys = 3;
@@ -165,6 +186,7 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC) {
 	// metamorphicEngines needs >1 engine to diversify across -- either an
 	// explicit pool or per-function engines.
 	if (Cfg.enginePoolSize < 2 && !Cfg.perFnEngine) Cfg.metamorphicEngines = false;
+	if (!Cfg.nestedVM) Cfg.nestedVMHardened = false;
 	return Cfg;
 }
 
@@ -241,9 +263,21 @@ PreservedAnalyses VMPass::run(Function& F, FunctionAnalysisManager& AM) {
 	}
 
 	auto Impl = std::make_unique<VMImpl>(VCtx);
+	if (auto PC = getObfConfig(F, AM).getPassConfig("vm"))
+		Impl->RequestedCfg = VMPassConfig::fromPassConfig(*PC, false);
 	if (auto AD = getObfConfig(F, AM).getPassConfig("antidebug"))
 		Impl->AntiDebug = AntiDebugConfig::fromPassConfig(*AD);
 	Impl->AntiDebug.mergeCompatibility(VCtx.Cfg);
+	Impl->AntiDebug = effectiveAntiDebugConfig(*F.getParent(), Impl->AntiDebug);
+	const auto& AD = Impl->AntiDebug;
+	bool HasChecks = hasAntiDebugDetectionSource(AD);
+	Impl->BindAntiDebug = VCtx.Cfg.bindAntiDebug && VCtx.Cfg.hardened &&
+		AD.enabled && AD.responseCorrupt && HasChecks;
+	Impl->Cfg.bindAntiDebug = Impl->BindAntiDebug;
+	Impl->Cfg.antiDebugConfig = AD;
+	if (VCtx.Cfg.bindAntiDebug && !Impl->BindAntiDebug)
+		Impl->BindDisabledReason = !VCtx.Cfg.hardened ? "requires_hardened" :
+			(!AD.enabled || !HasChecks) ? "no_detection_source" : "response_disabled";
 	if (auto* Coordinator = VMPlanCoordinator::active()) {
 		if (!Impl->prepare()) {
 			std::string R = Impl->FailReason.empty() ? "impl_failed" : Impl->FailReason;
@@ -256,11 +290,12 @@ PreservedAnalyses VMPass::run(Function& F, FunctionAnalysisManager& AM) {
 			}
 			return PreservedAnalyses::all();
 		}
-		EngineConfigKey Key = EngineConfigKey::fromConfig(VCtx.Cfg,
+		EngineConfigKey Key = EngineConfigKey::fromConfig(Impl->Cfg,
 			VMEngine::enginePoolOf(Impl->EngineId), Impl->EngineId, VCtx.MasterSeed,
 			&Impl->AntiDebug);
 		VMImpl* Raw = Impl.get();
-		if (auto* C = Coordinator->addPrepared(std::move(Impl), VCtx.Cfg, Key)) {
+		VMPassConfig Effective = Impl->Cfg;
+		if (auto* C = Coordinator->addPrepared(std::move(Impl), Effective, Key)) {
 			if (SensitiveRequired) {
 				C->Required = true;
 				C->SensitiveStrict = SensitiveStrict;

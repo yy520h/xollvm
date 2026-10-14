@@ -128,7 +128,16 @@ namespace llvm {
 		// a lone `and` nor the bit-test compare. pred byte is EQ or NE only.
 		OP_ANDCMPZ = 0x37,  // dst:u8 a:u8 b:u8 pred:u8  (5 bytes) -- dst = ((a&b) <eq|ne> 0) (i32 0/1)
 
-		OP_COUNT = 0x38
+		OP_ADDI32 = 0x38, OP_SUBI32, OP_MULI32, OP_ANDI32, OP_ORI32, OP_XORI32,
+		OP_SHLI32, OP_LSHRI32, OP_ASHRI32,
+		OP_ADDI64, OP_SUBI64, OP_MULI64, OP_ANDI64, OP_ORI64, OP_XORI64,
+		OP_SHLI64, OP_LSHRI64, OP_ASHRI64,
+		OP_MULADD64 = 0x4A, OP_SHLADD64, OP_CMPSEL64, OP_ANDCMPZ64,
+		OP_XORADD32, OP_ANDADD32, OP_ORADD32, OP_ADDXOR32, OP_SUBXOR32, OP_MULXOR32,
+		OP_XORADD64, OP_ANDADD64, OP_ORADD64, OP_ADDXOR64, OP_SUBXOR64, OP_MULXOR64,
+		OP_GEP_LOAD8 = 0x5A, OP_GEP_LOAD16, OP_GEP_LOAD32, OP_GEP_LOAD64,
+		OP_GEP_STORE32, OP_GEP_STORE64,
+		OP_COUNT = 0x60
 	};
 
 	// Max handler-body variants per opcode in the shared __vm_engine.
@@ -143,8 +152,8 @@ namespace llvm {
 	// M4 hooks them behind opaque-false guards). Count driven by
 	// VMPassConfig.handlerDecoys (0 = off = zero decoys registered).
 	static constexpr unsigned kMaxDecoys      = 32;
-	static constexpr uint8_t  OP_DECOY_BASE   = 0x38;  // == OP_COUNT
-	static constexpr unsigned OP_COUNT_TOTAL  = (unsigned)OP_DECOY_BASE + kMaxDecoys;  // 0x58
+	static constexpr uint8_t  OP_DECOY_BASE   = OP_COUNT;
+	static constexpr unsigned OP_COUNT_TOTAL  = (unsigned)OP_DECOY_BASE + kMaxDecoys;
 	static_assert((unsigned)OP_DECOY_BASE == (unsigned)OP_COUNT, "OP_DECOY_BASE must sit immediately after real opcodes");
 
 	// ============================================================================
@@ -343,18 +352,18 @@ namespace llvm {
 	//               FCMP_OEQ..FCMP_UNO = 1..14; FCMP_FALSE=0 / FCMP_TRUE=15 pass
 	//               through unchanged and still hit the handler's default = 0)
 	//
-	// Not covered (documented, intentionally left identity): Cast64Kind (the
-	// handler branches ext/trunc on a Kind>=C64_TRUNC1 range test — permuting
-	// breaks the ordering), FCastKind (each opcode only does a single binary
-	// signed/unsigned Kind== check — negligible diversity), OP_SELECT kind (a
-	// 3-value register-file selector via structural branches, not a semantic op).
+	// v2 补齐 Cast64Kind、FCastKind 和 SELECT 文件选择器；handler 按编码 case
+	// 判断，不能再依赖枚举排序。操作数位置由 VMInstructionLayout 独立描述。
 	// ============================================================================
 
 	struct ISAEnc {
-		static constexpr unsigned kEncodingVersion = 1;
+		static constexpr unsigned kEncodingVersion = 2;
 		static constexpr unsigned kNumBinSubop  = 13;  // BS_ADD .. BS_UREM
 		static constexpr unsigned kNumCastKind  = 8;   // CK_ZEXT1 .. CK_TRUNC16
 		static constexpr unsigned kNumFBinSubop = 5;   // FBS_FADD .. FBS_FREM
+		static constexpr unsigned kNumCast64Kind = 11;
+		static constexpr unsigned kNumFCastKind = 10;
+		static constexpr unsigned kNumSelectKind = 3;
 
 		// ICmp / FCmp predicates are raw LLVM CmpInst::Predicate enum values,
 		// contiguous runs. Kept as literals so this header stays free of LLVM IR
@@ -370,10 +379,16 @@ namespace llvm {
 		uint8_t CastKindL2P[kNumCastKind];    // logical CastKind   -> physical byte
 		uint8_t FBinSubopL2P[kNumFBinSubop];  // logical FBinSubop  -> physical byte
 		uint8_t FcmpPredL2P[kNumFcmpPred];    // (pred - base)      -> physical pred byte
+		uint8_t Cast64KindL2P[kNumCast64Kind];
+		uint8_t FCastKindL2P[kNumFCastKind];
+		uint8_t SelectKindL2P[kNumSelectKind];
 
 		ISAEnc() { initIdentity(); }
 
 		void initIdentity() {
+			for (unsigned i = 0; i < kNumCast64Kind; ++i) Cast64KindL2P[i] = (uint8_t)i;
+			for (unsigned i = 0; i < kNumFCastKind; ++i) FCastKindL2P[i] = (uint8_t)i;
+			for (unsigned i = 0; i < kNumSelectKind; ++i) SelectKindL2P[i] = (uint8_t)i;
 			for (unsigned i = 0; i < kNumBinSubop; ++i)  BinSubopL2P[i]  = (uint8_t)i;
 			for (unsigned i = 0; i < kNumCastKind; ++i)  CastKindL2P[i]  = (uint8_t)i;
 			for (unsigned i = 0; i < kNumFBinSubop; ++i) FBinSubopL2P[i] = (uint8_t)i;
@@ -406,6 +421,28 @@ namespace llvm {
 		void initFBinPermuted(TRand& R) { shuffleInto(R, FBinSubopL2P, kNumFBinSubop, 0); }
 		template <typename TRand>
 		void initFcmpPermuted(TRand& R) { shuffleInto(R, FcmpPredL2P, kNumFcmpPred, kFcmpPredBase); }
+		template <typename TRand>
+		void initCast64Permuted(TRand& R) { shuffleInto(R, Cast64KindL2P, kNumCast64Kind, 0); }
+		template <typename TRand>
+		void initFCastPermuted(TRand& R) { shuffleInto(R, FCastKindL2P, kNumFCastKind, 0); }
+		template <typename TRand>
+		void initSelectPermuted(TRand& R) { shuffleInto(R, SelectKindL2P, kNumSelectKind, 0); }
+
+		uint8_t encCast64Kind(uint8_t K) const { return K < kNumCast64Kind ? Cast64KindL2P[K] : K; }
+		uint8_t encFCastKind(uint8_t K) const { return K < kNumFCastKind ? FCastKindL2P[K] : K; }
+		uint8_t encSelectKind(uint8_t K) const { return K < kNumSelectKind ? SelectKindL2P[K] : K; }
+		uint8_t decCast64Kind(uint8_t P) const {
+			for (unsigned i = 0; i < kNumCast64Kind; ++i) if (Cast64KindL2P[i] == P) return i;
+			return 0xFF;
+		}
+		uint8_t decFCastKind(uint8_t P) const {
+			for (unsigned i = 0; i < kNumFCastKind; ++i) if (FCastKindL2P[i] == P) return i;
+			return 0xFF;
+		}
+		uint8_t decSelectKind(uint8_t P) const {
+			for (unsigned i = 0; i < kNumSelectKind; ++i) if (SelectKindL2P[i] == P) return i;
+			return 0xFF;
+		}
 
 		uint8_t encBinSubop(uint8_t Logical) const {
 			return (Logical < kNumBinSubop) ? BinSubopL2P[Logical] : Logical;

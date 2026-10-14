@@ -369,7 +369,7 @@ namespace llvm {
 		// 0 = all eligible opcodes nest; N>0 = only the first N, in the fixed
 		// order BINOP, BINOP64, ICMP, ICMP64, FCMP, CAST (see kNestedHelperOrder).
 		unsigned nestedVMOpcodes = 0;
-		bool     nestedVMHardened = false; // reserved: harden the inner VM layer (unused)
+		bool     nestedVMHardened = false; // 真实内层加固，max 开启
 
 		// threadedDispatch: inline the fetch/decode/indirectbr sequence into
 		// every handler's back-edge instead of routing through one shared
@@ -404,6 +404,10 @@ namespace llvm {
 		// signature for the permuted families. Off = byte-identical (identity map).
 		// 默认开启；preset 展开后仍由显式 randISA=0 覆盖。
 		bool     randISA = true;
+		bool     operandLayout = false; // ISA v2 字段排列；max 默认值在组合验收阶段接入
+		bool     extendedISA = false; // 真实立即数/复合指令发射
+		bool     encodedTargets = false; // 最终 ELF 相对地址封装
+		bool     whiteboxAES = false; // VM 密钥融合表后端
 
 		// enginePoolSize: number of distinct shared VM engines built per module
 		// (W1 "the real kill"). N>1 builds N structurally-independent engines;
@@ -438,7 +442,7 @@ namespace llvm {
 		std::string wrapperFamily = "split";
 		AntiDebugConfig antiDebugConfig;
 
-		static VMPassConfig fromPassConfig(const PassConfig& PC);
+		static VMPassConfig fromPassConfig(const PassConfig& PC, bool Normalize = true);
 		bool validate() const;
 	};
 

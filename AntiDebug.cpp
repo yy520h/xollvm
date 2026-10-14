@@ -581,6 +581,14 @@ void createMonitor(Module& M, const AntiDebugConfig& Cfg, GlobalVariable* Respon
 
 } // namespace
 
+AntiDebugConfig llvm::effectiveAntiDebugConfig(const Module& M, AntiDebugConfig Cfg) {
+	return effectiveConfig(M, Cfg);
+}
+
+bool llvm::hasAntiDebugDetectionSource(const AntiDebugConfig& Cfg) {
+	return hasChecks(Cfg);
+}
+
 GlobalVariable* llvm::getOrCreateAntiDebugResponse(Module& M, const AntiDebugConfig& Cfg) {
 	return responseState(M, configKey(effectiveConfig(M, Cfg)));
 }

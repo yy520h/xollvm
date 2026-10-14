@@ -20,6 +20,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
+#include "VMTargets.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -43,7 +44,7 @@ namespace {
 	constexpr unsigned kMaxRanges = 8;
 
 	cl::opt<std::string> Command(cl::Positional,
-		cl::desc("<audit|seal|verify>"), cl::Required);
+		cl::desc("<audit|seal|verify|targets>"), cl::Required);
 	cl::opt<std::string> Input("input", cl::desc("ELF input path"), cl::Required);
 	cl::opt<std::string> Output("output", cl::desc("sealed ELF output path"),
 		cl::init(""));
@@ -115,9 +116,9 @@ namespace {
 int main(int argc, char** argv) {
 	cl::ParseCommandLineOptions(argc, argv, "xollvm ELF hardener\n");
 
-	if (Command != "audit" && Command != "seal" && Command != "verify") {
+	if (Command != "audit" && Command != "seal" && Command != "verify" && Command != "targets") {
 		errs() << "error: unknown command '" << Command
-			<< "' (expected audit|seal|verify)\n";
+			<< "' (expected audit|seal|verify|targets)\n";
 		return Malformed;
 	}
 
@@ -130,7 +131,20 @@ int main(int argc, char** argv) {
 	MemoryBuffer& Buf = *BufOrErr.get();
 	ArrayRef<uint8_t> Data(
 		reinterpret_cast<const uint8_t*>(Buf.getBufferStart()), Buf.getBufferSize());
-
+	std::vector<uint8_t> FinalTargets(Data.begin(), Data.end());
+	if (Command == "targets" || Command == "seal") {
+		auto N = finalizeVMTargets(FinalTargets);
+		if (!N) { errs() << toString(N.takeError()) << "\n"; return Malformed; }
+		Data = FinalTargets;
+		if (Command == "targets") {
+			if (Output.empty()) { errs() << "error: targets requires --output\n"; return Malformed; }
+			std::error_code EC; raw_fd_ostream OS(Output, EC, sys::fs::OF_None);
+			if (EC) { errs() << "error: " << EC.message() << "\n"; return Malformed; }
+			OS.write(reinterpret_cast<const char*>(Data.data()), Data.size()); OS.close();
+			if (OS.has_error()) { errs() << "error: target output write failed\n"; return Malformed; }
+			errs() << "targets: " << *N << " descriptor(s)\n"; return Ok;
+		}
+	}
 	if (Data.size() < sizeof(ELF::Elf64_Ehdr)) {
 		errs() << "error: file smaller than an ELF64 header\n";
 		return Malformed;
@@ -155,6 +169,9 @@ int main(int argc, char** argv) {
 		errs() << "error: expected AArch64 ELF (EM_AARCH64)\n";
 		return Malformed;
 	}
+	// 基础格式错误仍为 malformed；合法 ELF 标头之后的篡改验证为策略失败。
+	auto Targets = verifyVMTargets(Data);
+	if (!Targets) { errs() << toString(Targets.takeError()) << "\n"; return Command == "verify" ? PolicyViolation : Malformed; }
 
 	const uint64_t PhOff = Ehdr->e_phoff;
 	const uint64_t PhEnt = Ehdr->e_phentsize;
@@ -291,6 +308,15 @@ int main(int argc, char** argv) {
 			}
 		}
 		if (!ManFound) {
+			if (*Targets) {
+				if (Command == "seal") {
+					if (Output.empty()) { errs() << "error: seal requires --output\n"; return Malformed; }
+					std::error_code EC; raw_fd_ostream OS(Output, EC, sys::fs::OF_None);
+					if (EC) { errs() << "error: " << EC.message() << "\n"; return Malformed; }
+					OS.write(reinterpret_cast<const char*>(Data.data()), Data.size());
+				}
+				errs() << "targets verified; no integrity manifest\n"; return Ok;
+			}
 			errs() << "error: no xollvm integrity manifest found\n";
 			return Malformed;
 		}

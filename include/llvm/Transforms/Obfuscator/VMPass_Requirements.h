@@ -6,6 +6,7 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationConfig.h"
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Layout.h"
 
 #include <array>
 #include <cstdint>
@@ -23,7 +24,7 @@ struct VMRequirementSet {
 	SmallBitVector Opcodes = SmallBitVector(OP_COUNT);
 	SmallBitVector BinSubops[2] = {SmallBitVector(13), SmallBitVector(13)};
 	SmallBitVector IcmpPredicates[2] = {SmallBitVector(42), SmallBitVector(42)};
-	SmallBitVector SuperPredicates[2] = {SmallBitVector(42), SmallBitVector(42)};
+	SmallBitVector SuperPredicates[4] = {SmallBitVector(42), SmallBitVector(42), SmallBitVector(42), SmallBitVector(42)};
 	SmallBitVector CastKinds[2] = {SmallBitVector(8), SmallBitVector(11)};
 	SmallBitVector FBinSubops = SmallBitVector(5);
 	SmallBitVector FcmpPredicates = SmallBitVector(16);
@@ -99,6 +100,15 @@ struct VMDependencyWitness {
 };
 
 struct VMEngineWitness {
+	VMPassConfig Requested;
+	VMPassConfig Effective;
+	VMRequirementSet CallerRequirements;
+	std::string WrapperFamily;
+	std::string BindDisabledReason;
+	std::string Phase;
+	unsigned NestedHelperCount = 0;
+	unsigned WhiteboxInstances = 0;
+	unsigned ModuleWhiteboxInstances = 0;
 	unsigned EngineId = 0;
 	EngineConfigKey ConfigKey;
 	VMRequirementSet Requirements;

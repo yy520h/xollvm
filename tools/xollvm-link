@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# MT 终端使用 bash xollvm-link；工具路径可显式覆盖，参数保持数组。
+set -euo pipefail
+bindir=$(builtin cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+compiler=${XOLLVM_LINK_COMPILER:-"$bindir/clang++"}
+hardener=${XOLLVM_ELF_HARDENER:-"$bindir/xollvm-elf-hardener"}
+[[ -x "$compiler" ]] || { printf 'xollvm-link: compiler unavailable: %s\n' "$compiler" >&2; exit 2; }
+[[ -x "$hardener" ]] || { printf 'xollvm-link: hardener unavailable: %s\n' "$hardener" >&2; exit 2; }
+output=a.out
+args=()
+while (($#)); do
+    case "$1" in
+        -o)
+            (($# >= 2)) || { printf 'xollvm-link: -o requires a path\n' >&2; exit 2; }
+            output=$2; shift 2 ;;
+        -o?*) output=${1:2}; shift ;;
+        -c|-S|-E|-fsyntax-only)
+            printf 'xollvm-link: link-only entry received %s\n' "$1" >&2; exit 2 ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+[[ -n "$output" && "$output" != - ]] || { printf 'xollvm-link: output must be a file\n' >&2; exit 2; }
+parent=$(dirname -- "$output")
+[[ -d "$parent" ]] || { printf 'xollvm-link: output directory missing\n' >&2; exit 2; }
+temp=$(mktemp "$parent/.xollvm-link.XXXXXXXX")
+trap 'rm -f -- "$temp"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+"$compiler" "${args[@]}" -o "$temp"
+"$hardener" targets --input "$temp" --output "$temp"
+"$hardener" audit --input "$temp"
+"$hardener" seal --input "$temp" --output "$temp"
+"$hardener" verify --input "$temp"
+chmod 755 -- "$temp"
+mv -f -- "$temp" "$output"

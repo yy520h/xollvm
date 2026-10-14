@@ -234,6 +234,8 @@ bool VMImpl::prepare() {
 	E.setKeyedDispatch(SaltConst, KeyedDispatch);
 	E.setSuperOps(SuperOps);
 	E.setISAEnc(&IsaEnc);
+	E.setLayout(Layout);
+	E.setExtendedISA(Cfg.extendedISA);
 	if (!E.run(F, CTSalt, M.getDataLayout())) {
 		FailReason = E.getFailReason().str();
 		if (FailReason.empty()) FailReason = "bytecode emission failed";
@@ -326,6 +328,13 @@ bool VMImpl::prepare() {
 
 bool VMImpl::commit() {
 	if (!Prepared || Committed) return false;
+	if (Cfg.encodedTargets) {
+		Triple T(M.getTargetTriple());
+		if (!T.isAArch64() || !T.isLittleEndian() || !T.isOSBinFormatELF())
+			report_fatal_error("encodedTargets requires AArch64 little-endian ELF");
+	}
+	// 直接/增量提交同样需要原模块的 callee，不能依赖 coordinator 调用。
+	remapPreparedExternalValues();
 
 
 	// Erase original body
@@ -340,7 +349,7 @@ bool VMImpl::commit() {
 	// it. See the sequencing note above virtualizeNestedHelpersOnce().
 	if (NestedVM) {
 		for (const auto& H : kNestedHelperOrder)
-			if (opcodeNests(H.Op))
+			if (opcodeNests(H.Op) && needsOpcode(H.Op))
 				getOrCreateNestedHelper(H.Op);
 	}
 
@@ -349,8 +358,7 @@ bool VMImpl::commit() {
 
 	// Nested-VM: inner-virtualize the helper(s), once per module. Must run
 	// AFTER populateVMEngine() above -- see sequencing note.
-	if (NestedVM)
-		virtualizeNestedHelpersOnce();
+	if (NestedVM && !virtualizeNestedHelpersOnce()) return false;
 
 	// Extend CALL handler switches if this function introduced new FTys
 	ensureCallFTyCases();
@@ -382,12 +390,6 @@ bool VMImpl::commit() {
 
 	// Encryption constructor (per-function, targets GVBytecodeRT)
 	buildEncryptCtor();
-
-	// .init_array anti-debug key-mask fold (bindAntiDebug only; must be
-	// registered at a lower .init_array priority than buildEncryptCtor's
-	// AES ctor above so it runs first at startup and corrupts the masked
-	// key global before the AES ctor unmasks it)
-	buildAntiDebugKeyBindCtor();
 
 	// .init_array bytecode integrity hash (hardened + antiDebug)
 	buildIntegrityHashCtor();
@@ -450,6 +452,8 @@ void VMImpl::setFullHandlerRequirements() {
 		P < ISAEnc::kIcmpPredBase + ISAEnc::kNumIcmpPred; ++P) {
 		HandlerRequirements.requireIcmpPredicate(OP_ICMP, P);
 		HandlerRequirements.requireIcmpPredicate(OP_ICMP64, P);
+		HandlerRequirements.requireIcmpPredicate(OP_CMPSEL64, P);
+		if (P <= CmpInst::ICMP_NE) HandlerRequirements.requireIcmpPredicate(OP_ANDCMPZ64, P);
 	}
 	for (unsigned K = 0; K < 8; ++K) {
 		HandlerRequirements.requireCastKind(OP_CAST, K);

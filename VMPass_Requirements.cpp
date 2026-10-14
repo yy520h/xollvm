@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Requirements.h"
+#include "llvm/Transforms/Obfuscator/Rng.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -20,7 +21,13 @@ constexpr const char *OpcodeNames[] = {
 	"loadi_f", "movr_f", "binop_f", "fcmp", "fcast_ff", "load_f", "store_f",
 	"ret_f", "select_f", "call_int64", "call_f", "fneg", "load_f32",
 	"store_f32", "fcast_fv", "fcast_fv64", "fcast_vf", "fcast_v64f",
-	"loadi64", "muladd", "shladd", "cmpsel", "andcmpz"
+	"loadi64", "muladd", "shladd", "cmpsel", "andcmpz",
+	"addi32", "subi32", "muli32", "andi32", "ori32", "xori32", "shli32", "lshri32", "ashri32",
+	"addi64", "subi64", "muli64", "andi64", "ori64", "xori64", "shli64", "lshri64", "ashri64",
+	"muladd64", "shladd64", "cmpsel64", "andcmpz64",
+	"xoradd32", "andadd32", "oradd32", "addxor32", "subxor32", "mulxor32",
+	"xoradd64", "andadd64", "oradd64", "addxor64", "subxor64", "mulxor64",
+	"gep_load8", "gep_load16", "gep_load32", "gep_load64", "gep_store32", "gep_store64"
 };
 static_assert(std::size(OpcodeNames) == OP_COUNT);
 
@@ -60,6 +67,8 @@ const SmallBitVector *predicateSet(const VMRequirementSet &R, VMOp Op) {
 	case OP_ICMP64: return &R.IcmpPredicates[1];
 	case OP_CMPSEL: return &R.SuperPredicates[0];
 	case OP_ANDCMPZ: return &R.SuperPredicates[1];
+	case OP_CMPSEL64: return &R.SuperPredicates[2];
+	case OP_ANDCMPZ64: return &R.SuperPredicates[3];
 	default: return nullptr;
 	}
 }
@@ -127,7 +136,7 @@ void VMRequirementSet::requireIcmpPredicate(VMOp Op, uint8_t Logical) {
 	auto *Bits = const_cast<SmallBitVector *>(predicateSet(*this, Op));
 	requireValid(Bits && Logical >= ISAEnc::kIcmpPredBase &&
 		Logical < ISAEnc::kIcmpPredBase + ISAEnc::kNumIcmpPred &&
-		(Op != OP_ANDCMPZ || Logical <= ISAEnc::kIcmpPredBase + 1));
+		((Op != OP_ANDCMPZ && Op != OP_ANDCMPZ64) || Logical <= ISAEnc::kIcmpPredBase + 1));
 	requireOpcode(Op);
 	Bits->set(Logical);
 }
@@ -181,9 +190,9 @@ void VMRequirementSet::merge(const VMRequirementSet &Other) {
 	for (unsigned I = 0; I < 2; ++I) {
 		BinSubops[I] |= Other.BinSubops[I];
 		IcmpPredicates[I] |= Other.IcmpPredicates[I];
-		SuperPredicates[I] |= Other.SuperPredicates[I];
 		CastKinds[I] |= Other.CastKinds[I];
 	}
+	for (unsigned I = 0; I < 4; ++I) SuperPredicates[I] |= Other.SuperPredicates[I];
 	FBinSubops |= Other.FBinSubops;
 	FcmpPredicates |= Other.FcmpPredicates;
 	SelectKinds |= Other.SelectKinds;
@@ -207,6 +216,22 @@ void VMRequirementSet::closeDependencies(const VMPassConfig &Cfg) {
 	// 控制/寻址中的宿主算术不构成 VM BINOP 需求；所有 opcode 都来自发射点。
 	for (unsigned I = 0; I < OP_COUNT; ++I) {
 		if (!Opcodes.test(I)) continue;
+		if (I >= OP_ADDI32 && I <= OP_ASHRI64) {
+			NeedsRegFile[I >= OP_ADDI64 ? 1 : 0] = true;
+			continue;
+		}
+		if (I >= OP_MULADD64 && I <= OP_MULXOR64) {
+			bool Is64 = I <= OP_ANDCMPZ64 || I >= OP_XORADD64;
+			NeedsRegFile[Is64 ? 1 : 0] = NeedsSuperOps = true;
+			if (I == OP_ANDCMPZ64) NeedsRegFile[0] = true;
+			continue;
+		}
+		if (I >= OP_GEP_LOAD8 && I <= OP_GEP_STORE64) {
+			NeedsRegFile[3] = true;
+			// index kind 随指令变化，闭包必须允许两种整数索引文件。
+			NeedsRegFile[0] = NeedsRegFile[1] = NeedsSuperOps = true;
+			continue;
+		}
 		switch (static_cast<VMOp>(I)) {
 		case OP_LOADI: case OP_MOVR: case OP_BINOP: case OP_ICMP: case OP_CAST:
 		case OP_JMPC: case OP_SWITCH: case OP_CALL_INT:
@@ -240,6 +265,7 @@ void VMRequirementSet::closeDependencies(const VMPassConfig &Cfg) {
 		case OP_MULADD: case OP_SHLADD: case OP_CMPSEL: case OP_ANDCMPZ:
 			NeedsRegFile[0] = NeedsSuperOps = true; break;
 		case OP_JMP: case OP_RET_VOID: case OP_CALL_VOID: case OP_COUNT: break;
+		default: break; // 扩展指令文件依赖已在上方分类
 		}
 	}
 	NeedsConstStream |= Cfg.constInStream &&
@@ -290,6 +316,11 @@ bool VMRequirementSet::allowsCallType(FunctionType *FTy) const {
 
 json::Object VMRequirementSet::toJson() const {
 	json::Object O;
+	json::Array Opcodes, OpcodeLabels;
+	for (unsigned I = 0; I < OP_COUNT; ++I) if (contains(static_cast<VMOp>(I))) {
+		Opcodes.push_back(I); OpcodeLabels.push_back(vmOpcodeName(static_cast<VMOp>(I)));
+	}
+	O["opcodes"] = std::move(Opcodes); O["opcode_names"] = std::move(OpcodeLabels);
 	for (unsigned I = 0; I < OP_COUNT; ++I) {
 		VMOp Op = static_cast<VMOp>(I);
 		if (!contains(Op)) continue;
@@ -345,6 +376,10 @@ unsigned EnginePool, unsigned EngineOwner, uint64_t MappingSeed,
 	VM_BOOL(rollingRegKey); VM_BOOL(antiDebug); VM_BOOL(bindAntiDebug);
 	VM_BOOL(nestedVM); VM_BOOL(nestedVMHardened); VM_BOOL(threadedDispatch);
 	VM_BOOL(keyedDispatch); VM_BOOL(superOps); VM_BOOL(randISA);
+	VM_BOOL(operandLayout);
+	VM_BOOL(extendedISA);
+	VM_BOOL(encodedTargets);
+	VM_BOOL(whiteboxAES);
 	VM_BOOL(cloudDispatch);
 	VM_BOOL(metamorphicEngines); VM_BOOL(perFnEngine);
 #undef VM_BOOL
@@ -358,7 +393,11 @@ unsigned EnginePool, unsigned EngineOwner, uint64_t MappingSeed,
 	Key.Fields.emplace_back("engine_pool", EnginePool);
 	Key.Fields.emplace_back("engine_owner", Cfg.perFnEngine ? EngineOwner : 0);
 	Key.Fields.emplace_back("isa_version", ISAEnc::kEncodingVersion);
-	Key.Fields.emplace_back("mapping_seed", Cfg.randISA ? MappingSeed : 0);
+	Key.Fields.emplace_back("mapping_seed", Cfg.randISA || Cfg.operandLayout ? MappingSeed : 0);
+	Key.Fields.emplace_back("layout_version", VMInstructionLayout::Version);
+	Key.Fields.emplace_back("target_version", 1);
+	Key.Fields.emplace_back("whitebox_version", 1);
+	Key.Fields.emplace_back("wrapper_family", obf::fnv1a64(Cfg.wrapperFamily));
 	const AntiDebugConfig& AD = AntiDebug ? *AntiDebug : Cfg.antiDebugConfig;
 	Key.Fields.emplace_back("ad_enabled", AD.enabled);
 	Key.Fields.emplace_back("ad_tracer_pid", AD.tracerPid);
@@ -414,7 +453,24 @@ unsigned VMEnginePlan::handlerTableEntries() const {
 
 json::Object VMEngineWitness::toJson() const {
 	json::Object O;
-	O["version"] = 1;
+	O["requested"] = EngineConfigKey::fromConfig(Requested, 0, EngineId, ModuleSeed).toJson();
+	O["effective"] = ConfigKey.toJson();
+	O["caller_requirements"] = CallerRequirements.toJson();
+	O["wrapper_family"] = WrapperFamily;
+	O["phase"] = Phase;
+	O["post_link"] = Effective.encodedTargets ? "pending" : "not_required";
+	O["nested_helpers"] = NestedHelperCount;
+	O["whitebox_instances"] = WhiteboxInstances;
+	O["module_whitebox_instances"] = ModuleWhiteboxInstances;
+	json::Object Disabled;
+	if (!BindDisabledReason.empty()) Disabled["bindAntiDebug"] = BindDisabledReason;
+	if (Requested.lazyDecrypt && !Effective.lazyDecrypt) Disabled["lazyDecrypt"] = "requires_encBytecode";
+	if (Requested.hardened && !Effective.hardened) Disabled["hardened"] = "requires_encBytecode";
+	if (Requested.constInStream && !Effective.constInStream) Disabled["constInStream"] = "requires_encBytecode";
+	if (Requested.metamorphicEngines && !Effective.metamorphicEngines) Disabled["metamorphicEngines"] = "requires_multiple_engines";
+	if (Requested.nestedVMHardened && !Effective.nestedVMHardened) Disabled["nestedVMHardened"] = "requires_nestedVM";
+	O["disabled_reasons"] = std::move(Disabled);
+	O["version"] = 2;
 	O["engine_id"] = EngineId;
 	O["config_key"] = ConfigKey.toJson();
 	O["requirements"] = Requirements.toJson();
@@ -447,6 +503,9 @@ json::Object VMEngineWitness::toJson() const {
 	M["cast_kind"] = mapValues(Maps.CastKindL2P);
 	M["fbin_subop"] = mapValues(Maps.FBinSubopL2P);
 	M["fcmp_predicate"] = mapValues(Maps.FcmpPredL2P);
+	M["cast64_kind"] = mapValues(Maps.Cast64KindL2P);
+	M["fcast_kind"] = mapValues(Maps.FCastKindL2P);
+	M["select_kind"] = mapValues(Maps.SelectKindL2P);
 	O["isa_maps"] = std::move(M);
 	return O;
 }

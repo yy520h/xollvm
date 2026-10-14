@@ -1,4 +1,5 @@
 #pragma once
+#include "llvm/Transforms/Obfuscator/VMPass_Decode.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -268,32 +269,39 @@ namespace llvm {
 			AllocaInst* EngineJunk = nullptr; // [NJunk x i32] private sink for decoy stores
 
 			SmallVector<FunctionType*, 16> SharedFTys;
-			DenseMap<FunctionType*, uint8_t> FTyToIdx;
+			SmallVector<AttributeList, 16> SharedCallAttrs;
+			DenseMap<std::pair<FunctionType*, void*>, uint8_t> FTyToIdx;
 
 		struct CallSwitchInfo {
 			SwitchInst* SW = nullptr;
 			BasicBlock* MergeBB = nullptr;
 			PHINode* RetPHI = nullptr;
 			Value* Callee = nullptr;
-			SmallVector<Value*, 8> PVals, IVals, I64Vs, F32Vs, FregVals;
 			RetKind2    RK = RK2_VOID;
+			VMByteDecodeContext Decode;
+			Value* OperandIP = nullptr;
+			Value* Regs = nullptr;
+			Value* Regs64 = nullptr;
+			Value* Fregs = nullptr;
+			Value* Pregs = nullptr;
+			Value* RegKeys = nullptr;
+			Value* Reg64Keys = nullptr;
+			Value* FRegKeys = nullptr;
+			bool RegEncrypt = false;
+			unsigned Variant = 0;
 
 			// Engine-context pointers captured when this CALL handler was built.
 			// ensureCallFTyCases() runs on a DIFFERENT VMImpl whose Eff* point
 			// at that function's own state, not the engine's, so it must reload
 			// args from the engine's bytecode using these captured pointers.
-			Value* EffBC = nullptr;
-			Value* EffSalt = nullptr;
 			Value* MaskVR = nullptr;
 			Value* MaskVR64 = nullptr;
 			Value* MaskFR = nullptr;
 			Value* MaskPR = nullptr;
-			bool EncBytecode = false;
-			bool StrongBC = false;
 			bool ObfRegIdx = false;
-			unsigned ArgByteBase = 0;   // first arg-byte offset (0 void, else 1)
+			unsigned ArgByteBase = 0;   // CALL 操作数起点到首个参数字节的偏移
 		};
-			CallSwitchInfo CallSW[5];
+			SmallVector<CallSwitchInfo, 4> CallSW[5];
 
 			bool Populated = false;
 			unsigned FTyCountAtLastBuild = 0;
@@ -357,6 +365,9 @@ namespace llvm {
 		// have no FunctionObfContext / annotation of their own).
 		VMPassConfig Cfg;
 		AntiDebugConfig AntiDebug;
+		VMPassConfig RequestedCfg;
+		std::string BindDisabledReason;
+		std::string ActualWrapperFamily;
 		obf::Rng     R;
 
 		const bool     ObfRegIdx;
@@ -369,12 +380,12 @@ namespace llvm {
 		const bool     ConstInStream; // move int/i64/fp constants into the encrypted bytecode stream instead of plaintext wrapper stores
 		const bool     NestedVM;         // eligible opcode handlers call a second VM-interpreted layer instead of computing inline
 		const unsigned NestedVMOpcodes;  // 0 = all eligible opcodes nest; N>0 = first N in the fixed order (see opcodeNests)
-		const bool     NestedVMHardened; // reserved: harden the inner VM layer
+		const bool     NestedVMHardened; // 真实内层 engine/wrapper 加固
 		const bool     ThreadedDispatch; // inline fetch/decode/indirectbr into every handler's back-edge; no central vm.dispatch/vm.fetch
 		const bool     KeyedDispatch;    // XOR each opcode byte with a per-IP compile-time key at emit/fetch time
 		const bool     CloudDispatch;    // dispatch 索引叠加运行时云值 offset（合法值=0）；错误/过期值越界自然崩溃
 		const bool     SuperOps;         // fuse eligible i32 mul+add chains into one OP_MULADD opcode at emission
-		const bool     BindAntiDebug;    // fold anti-debug detection into the AES round-key mask instead of salt-poisoning traps
+		bool           BindAntiDebug;    // 合并检测配置后决定有效绑定，复用锁存响应状态
 		const bool     RandISA;          // per-build permutation of semantic operand-field byte encodings (currently BinSubop)
 		// Which shared engine this build targets. Packs (poolIdx, layer) as
 		// poolIdx*2 + layer (layer 0 = plain "__vm_engine", 1 = nesting
@@ -403,6 +414,8 @@ namespace llvm {
 
 		VMOpcodeMap OpMap;
 		ISAEnc      IsaEnc;   // identity unless RandISA; module-uniform subop-byte permutation
+		VMInstructionLayout Layout;
+		VMOp BuildingOpcode = OP_RET_VOID;
 
 		// 暂存模块拥有规范化副本，保证 emitter 的 Value 指针跨阶段有效。
 		std::unique_ptr<Module> PreparedModule;
@@ -420,6 +433,8 @@ namespace llvm {
 		BasicBlock* InvalidBB = nullptr;
 
 		GlobalVariable* GVBytecode = nullptr, * GVBytecodeRT = nullptr, * GVHandlers = nullptr, * GVCallees = nullptr;
+		GlobalVariable* GVEngineTarget = nullptr;
+		GlobalVariable* GVWhiteBox = nullptr;
 		// parallel [C x i8] table -- callee slot -> index into UniqueFTys.
 		GlobalVariable* GVFTyIndices = nullptr;
 		// unique FunctionType* list built by buildCalleeGlobal(), consumed by buildCall2().
@@ -570,7 +585,7 @@ namespace llvm {
 			I64Ty(Type::getInt64Ty(Ctx)),
 			PtrTy(PointerType::getUnqual(Ctx)),
 			DoubleTy(Type::getDoubleTy(Ctx)),
-			Cfg(CfgIn), R(RIn),
+			Cfg(CfgIn), RequestedCfg(CfgIn), R(RIn),
 			ObfRegIdx(Cfg.obfRegIdx),
 			EncBytecode(Cfg.encBytecode),
 			StrongBC(Cfg.strongBytecode),
@@ -604,6 +619,7 @@ namespace llvm {
 			MasterSeed(MasterSeedIn) {
 			// per-function opcode permutation for handler-table/bytecode diversity.
 			OpMap.initPermuted(R);
+			if (Cfg.operandLayout) Layout = VMInstructionLayout::forSeed(MasterSeed);
 
 			// RandISA (P9-A): module-uniform permutation of semantic operand-field
 			// byte encodings. Derived from MasterSeed (NOT the per-function RNG R)
@@ -624,6 +640,12 @@ namespace llvm {
 				IsaEnc.initFBinPermuted(FBinRng);
 				obf::Rng FcmpRng(obf::mix64(MasterSeed ^ obf::fnv1a64("vm.isa.fcmppred")));
 				IsaEnc.initFcmpPermuted(FcmpRng);
+				obf::Rng C64Rng(obf::mix64(MasterSeed ^ obf::fnv1a64("vm.isa.cast64kind")));
+				IsaEnc.initCast64Permuted(C64Rng);
+				obf::Rng FCRng(obf::mix64(MasterSeed ^ obf::fnv1a64("vm.isa.fcastkind")));
+				IsaEnc.initFCastPermuted(FCRng);
+				obf::Rng SelRng(obf::mix64(MasterSeed ^ obf::fnv1a64("vm.isa.selectkind")));
+				IsaEnc.initSelectPermuted(SelRng);
 			}
 
 			//  generate per-function AES key material from RNG
@@ -722,48 +744,32 @@ namespace llvm {
 			return B.CreateLoad(I8Ty, BytePtr, N + ".lz.byte");
 		}
 
-		Value* loadBC(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N = "vm.bc") {
-			Value* Idx32 = Off ? B.CreateAdd(IP, B.getInt32(Off), N + ".i32") : IP;
-			Value* Idx64 = B.CreateSExt(Idx32, I64Ty, N + ".ip64");
-			Value* Ptr = B.CreateGEP(I8Ty, EffBC, Idx64, N + ".p");
-			Value* Raw = B.CreateLoad(I8Ty, Ptr, N);
-			if (!EncBytecode) return Raw;
-
-			if (LazyDecrypt && EffLazyCtx)
-				Raw = B.CreateXor(Raw, lazyAESByte(B, Idx32, N), N + ".aesx");
-
-			auto* SL = B.CreateLoad(I32Ty, EffSalt, N + ".s");
-			SL->setVolatile(true);
-			Value* Key8;
-			if (StrongBC) {
-				Key8 = ksByteIR(B, SL, Idx32, N);
-			} else {
-				Value* Key32 = B.CreateAnd(B.CreateXor(SL, Idx32, N + ".kx"), B.getInt32(0xFF), N + ".km");
-				Key8 = B.CreateTrunc(Key32, I8Ty, N + ".k8");
+		VMByteDecodeContext byteDecodeContext() const {
+			VMByteDecodeContext C;
+			C.BC = EffBC; C.Salt = EffSalt; C.LazyCtx = EffLazyCtx;
+			C.Keystream = KeystreamFn;
+			C.EncBytecode = EncBytecode; C.StrongBC = StrongBC;
+			C.LazyDecrypt = LazyDecrypt;
+			C.CacheEnabled = true;
+			if (Cfg.whiteboxAES) {
+				C.KeyIsPointer = true; C.KeyOffset = 0; C.NonceOffset = 8;
+				C.WindowOffset = 16; C.CachedBlockOffset = 32;
 			}
-			return B.CreateXor(Raw, Key8, N + ".dec");
+			return C;
+		}
+
+		Value* loadBC(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N = "vm.bc") {
+			return emitVMByteLoad(B, byteDecodeContext(),
+				Off ? B.CreateAdd(IP, B.getInt32(Off), N + ".i32") : IP, N);
 		}
 
 		Value* loadBCDyn(IRBuilder<>& B, Value* IP, Value* Off, const Twine& N = "vm.bcd") {
-			Value* Idx32 = B.CreateAdd(IP, Off, N + ".i32");
-			Value* Idx64 = B.CreateSExt(Idx32, I64Ty, N + ".ip64");
-			Value* Ptr = B.CreateGEP(I8Ty, EffBC, Idx64, N + ".p");
-			Value* Raw = B.CreateLoad(I8Ty, Ptr, N);
-			if (!EncBytecode) return Raw;
+			return emitVMByteLoad(B, byteDecodeContext(), B.CreateAdd(IP, Off, N + ".i32"), N);
+		}
 
-			if (LazyDecrypt && EffLazyCtx)
-				Raw = B.CreateXor(Raw, lazyAESByte(B, Idx32, N), N + ".aesx");
-
-			auto* SL = B.CreateLoad(I32Ty, EffSalt, N + ".s");
-			SL->setVolatile(true);
-			Value* Key8;
-			if (StrongBC) {
-				Key8 = ksByteIR(B, SL, Idx32, N);
-			} else {
-				Value* Key32 = B.CreateAnd(B.CreateXor(SL, Idx32, N + ".kx"), B.getInt32(0xFF), N + ".km");
-				Key8 = B.CreateTrunc(Key32, I8Ty, N + ".k8");
-			}
-			return B.CreateXor(Raw, Key8, N + ".dec");
+		// 旧语义读取以规范字节序表达；实际字段地址统一由 schema 翻译。
+		Value* loadOperandByte(IRBuilder<>& B, Value* IP, unsigned Off, const Twine& N) {
+			return loadBC(B, IP, Layout.physicalByte(BuildingOpcode, Off + 1) - 1, N);
 		}
 
 		Value* rdByteDyn(IRBuilder<>& B, Value* IP, Value* Off, const Twine& N) {
@@ -794,21 +800,21 @@ namespace llvm {
 
 		// Helpers that read one obfuscated register-index byte at IP+Off
 		Value* rdVR(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N) {
-			return deobf(B, loadBC(B, IP, Off, N + ".rb"), MaskVR, N);
+			return deobf(B, loadOperandByte(B, IP, Off, N + ".rb"), MaskVR, N);
 		}
 		Value* rdVR64(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N) {
-			return deobf(B, loadBC(B, IP, Off, N + ".rb"), MaskVR64, N);
+			return deobf(B, loadOperandByte(B, IP, Off, N + ".rb"), MaskVR64, N);
 		}
 		Value* rdPR(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N) {
-			return deobf(B, loadBC(B, IP, Off, N + ".rb"), MaskPR, N);
+			return deobf(B, loadOperandByte(B, IP, Off, N + ".rb"), MaskPR, N);
 		}
 		// Read a freg slot index (same deobf as integer regs)
 		Value* rdFR(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N) {
-			return deobf(B, loadBC(B, IP, Off, N + ".rb"), MaskFR, N);
+			return deobf(B, loadOperandByte(B, IP, Off, N + ".rb"), MaskFR, N);
 		}
 		// Read a plain byte (no deobf)
 		Value* rdByte(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N) {
-			return B.CreateZExt(loadBC(B, IP, Off, N), I32Ty, N + ".b");
+			return B.CreateZExt(loadOperandByte(B, IP, Off, N), I32Ty, N + ".b");
 		}
 		// Read a u32le at IP+Off
 		Value* rdU32(IRBuilder<>& B, Value* IP, uint32_t Off, const Twine& N) {
@@ -912,6 +918,10 @@ namespace llvm {
 
 		// Advance IP by N and return the pre-advance value for operand reads
 		Value* advIP(IRBuilder<>& B, uint32_t N) {
+			if (!Layout.variable(BuildingOpcode)) {
+				assert(N + 1 == Layout.size(BuildingOpcode) && "handler/schema length mismatch");
+				N = Layout.size(BuildingOpcode) - 1;
+			}
 			auto* Cur = B.CreateLoad(I32Ty, VMIP, "vm.ip.c"); Cur->setVolatile(true);
 			auto* St = B.CreateStore(B.CreateAdd(Cur, B.getInt32(N), "vm.ip.n"), VMIP);
 			St->setVolatile(true); return Cur;
@@ -923,6 +933,7 @@ namespace llvm {
 		// tail needs the full successor set up front) -- reuse and rename that
 		// block instead of allocating a fresh one. Off path unchanged.
 		IRBuilder<> mkOpc(VMOp Opc, const Twine& Name) {
+			BuildingOpcode = Opc;
 			if (ThreadedDispatch && OpcBB[Opc][CurVariant]) {
 				BasicBlock* BB = OpcBB[Opc][CurVariant];
 				BB->setName("vm.opc." + Name + ".v" + Twine(CurVariant));
@@ -965,12 +976,17 @@ namespace llvm {
 		// Each group is independently testable and recompilable.
 		void buildOpcodeHandlers();
 		void buildHandlersIntArith();  // LOADI MOVR BINOP BINOP64 ICMP ICMP64 CAST
+		void buildHandlersImmediate();
+		void buildHandlersExtendedCompute();
+		void buildHandlersExtendedMemory();
 		void buildHandlersConv();      // SELECT PTRTOINT CAST64 PTRTOINT64 INTTOPTR
 		void buildHandlersMem();       // LOAD*/STORE* (all widths)  GEP*  LOADPTR  STOREPTR
 		void buildHandlersControl();   // JMP JMPC SWITCH  RET_VOID RET_INT RET_PTR
 		void buildHandlersFloat();     // all float/freg opcodes (LOADI_F .. FNEG)
 		void buildHandlersCall();      // CALL_VOID CALL_INT CALL_PTR CALL_INT64 CALL_F
 		void buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK);
+		void extendVMCallSwitch(VMEngine::SharedState::CallSwitchInfo& CSW,
+			FunctionType* SrcFTy, unsigned TypeIndex, AttributeList ABIAttrs);
 
 		// M3: static decoy handlers (VMPass_Decoys.cpp). computeNumDecoys()
 		// returns 0 when handlerDecoys==0 or nestedVM==1 (byte-identical off);
@@ -986,7 +1002,8 @@ namespace llvm {
 		// Nested-VM: pure per-opcode helpers authored fresh + virtualized via a
 		// second VMImpl over the shared engine. See VMPass_Impl.cpp for the
 		// sequencing rationale.
-		Function* getOrCreateNestedBinopHelper();   // idempotent per module
+		std::string nestedHelperName(StringRef Base) const;
+		Function* getOrCreateNestedBinopHelper();   // idempotent per owner
 		Function* getOrCreateNestedBinop64Helper(); // idempotent per module
 		Function* getOrCreateNestedIcmpHelper();    // idempotent per module
 		Function* getOrCreateNestedIcmp64Helper();  // idempotent per module
@@ -994,7 +1011,7 @@ namespace llvm {
 		Function* getOrCreateNestedCastHelper();    // idempotent per module
 		Function* getOrCreateNestedBinopFHelper();  // idempotent per module
 		Function* getOrCreateNestedHelper(VMOp Op); // dispatches to the per-opcode authors above
-		void virtualizeNestedHelpersOnce();         // idempotent per module
+		bool virtualizeNestedHelpersOnce();         // idempotent per owner
 
 		// Whether Op is nested for this build: NestedVM is on, and (Op is
 		// within the first NestedVMOpcodes entries of the fixed nesting order,
@@ -1043,7 +1060,6 @@ namespace llvm {
 		void buildIntegrityHashCtor();   // .init_array FNV-1a check
 		void buildCalleeXorCtor();       // .init_array callee XOR masking
 		void buildAntiDebugGate(VMEngine::SharedState* SS); // dispatch timing gate
-		void buildAntiDebugKeyBindCtor(); // .init_array: fold detection into AES round-key mask
 	};
 
 } // namespace llvm

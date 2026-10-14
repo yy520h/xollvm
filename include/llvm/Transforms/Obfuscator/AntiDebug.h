@@ -6,6 +6,8 @@
 namespace llvm {
 
 class GlobalVariable;
+AntiDebugConfig effectiveAntiDebugConfig(const Module& M, AntiDebugConfig Cfg);
+bool hasAntiDebugDetectionSource(const AntiDebugConfig& Cfg);
 GlobalVariable* getOrCreateAntiDebugResponse(Module& M, const AntiDebugConfig& Cfg);
 bool applyAntiDebug(Function& F, AntiDebugConfig Cfg);
 

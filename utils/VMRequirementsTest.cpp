@@ -1,11 +1,16 @@
 #include "llvm/Transforms/Obfuscator/ObfuscationConfig.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Verifier.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Decode.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Layout.h"
+#include "llvm/Transforms/Obfuscator/VMTargetEncoding.h"
+#include "llvm/Transforms/Obfuscator/VMWhiteBoxAES.h"
 #include "gtest/gtest.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Requirements.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
@@ -15,9 +20,298 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
+#ifdef __ANDROID__
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #endif
 
 using namespace llvm;
+
+TEST(VMWhiteBoxAES, FIPSKnownAnswerAndRandomReference) {
+	std::array<uint8_t, 16> Key = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+	std::array<uint8_t, 16> Input = {0,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff};
+	std::array<uint8_t, 16> Expected = {0x69,0xc4,0xe0,0xd8,0x6a,0x7b,0x04,0x30,0xd8,0xcd,0xb7,0x80,0x70,0xb4,0xc5,0x5a};
+	auto A = VMWhiteBoxAES::generate(Key, 1), B = VMWhiteBoxAES::generate(Key, 42);
+	ASSERT_TRUE(bool(A)); ASSERT_TRUE(bool(B));
+	EXPECT_EQ(VMWhiteBoxAES::evaluate(*A, Input), Expected);
+	EXPECT_EQ(VMWhiteBoxAES::evaluate(*B, Input), Expected);
+	EXPECT_NE(A->Bytes, B->Bytes);
+#ifdef OBF_TEST_VM_IMPL
+	obf::Rng R(42);
+	for (unsigned i = 0; i < 100; ++i) {
+		R.bytes(Key); R.bytes(Input);
+		uint8_t RK[176], Block[16]; vm_aes::keyExpand(Key.data(), RK);
+		std::copy(Input.begin(), Input.end(), Block); vm_aes::encryptBlock(RK, Block);
+		auto T = VMWhiteBoxAES::generate(Key, i);
+		ASSERT_TRUE(bool(T));
+		auto Actual = VMWhiteBoxAES::evaluate(*T, Input);
+		EXPECT_TRUE(std::equal(Actual.begin(), Actual.end(), Block));
+		EXPECT_EQ(std::search(T->Bytes.begin(), T->Bytes.end(), RK, RK + 176), T->Bytes.end());
+	}
+	if (const char* Path = std::getenv("XOLLVM_WHITEBOX_KAT_IR")) {
+		LLVMContext C; Module M("whitebox-kat", C); M.setTargetTriple(Triple("aarch64-unknown-linux-android26"));
+		Key = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+		auto T = VMWhiteBoxAES::generate(Key, 42); ASSERT_TRUE(bool(T));
+		auto* G = emitVMWhiteBoxInstance(M, *T);
+		auto* Block = getVMWhiteBoxBlockFunction(M);
+		auto* FT = FunctionType::get(Type::getVoidTy(C), {PointerType::getUnqual(C), PointerType::getUnqual(C)}, false);
+		auto* F = Function::Create(FT, GlobalValue::ExternalLinkage, "kat", M);
+		IRBuilder<> IR(BasicBlock::Create(C, "entry", F)); IR.CreateCall(Block, {G, F->getArg(0), F->getArg(1)}); IR.CreateRetVoid();
+		// fixture 中插入原子计数，生产后端无诊断计数器。
+		auto* CTR = getVMWhiteBoxCTRFunction(M);
+		auto* Count = new GlobalVariable(M, Type::getInt32Ty(C), false, GlobalValue::ExternalLinkage, nullptr, "count");
+		IRBuilder<> Counter(&*CTR->getEntryBlock().begin());
+		Counter.CreateAtomicRMW(AtomicRMWInst::Add, Count, Counter.getInt32(1), Align(4), AtomicOrdering::Monotonic);
+		auto* Init = Function::Create(FunctionType::get(Type::getVoidTy(C), {PointerType::getUnqual(C)}, false), GlobalValue::ExternalLinkage, "init", M);
+		IRBuilder<> IB(BasicBlock::Create(C, "entry", Init));
+		IB.CreateStore(G, Init->getArg(0));
+		IB.CreateStore(IB.getInt64(0), IB.CreateGEP(IB.getInt8Ty(), Init->getArg(0), IB.getInt64(8)));
+		IB.CreateStore(IB.getInt32(0xffffffffu), IB.CreateGEP(IB.getInt8Ty(), Init->getArg(0), IB.getInt64(32))); IB.CreateRetVoid();
+		std::array<uint8_t, 64> BC; for (unsigned i = 0; i < BC.size(); ++i) BC[i] = uint8_t(i * 7) ^ i;
+		uint8_t RK[176], Nonce[8] = {}; vm_aes::keyExpand(Key.data(), RK); vm_aes::ctr(RK, Nonce, BC.data(), BC.size());
+		auto* BCInit = ConstantDataArray::get(C, BC);
+		auto* BCG = new GlobalVariable(M, BCInit->getType(), true, GlobalValue::PrivateLinkage, BCInit, "bc");
+		auto* Fetch = Function::Create(FunctionType::get(Type::getInt8Ty(C), {PointerType::getUnqual(C), Type::getInt32Ty(C)}, false), GlobalValue::ExternalLinkage, "fetch", M);
+		IRBuilder<> FB(BasicBlock::Create(C, "entry", Fetch)); auto* Salt = FB.CreateAlloca(FB.getInt32Ty()); FB.CreateStore(FB.getInt32(0), Salt);
+		VMByteDecodeContext Decode; Decode.BC = BCG; Decode.Salt = Salt; Decode.LazyCtx = Fetch->getArg(0); Decode.Keystream = CTR;
+		Decode.EncBytecode = Decode.LazyDecrypt = Decode.CacheEnabled = Decode.KeyIsPointer = true;
+		Decode.NonceOffset = 8; Decode.WindowOffset = 16; Decode.CachedBlockOffset = 32;
+		FB.CreateRet(emitVMByteLoad(FB, Decode, Fetch->getArg(1), "decoded"));
+		EXPECT_FALSE(verifyModule(M, &errs()));
+		std::error_code EC; raw_fd_ostream OS(Path, EC); ASSERT_FALSE(bool(EC)); M.print(OS, nullptr);
+	}
+#endif
+}
+
+TEST(VMTargetEncoding, RelativeTargetsRoundTripAtAllRotations) {
+	using namespace VMTargetFormat;
+	for (unsigned R = 1; R <= 63; ++R) for (uint64_t Slot : {0ULL, 0x1000ULL, ~0ULL})
+		for (uint64_t Target : {0ULL, 0x800ULL, 0x8000000000000000ULL, ~0ULL}) {
+			uint64_t K = 0x123456789abcdef0ULL, A = 0xfedcba9876543210ULL;
+			EXPECT_EQ(Slot + decode(encode(Target - Slot, K, A, R), K, A, R), Target);
+		}
+}
+
+TEST(VMExtendedISA, ComputationalFusionEmitterWitnesses) {
+	const char* Producers[] = {"mul", "shl", "xor", "and", "or", "add", "sub", "mul"};
+	const char* Consumers[] = {"add", "add", "add", "add", "add", "xor", "xor", "xor"};
+	for (unsigned W : {32u, 64u}) {
+		for (unsigned i = 0; i < 8; ++i) {
+			LLVMContext C;
+			SMDiagnostic D;
+			std::string Ty = "i" + std::to_string(W);
+			auto M = parseAssemblyString("define " + Ty + " @f(" + Ty + " %a," + Ty + " %b," + Ty +
+				" %c) { %p = " + Producers[i] + " " + Ty + " %a,%b\n %r = " + Consumers[i] +
+				" " + Ty + " %p,%c\n ret " + Ty + " %r }", D, C);
+			ASSERT_NE(M, nullptr) << D.getMessage().str();
+			BytecodeEmitter E;
+			E.setExtendedISA(true); E.setSuperOps(true);
+			E.setLayout(VMInstructionLayout::forSeed(42));
+			ASSERT_TRUE(E.run(*M->getFunction("f"), 0, M->getDataLayout())) << E.FailReason;
+			VMOp Op = i < 2 ? (W == 32 ? (i == 0 ? OP_MULADD : OP_SHLADD) : (i == 0 ? OP_MULADD64 : OP_SHLADD64))
+				: static_cast<VMOp>((W == 32 ? OP_XORADD32 : OP_XORADD64) + i - 2);
+			EXPECT_TRUE(E.Requirements.contains(Op));
+			EXPECT_TRUE(E.Requirements.NeedsSuperOps);
+			EXPECT_EQ(E.BC.front(), Op);
+			std::string Error; uint32_t Bad = 0; VMOpcodeMap Map;
+			EXPECT_TRUE(verifyBytecode(E, 0, Map, Error, Bad)) << Error;
+		}
+	}
+}
+
+TEST(VMExtendedISA, ComparisonFusionWitnessesRejectInvalidPredicateAndSlots) {
+	for (VMOp Op : {OP_CMPSEL64, OP_ANDCMPZ64}) {
+		LLVMContext C; SMDiagnostic D;
+		std::string Body = Op == OP_CMPSEL64 ?
+			"%p = icmp slt i64 %a,%b\n %r = select i1 %p,i64 %a,i64 %b\n ret i64 %r" :
+			"%p = and i64 %a,%b\n %r = icmp ne i64 %p,0\n ret i1 %r";
+		auto M = parseAssemblyString("define " + std::string(Op == OP_CMPSEL64 ? "i64" : "i1") +
+			" @f(i64 %a,i64 %b) { " + Body + " }", D, C);
+		ASSERT_NE(M, nullptr);
+		BytecodeEmitter E; E.setExtendedISA(true); E.setSuperOps(true);
+		auto L = VMInstructionLayout::forSeed(42); E.setLayout(L);
+		ASSERT_TRUE(E.run(*M->getFunction("f"), 0, M->getDataLayout()));
+		EXPECT_EQ(E.BC.front(), Op); EXPECT_TRUE(E.Requirements.contains(Op));
+		std::string Error; uint32_t Bad = 0; VMOpcodeMap Map;
+		EXPECT_TRUE(verifyBytecode(E, 0, Map, Error, Bad)) << Error;
+		auto Good = E.BC;
+		E.BC[L.offset(Op, VMFieldRole::Predicate)] = 255;
+		EXPECT_FALSE(verifyBytecode(E, 0, Map, Error, Bad)); E.BC = Good;
+		E.BC[L.offset(Op, VMFieldRole::SrcB)] = 255;
+		EXPECT_FALSE(verifyBytecode(E, 0, Map, Error, Bad)); E.BC = Good;
+		E.BC.resize(L.size(Op) - 1);
+		EXPECT_FALSE(verifyBytecode(E, 0, Map, Error, Bad));
+	}
+}
+
+TEST(VMExtendedISA, CompleteDomainAndMemoryEmitterWitnesses) {
+	EXPECT_EQ(unsigned(OP_COUNT), 96u);
+	for (unsigned O = OP_GEP_LOAD8; O <= OP_GEP_STORE64; ++O) for (unsigned IW : {32u, 64u}) {
+		VMOp Op = static_cast<VMOp>(O);
+		bool Store = O >= OP_GEP_STORE32;
+		unsigned Width = Op == OP_GEP_LOAD8 ? 8 : Op == OP_GEP_LOAD16 ? 16 :
+			Op == OP_GEP_LOAD64 || Op == OP_GEP_STORE64 ? 64 : 32;
+		LLVMContext C; SMDiagnostic D;
+		std::string Ty = "i" + std::to_string(Width), IT = "i" + std::to_string(IW);
+		std::string Body = Store ? "store " + Ty + " %v,ptr %p,align 1\n ret void" :
+			"%r = load " + Ty + ",ptr %p,align 1\n ret " + Ty + " %r";
+		auto M = parseAssemblyString("target datalayout = \"e-p:64:64\"\ndefine " +
+			(Store ? std::string("void") : Ty) + " @f(ptr %base," + IT + " %idx," + Ty +
+			" %v) { %p = getelementptr " + Ty + ",ptr %base," + IT + " %idx\n " + Body + " }", D, C);
+		ASSERT_NE(M, nullptr) << D.getMessage().str();
+		BytecodeEmitter E; E.setExtendedISA(true); E.setSuperOps(true);
+		auto L = VMInstructionLayout::forSeed(42); E.setLayout(L);
+		ASSERT_TRUE(E.run(*M->getFunction("f"), 0, M->getDataLayout())) << E.FailReason;
+		EXPECT_EQ(E.BC.front(), Op); EXPECT_TRUE(E.Requirements.contains(Op));
+		std::string Error; uint32_t Bad = 0; VMOpcodeMap Map;
+		EXPECT_TRUE(verifyBytecode(E, 0, Map, Error, Bad)) << Error;
+		auto Good = E.BC;
+		for (VMFieldRole Role : {VMFieldRole::Dst, VMFieldRole::Pointer, VMFieldRole::Index,
+			VMFieldRole::Kind, VMFieldRole::Alignment}) {
+			E.BC[L.offset(Op, Role)] = 255;
+			EXPECT_FALSE(verifyBytecode(E, 0, Map, Error, Bad)) << unsigned(Role);
+			E.BC = Good;
+		}
+		E.BC[L.offset(Op, VMFieldRole::Scale)] = E.BC[L.offset(Op, VMFieldRole::Scale) + 1] = 0;
+		EXPECT_FALSE(verifyBytecode(E, 0, Map, Error, Bad)); E.BC = Good;
+		E.BC.resize(L.size(Op) - 1);
+		EXPECT_FALSE(verifyBytecode(E, 0, Map, Error, Bad));
+	}
+	for (unsigned I = 0; I < kMaxDecoys; ++I) EXPECT_GE(unsigned(OP_DECOY_BASE) + I, unsigned(OP_COUNT));
+}
+
+TEST(VMExtendedISA, FusionGuardsApplyToLegacyAndExtendedOpcodes) {
+	for (unsigned Width : {32u, 64u}) for (unsigned Reason = 0; Reason < 4; ++Reason) {
+		LLVMContext C;
+		SMDiagnostic D;
+		std::string Ty = "i" + std::to_string(Width);
+		std::string Gap = Reason == 0 ? "br label %next\nnext:\n" : Reason == 1 ? "call void @effect()\n" : "";
+		std::string Flag = Reason == 2 ? " nsw" : "";
+		auto M = parseAssemblyString("declare void @effect()\ndefine " + Ty + " @f(" + Ty +
+			" %a," + Ty + " %b," + Ty + " %c) { %p = mul " + Ty + " %a,%b\n" + Gap +
+			"%r = add" + Flag + " " + Ty + " %p,%c\n ret " + Ty + " %r }", D, C);
+		ASSERT_NE(M, nullptr);
+		BytecodeEmitter E; E.setExtendedISA(true); E.setSuperOps(Reason != 3);
+		ASSERT_TRUE(E.run(*M->getFunction("f"), 0, M->getDataLayout())) << E.FailReason;
+		EXPECT_FALSE(E.Requirements.contains(Width == 32 ? OP_MULADD : OP_MULADD64)) << Reason;
+	}
+}
+
+TEST(VMExtendedISA, ImmediateOpcodesHaveEmitterWitnessAndValidateOperands) {
+	constexpr const char* Ops[] = {"add", "sub", "mul", "and", "or", "xor", "shl", "lshr", "ashr"};
+	for (unsigned Width : {32u, 64u}) {
+		for (unsigned i = 0; i < 9; ++i) {
+			LLVMContext C;
+			SMDiagnostic D;
+			std::string Ty = "i" + std::to_string(Width);
+			auto M = parseAssemblyString("define " + Ty + " @f(" + Ty + " %a) { %r = " +
+				Ops[i] + " " + Ty + " %a, 3\n ret " + Ty + " %r }", D, C);
+			ASSERT_NE(M, nullptr) << D.getMessage().str();
+			BytecodeEmitter E;
+			E.setExtendedISA(true);
+			auto L = VMInstructionLayout::forSeed(42);
+			E.setLayout(L);
+			ASSERT_TRUE(E.run(*M->getFunction("f"), 0, M->getDataLayout())) << E.FailReason;
+			VMOp Op = static_cast<VMOp>(OP_ADDI32 + (Width == 64 ? 9 : 0) + i);
+			EXPECT_TRUE(E.Requirements.contains(Op));
+			EXPECT_EQ(E.BC.front(), Op);
+			std::string Error;
+			uint32_t Bad = 0;
+			VMOpcodeMap Map;
+			EXPECT_TRUE(verifyBytecode(E, 0, Map, Error, Bad)) << Error;
+			auto Good = E.BC;
+			E.BC[L.offset(Op, VMFieldRole::SrcA)] = 255;
+			EXPECT_FALSE(verifyBytecode(E, 0, Map, Error, Bad));
+			E.BC = Good;
+			if (i >= BS_SHL) {
+				unsigned Imm = L.offset(Op, VMFieldRole::Immediate);
+				E.BC[Imm] = Width;
+				EXPECT_FALSE(verifyBytecode(E, 0, Map, Error, Bad));
+				E.BC = Good;
+			}
+			E.BC.front() = 255;
+			EXPECT_FALSE(verifyBytecode(E, 0, Map, Error, Bad));
+			E.BC = Good;
+			E.BC.resize(L.size(Op) - 1);
+			EXPECT_FALSE(verifyBytecode(E, 0, Map, Error, Bad));
+		}
+	}
+}
+
+TEST(VMOperandLayout, KeepsWidthsAndChangesOffsets) {
+	auto A = VMInstructionLayout::forSeed(1);
+	auto B = VMInstructionLayout::forSeed(42);
+	EXPECT_EQ(A.size(OP_BINOP), B.size(OP_BINOP));
+	EXPECT_NE(A.fingerprint(), B.fingerprint());
+	EXPECT_TRUE(A.validate());
+	EXPECT_TRUE(B.validate());
+	for (unsigned Op = 0; Op < OP_COUNT; ++Op) {
+		for (const auto& Field : A.fields(static_cast<VMOp>(Op))) {
+			for (unsigned i = 0; i < Field.Width; ++i)
+				EXPECT_EQ(A.canonicalByte(static_cast<VMOp>(Op), Field.Offset + i), Field.Canonical + i);
+		}
+	}
+}
+
+TEST(VMOperandLayout, RejectsDuplicateOverlappingAndOutOfBoundsFields) {
+	VMInstructionLayout L;
+	EXPECT_FALSE(L.setFields(OP_BINOP, {{VMFieldRole::Dst, 1, 1, 1},
+		{VMFieldRole::Dst, 1, 2, 1}, {VMFieldRole::SrcB, 3, 3, 1},
+		{VMFieldRole::Kind, 4, 4, 1}}));
+	EXPECT_FALSE(L.setFields(OP_LOADI, {{VMFieldRole::Dst, 1, 1, 1},
+		{VMFieldRole::Immediate, 2, 1, 4}}));
+	EXPECT_FALSE(L.setFields(OP_LOADI, {{VMFieldRole::Dst, 1, 1, 1},
+		{VMFieldRole::Immediate, 2, 5, 4}}));
+	EXPECT_TRUE(L.validate());
+}
+
+TEST(VMOperandLayout, EmitterAndVerifierAgreeOnPermutedBytecode) {
+	LLVMContext C;
+	SMDiagnostic D;
+	auto M = parseAssemblyString("define i32 @f(i32 %a, i32 %b) { %r = sub i32 %a, %b\n ret i32 %r }", D, C);
+	ASSERT_NE(M, nullptr);
+	VMOpcodeMap Map;
+	BytecodeEmitter E;
+	auto Layout = VMInstructionLayout::forSeed(42);
+	E.setLayout(Layout);
+	ASSERT_TRUE(E.run(*M->getFunction("f"), 0, M->getDataLayout()));
+	EXPECT_EQ(E.BC[Layout.offset(OP_BINOP, VMFieldRole::Kind)], BS_SUB);
+	std::string Error;
+	uint32_t Bad = 0;
+	EXPECT_TRUE(verifyBytecode(E, 0, Map, Error, Bad)) << Error;
+	E.BC[Layout.offset(OP_BINOP, VMFieldRole::SrcA)] = 254;
+	EXPECT_FALSE(verifyBytecode(E, 0, Map, Error, Bad));
+	EXPECT_EQ(Bad, 0u);
+}
+
+TEST(VMByteDecode, SeparateContextsKeepTheirOwnSaltAndBuffer) {
+	LLVMContext C;
+	Module M("decode", C);
+	auto* FT = FunctionType::get(Type::getInt8Ty(C),
+		{PointerType::getUnqual(C), PointerType::getUnqual(C),
+		 PointerType::getUnqual(C), PointerType::getUnqual(C), Type::getInt32Ty(C)}, false);
+	auto* F = Function::Create(FT, GlobalValue::ExternalLinkage, "decode", M);
+	IRBuilder<> B(BasicBlock::Create(C, "entry", F));
+	VMByteDecodeContext A, D;
+	A.BC = F->getArg(0); A.Salt = F->getArg(1);
+	D.BC = F->getArg(2); D.Salt = F->getArg(3);
+	A.EncBytecode = D.EncBytecode = true;
+	A.StrongBC = true;
+	auto* V0 = emitVMByteLoad(B, A, F->getArg(4), "first");
+	auto* V1 = emitVMByteLoad(B, D, F->getArg(4), "second");
+	B.CreateRet(B.CreateXor(V0, V1));
+	EXPECT_FALSE(verifyModule(M));
+	unsigned First = 0, Second = 0;
+	for (auto& I : instructions(*F)) {
+		if (auto* L = dyn_cast<LoadInst>(&I)) {
+			if (L->getPointerOperand() == A.Salt) ++First;
+			if (L->getPointerOperand() == D.Salt) ++Second;
+		}
+	}
+	EXPECT_EQ(First, 1u);
+	EXPECT_EQ(Second, 1u);
+}
 
 TEST(VMPlan, EmptyCoordinatorFreezesWithoutCandidates) {
 	VMPlanCoordinator Coordinator;
@@ -400,9 +694,9 @@ TEST(VMRequirements, TableDomainDoesNotShrinkWithDemand) {
 	P.Config.handlerVariants = 3;
 	P.Config.encDispatch = true;
 	P.Requirements.requireBinSubop(OP_BINOP, BS_MUL);
-	EXPECT_EQ(P.handlerTableEntries(), 225u);
+	EXPECT_EQ(P.handlerTableEntries(), unsigned(OP_COUNT) * 4 + 1);
 	P.Decoys = 7;
-	EXPECT_EQ(P.handlerTableEntries(), 232u);
+	EXPECT_EQ(P.handlerTableEntries(), unsigned(OP_COUNT) * 4 + 8);
 }
 
 TEST(VMRequirements, WitnessRecordsLogicalPrecisionAndFullKey) {
@@ -859,6 +1153,55 @@ TEST(SensitiveDecisionConfigTest, RequiresEnabledVM) {
 }
 
 #ifdef OBF_TEST_VM_IMPL
+TEST(VMCallVariants, IncrementalTypesReachEveryVariant) {
+	for (unsigned Order = 0; Order != 2; ++Order) {
+		LLVMContext C;
+		SMDiagnostic D;
+		auto M = parseAssemblyString(R"IR(
+target triple = "aarch64-unknown-linux-android26"
+declare i32 @one(i32)
+declare i32 @three(i32, i64, double)
+define i32 @first(i32 %x) { %r = call i32 @one(i32 %x)
+ ret i32 %r }
+define i32 @later(i32 %x, i64 %y, double %z) { %r = call i32 @three(i32 %x, i64 %y, double %z)
+ ret i32 %r }
+)IR", D, C);
+		ASSERT_NE(M, nullptr) << D.getMessage().str();
+		VMPassConfig Config;
+		Config.hardened = true;
+		Config.encBytecode = Config.lazyDecrypt = Config.strongBytecode = true;
+		Config.regEncrypt = Config.rollingRegKey = true;
+		Config.handlerVariants = 4;
+		obf::Rng R(42);
+		SmallVector<std::unique_ptr<VMImpl>, 2> Impls;
+		const char* Names[2] = {"first", "later"};
+		for (unsigned i = 0; i != 2; ++i) {
+			auto Impl = std::make_unique<VMImpl>(*M->getFunction(Names[i ^ Order]), Config, R, 42);
+			ASSERT_TRUE(Impl->run()) << Impl->FailReason;
+			Impls.push_back(std::move(Impl));
+		}
+		EXPECT_EQ(Impls[0]->EngineId, Impls[1]->EngineId);
+		auto* SS = VMEngine::getSharedState(*M, Impls[0]->EngineId);
+		ASSERT_EQ(SS->SharedFTys.size(), 2u);
+		ASSERT_EQ(SS->CallSW[VMEngine::RK2_I32].size(), 4u);
+		DenseSet<BasicBlock*> Targets;
+		for (const auto& SW : SS->CallSW[VMEngine::RK2_I32]) {
+			EXPECT_EQ(SW.SW->getNumCases(), 2u);
+			EXPECT_EQ(SW.OperandIP->getType(), Type::getInt32Ty(C));
+			Targets.insert(SS->OpcBB[OP_CALL_INT][SW.Variant]);
+		}
+		EXPECT_EQ(Targets.size(), 4u);
+		EXPECT_FALSE(verifyModule(*M, &errs()));
+		if (const char* Dir = std::getenv("OBF_VM_CALL_IR_DIR")) {
+			std::error_code EC;
+			raw_fd_ostream OS(std::string(Dir) + "/incremental-" + std::to_string(Order) + ".ll", EC);
+			ASSERT_FALSE(EC) << EC.message();
+			M->print(OS, nullptr);
+		}
+		VMEngine::releaseSharedState(*M);
+	}
+}
+
 TEST(VMPlan, DemandOnlyCandidateCanPrecedePreparedCandidate) {
 	LLVMContext C;
 	SMDiagnostic D;
@@ -1297,5 +1640,47 @@ lpad:
 		EXPECT_EQ(Print(), Before);
 	}
 	EXPECT_EQ(Print(), Before);
+}
+
+TEST(VMNested, HelperFailureRestoresCallerAndNoSkipsAborts) {
+	auto Run = [](bool NoSkips) {
+		LLVMContext C; SMDiagnostic D;
+		auto M = parseAssemblyString("define i32 @target(i32 %a,i32 %b) { %r = add i32 %a,%b\n ret i32 %r }", D, C);
+		VMPassConfig Config; Config.nestedVM = true; Config.nestedVMHardened = true;
+		obf::Rng R(42); auto Impl = std::make_unique<VMImpl>(*M->getFunction("target"), Config, R, 42);
+		ASSERT_TRUE(Impl->prepare());
+		auto Key = EngineConfigKey::fromConfig(Config, 0, Impl->EngineId, 42, &Impl->AntiDebug);
+		std::string Name = (Twine("__vm_h_binop_owner") + Twine(Impl->EngineId) + "_" + Twine::utohexstr(Key.stableHash())).str();
+		auto* HF = Function::Create(FunctionType::get(Type::getInt32Ty(C),
+			{Type::getInt32Ty(C), Type::getInt32Ty(C), Type::getInt8Ty(C)}, false), GlobalValue::InternalLinkage, Name, *M);
+		IRBuilder<> B(BasicBlock::Create(C, "entry", HF)); B.CreateFence(AtomicOrdering::SequentiallyConsistent); B.CreateRet(HF->getArg(0));
+		VMPlanCoordinator P; auto* Candidate = P.addPrepared(std::move(Impl), Config, Key);
+		ASSERT_TRUE(P.freeze());
+		bool Prev = ObfNoSkips; ObfNoSkips = NoSkips;
+		EXPECT_TRUE(P.commit()); ObfNoSkips = Prev;
+		EXPECT_FALSE(Candidate->Accepted);
+		EXPECT_NE(Candidate->SkipReason.find("nested"), std::string::npos);
+		ASSERT_FALSE(M->getFunction("target")->empty());
+		EXPECT_TRUE(isa<BinaryOperator>(M->getFunction("target")->getEntryBlock().front()));
+		EXPECT_FALSE(verifyModule(*M, &errs())); VMEngine::releaseSharedState(*M);
+	};
+	Run(false);
+#ifdef __ANDROID__
+	// Android gtest 的 stderr 捕获硬编码 /data/local/tmp，Termux 无写权限。
+	// 用 pipe 隔离 fatal 子进程，仍断言真实中止状态和明确诊断。
+	int FDs[2]; ASSERT_EQ(pipe(FDs), 0);
+	pid_t PID = fork(); ASSERT_GE(PID, 0);
+	if (PID == 0) {
+		close(FDs[0]); dup2(FDs[1], STDERR_FILENO); close(FDs[1]);
+		Run(true); _exit(0);
+	}
+	close(FDs[1]); std::string Error; char Buf[1024]; ssize_t N;
+	while ((N = read(FDs[0], Buf, sizeof(Buf))) > 0) Error.append(Buf, N);
+	close(FDs[0]); int Status = 0; ASSERT_EQ(waitpid(PID, &Status, 0), PID);
+	EXPECT_TRUE(WIFSIGNALED(Status) || (WIFEXITED(Status) && WEXITSTATUS(Status) != 0));
+	EXPECT_NE(Error.find("nested helper preparation failed"), std::string::npos);
+#else
+	EXPECT_DEATH(Run(true), "nested helper preparation failed");
+#endif
 }
 #endif

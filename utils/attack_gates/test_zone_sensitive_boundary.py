@@ -81,6 +81,26 @@ def test_zone_region_validates_and_commits(obf_ir):
     assert "obf.sensitive.committed" in text
 
 
+def test_sensitive_decision_uses_encrypted_lazy_bytecode(obf_ir):
+    ir, work = obf_ir
+    out = work / "cap.obf.ll"
+    if not out.exists():
+        subprocess.run([str(_tool("opt")), "-passes=obfuscation", "-S", str(ir),
+                        "-o", str(out)], check=True, capture_output=True,
+                       text=True, timeout=600)
+    text = out.read_text()
+    decision = re.search(
+        r"define[^\n]*@([^\s(]*22acceptVerifiedResponse[^\s(]*)\([^\n]*\{(.*?)\n\}",
+        text, re.S)
+    assert decision, "sensitive decision wrapper missing"
+    symbol, body = decision.groups()
+    assert f"@{symbol}.vm.aes.rk" in body, "decision bytecode lacks AES key setup"
+    assert "vm.lazy.ctx" in body, "decision eagerly exposes decrypted bytecode"
+    assert "vm.regkeys" in body, "hardened decision lacks encrypted register state"
+    assert re.search(r"\bcall\b[^\n]*@__obf_aes_ctr_keystream_block\s*\(", text), \
+        "lazy instruction decoder missing"
+
+
 def test_protected_symbol_has_no_direct_verifier_and_uses_indirect_engine(obf_ir):
     ir, work = obf_ir
     opt = _tool("opt")

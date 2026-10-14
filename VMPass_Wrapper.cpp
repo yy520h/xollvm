@@ -21,6 +21,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
+#include "llvm/Transforms/Obfuscator/VMTargetEncoding.h"
 #include "llvm/Transforms/Obfuscator/AntiDebug.h"
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
@@ -192,6 +193,7 @@ void VMImpl::buildWrapper() {
 	if (Fam != "split" && Fam != "arena")
 		Fam = "split";  // outlined / unknown -> normalize
 	const std::string FamTag = "." + Fam;
+	ActualWrapperFamily = Fam;
 
 	// constant blinding helpers 
 	// When hardened=1, security-sensitive constants (salt, masks, register
@@ -499,7 +501,14 @@ void VMImpl::buildWrapper() {
 	auto* SS = VMEngine::getSharedState(M, EngineId);
 	const bool LazyActive = SS->LazyMode;
 	Value* LazyCtxArg = nullptr;
-	if (LazyActive) {
+	if (LazyActive && Cfg.whiteboxAES) {
+		auto* LazyCtx = B.CreateAlloca(ArrayType::get(I8Ty, 40), nullptr, "vm.whitebox.ctx");
+		LazyCtx->setAlignment(Align(8));
+		B.CreateStore(GVWhiteBox, LazyCtx);
+		B.CreateMemCpy(B.CreateGEP(I8Ty, LazyCtx, B.getInt64(8)), Align(1), GVAESNonce, Align(1), 8);
+		B.CreateStore(B.getInt32(0xffffffffu), B.CreateGEP(I8Ty, LazyCtx, B.getInt64(32)));
+		LazyCtxArg = LazyCtx;
+	} else if (LazyActive) {
 		// buildWrapper() runs before buildEncryptCtor(); when lazy, create
 		// the masked key-schedule/nonce/mask globals here so both this
 		// wrapper and the later ctor (which reuses them instead of
@@ -615,6 +624,15 @@ void VMImpl::buildWrapper() {
 				Poisoned, blindI32(SaltConst), "vm.ad.salt.effective");
 		}
 	}
+	if (BindAntiDebug) {
+		auto* Response = getOrCreateAntiDebugResponse(M, AntiDebug);
+		auto* Flag = B.CreateLoad(I32Ty, Response, "vm.ad.bind.response");
+		Flag->setAtomic(AtomicOrdering::Monotonic);
+		// 每次调用复用锁存状态；白盒表保持只读，污染解码 salt 而不恢复轮密钥。
+		Value* Poison = B.CreateSelect(B.CreateICmpNE(Flag, B.getInt32(0)),
+			B.getInt32(ADPoisonKey), B.getInt32(0), "vm.ad.bind.poison");
+		Args[VMEngine::kParamSalt] = B.CreateXor(blindI32(SaltConst), Poison, "vm.ad.bind.salt");
+	}
 	// ELF integrity fail-closed: when the module carries a runtime integrity
 	// state (emitted only for strict sensitive regions), fold it into the VM
 	// salt. Valid state is 0 (neutral); a tampered/unsigned image sets a
@@ -637,7 +655,7 @@ void VMImpl::buildWrapper() {
 	// founding function's build.)
 	Value* EngSlot = B.CreateGEP(PtrTy, GVHandlers,
 		blindI32(OP_COUNT * SS->NumVariants), "vm.eng.slot");
-	Value* EngPtr = B.CreateLoad(PtrTy, EngSlot, "vm.eng.ptr");
+	Value* EngPtr = Cfg.encodedTargets ? emitVMTargetLoad(B, GVEngineTarget, B.getInt32(0), GVEngineTarget, "vm.eng.ptr") : B.CreateLoad(PtrTy, EngSlot, "vm.eng.ptr");
 
 	FunctionType* EngFTy = VMEngine::getVMEngineFunctionType(Ctx, LazyActive);
 	B.CreateCall(EngFTy, EngPtr, Args);
@@ -731,6 +749,9 @@ void VMImpl::hardenWrapper() {
 		PhaseBBs.push_back(NewBB);
 	}
 	std::reverse(PhaseBBs.begin(), PhaseBBs.end());
+	// 伪边会绕过前置 phase；必须在加入这些边之前落栈跨块 SSA。
+	SmallVector<AllocaInst*, 32> Demoted;
+	llvm::obf::demoteForCFGChange(F, Demoted);
 	// Now: EntryBB(allocas) → PhaseBBs[0] → PhaseBBs[1] → ... → PhaseBBs[N-1](ret)
 	// Each edge is an unconditional branch inserted by splitBasicBlock.
 

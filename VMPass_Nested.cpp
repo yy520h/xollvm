@@ -92,6 +92,12 @@ bool VMImpl::opcodeNests(VMOp Op) const {
 	return false;
 }
 
+std::string VMImpl::nestedHelperName(StringRef Base) const {
+	uint64_t Key = EngineConfigKey::fromConfig(Cfg, VMEngine::enginePoolOf(EngineId),
+		EngineId, MasterSeed, &AntiDebug).stableHash();
+	return (Base + "_owner" + Twine(EngineId) + "_" + Twine::utohexstr(Key)).str();
+}
+
 
 Function* VMImpl::getOrCreateNestedHelper(VMOp Op) {
 	switch (Op) {
@@ -113,12 +119,12 @@ Function* VMImpl::getOrCreateNestedHelper(VMOp Op) {
 // speculatively executed for a non-div/rem subop. Idempotent: reused across
 // every nested-eligible function in the module.
 Function* VMImpl::getOrCreateNestedBinopHelper() {
-	if (Function* Existing = M.getFunction(kNestedBinopHelperName))
+	if (Function* Existing = M.getFunction(nestedHelperName(kNestedBinopHelperName)))
 		return Existing;
 
 	FunctionType* FTy = FunctionType::get(I32Ty, { I32Ty, I32Ty, I8Ty }, false);
 	Function* HF = Function::Create(FTy, GlobalValue::InternalLinkage,
-		kNestedBinopHelperName, &M);
+		nestedHelperName(kNestedBinopHelperName), &M);
 	HF->addFnAttr(Attribute::NoUnwind);
 	Argument* AArg = HF->getArg(0); AArg->setName("a");
 	Argument* BArg = HF->getArg(1); BArg->setName("b");
@@ -174,12 +180,12 @@ Function* VMImpl::getOrCreateNestedBinopHelper() {
 // OP_BINOP64's subop switch (buildHandlersIntArith) exactly, same shape as
 // getOrCreateNestedBinopHelper() but over I64Ty operands/result.
 Function* VMImpl::getOrCreateNestedBinop64Helper() {
-	if (Function* Existing = M.getFunction(kNestedBinop64HelperName))
+	if (Function* Existing = M.getFunction(nestedHelperName(kNestedBinop64HelperName)))
 		return Existing;
 
 	FunctionType* FTy = FunctionType::get(I64Ty, { I64Ty, I64Ty, I8Ty }, false);
 	Function* HF = Function::Create(FTy, GlobalValue::InternalLinkage,
-		kNestedBinop64HelperName, &M);
+		nestedHelperName(kNestedBinop64HelperName), &M);
 	HF->addFnAttr(Attribute::NoUnwind);
 	Argument* AArg = HF->getArg(0); AArg->setName("a");
 	Argument* BArg = HF->getArg(1); BArg->setName("b");
@@ -237,12 +243,12 @@ Function* VMImpl::getOrCreateNestedBinop64Helper() {
 // of the 10 integer predicates) returns 0, matching the select chain's
 // initial R=false.
 Function* VMImpl::getOrCreateNestedIcmpHelper() {
-	if (Function* Existing = M.getFunction(kNestedIcmpHelperName))
+	if (Function* Existing = M.getFunction(nestedHelperName(kNestedIcmpHelperName)))
 		return Existing;
 
 	FunctionType* FTy = FunctionType::get(I32Ty, { I32Ty, I32Ty, I8Ty }, false);
 	Function* HF = Function::Create(FTy, GlobalValue::InternalLinkage,
-		kNestedIcmpHelperName, &M);
+		nestedHelperName(kNestedIcmpHelperName), &M);
 	HF->addFnAttr(Attribute::NoUnwind);
 	Argument* AArg = HF->getArg(0); AArg->setName("a");
 	Argument* BArg = HF->getArg(1); BArg->setName("b");
@@ -297,12 +303,12 @@ Function* VMImpl::getOrCreateNestedIcmpHelper() {
 // OP_ICMP64's predicate select-chain, same shape as getOrCreateNestedIcmpHelper()
 // but over I64Ty operands (result stays i32, matching OP_ICMP64's vreg dest).
 Function* VMImpl::getOrCreateNestedIcmp64Helper() {
-	if (Function* Existing = M.getFunction(kNestedIcmp64HelperName))
+	if (Function* Existing = M.getFunction(nestedHelperName(kNestedIcmp64HelperName)))
 		return Existing;
 
 	FunctionType* FTy = FunctionType::get(I32Ty, { I64Ty, I64Ty, I8Ty }, false);
 	Function* HF = Function::Create(FTy, GlobalValue::InternalLinkage,
-		kNestedIcmp64HelperName, &M);
+		nestedHelperName(kNestedIcmp64HelperName), &M);
 	HF->addFnAttr(Attribute::NoUnwind);
 	Argument* AArg = HF->getArg(0); AArg->setName("a");
 	Argument* BArg = HF->getArg(1); BArg->setName("b");
@@ -359,12 +365,12 @@ Function* VMImpl::getOrCreateNestedIcmp64Helper() {
 // (pred=0), and any unmatched pred value (e.g. FCMP_TRUE) -- returns 0,
 // matching OP_FCMP's default block exactly (including its FCMP_TRUE gap).
 Function* VMImpl::getOrCreateNestedFcmpHelper() {
-	if (Function* Existing = M.getFunction(kNestedFcmpHelperName))
+	if (Function* Existing = M.getFunction(nestedHelperName(kNestedFcmpHelperName)))
 		return Existing;
 
 	FunctionType* FTy = FunctionType::get(I32Ty, { DoubleTy, DoubleTy, I8Ty }, false);
 	Function* HF = Function::Create(FTy, GlobalValue::InternalLinkage,
-		kNestedFcmpHelperName, &M);
+		nestedHelperName(kNestedFcmpHelperName), &M);
 	HF->addFnAttr(Attribute::NoUnwind);
 	Argument* AArg = HF->getArg(0); AArg->setName("a");
 	Argument* BArg = HF->getArg(1); BArg->setName("b");
@@ -433,12 +439,12 @@ Function* VMImpl::getOrCreateNestedFcmpHelper() {
 // the ZEXT and TRUNC cases). Default (kind not in 0..7) returns src
 // unchanged, matching the select chain's initial R=SV.
 Function* VMImpl::getOrCreateNestedCastHelper() {
-	if (Function* Existing = M.getFunction(kNestedCastHelperName))
+	if (Function* Existing = M.getFunction(nestedHelperName(kNestedCastHelperName)))
 		return Existing;
 
 	FunctionType* FTy = FunctionType::get(I32Ty, { I32Ty, I8Ty }, false);
 	Function* HF = Function::Create(FTy, GlobalValue::InternalLinkage,
-		kNestedCastHelperName, &M);
+		nestedHelperName(kNestedCastHelperName), &M);
 	HF->addFnAttr(Attribute::NoUnwind);
 	Argument* SrcArg = HF->getArg(0); SrcArg->setName("src");
 	Argument* KindArg = HF->getArg(1); KindArg->setName("kind");
@@ -497,12 +503,12 @@ Function* VMImpl::getOrCreateNestedCastHelper() {
 // (fptrunc->fpext), matching native float arithmetic. Plain (no fast-math) FP
 // ops, mirroring the handler. Default case is FBS_FADD.
 Function* VMImpl::getOrCreateNestedBinopFHelper() {
-	if (Function* Existing = M.getFunction(kNestedBinopFHelperName))
+	if (Function* Existing = M.getFunction(nestedHelperName(kNestedBinopFHelperName)))
 		return Existing;
 
 	FunctionType* FTy = FunctionType::get(DoubleTy, { DoubleTy, DoubleTy, I8Ty }, false);
 	Function* HF = Function::Create(FTy, GlobalValue::InternalLinkage,
-		kNestedBinopFHelperName, &M);
+		nestedHelperName(kNestedBinopFHelperName), &M);
 	HF->addFnAttr(Attribute::NoUnwind);
 	Argument* AArg = HF->getArg(0); AArg->setName("a");
 	Argument* BArg = HF->getArg(1); BArg->setName("b");
@@ -555,44 +561,45 @@ Function* VMImpl::getOrCreateNestedBinopFHelper() {
 // run AFTER populateVMEngine() -- see the sequencing note above. Loops over
 // the fixed nesting order; a helper not found by name was never referenced
 // (opcodeNests() excluded it, e.g. via the nestedVMOpcodes cap).
-void VMImpl::virtualizeNestedHelpersOnce() {
-	// There is one shared set of __vm_h_* helpers per module, all virtualized
-	// against the plain pool-0 engine (EngineId 0). With a pooled nest layer the
-	// module can hold several nest engines (@__vm_engine.nest[.pN], one per pool
-	// member a nestedVM function landed in), and each would otherwise re-enter
-	// here and virtualize the same helpers again -- wrapping an already-wrapped
-	// helper. Key the once-guard on the plain pool-0 engine's state, which every
-	// nest engine shares, so the helpers are virtualized exactly once per module.
-	VMEngine::SharedState* SS = VMEngine::getSharedState(M, VMEngine::makeEngineId(0, 0));
-	if (SS->NestedHelpersBuilt) return;
-	SS->NestedHelpersBuilt = true;
-
+bool VMImpl::virtualizeNestedHelpersOnce() {
+	auto* SS = VMEngine::getSharedState(M, EngineId);
+	if (SS->NestedHelpersBuilt) return true;
 	VMPassConfig InnerCfg = Cfg;
-	InnerCfg.nestedVM = false; // hard recursion guard: no helper is ever itself nested
-	InnerCfg.minBlocks = 1;    // helper is a single small switch
-	// NOTE: NestedVMHardened is reserved. Hardening the helper's thin wrapper
-	// via the standard wrapper-hardening passes currently yields dominance-
-	// invalid IR on the helper's small wrapper shape; left off until that is
-	// fixed. The distinct inner engine already provides the second layer.
-	InnerCfg.hardened = false;
-	VMPlanCoordinator* PreviousCoordinator = VMPlanCoordinator::setActive(nullptr);
-
-	for (unsigned i = 0; i < kNumNestedHelpers; ++i) {
-		Function* HelperFn = M.getFunction(kNestedHelperOrder[i].Name);
-		if (!HelperFn) continue; // this opcode's helper was never referenced
-
-		obf::Rng InnerRng = R.fork((Twine("vm.nested.inner.") + kNestedHelperOrder[i].Name).str());
-		// Forward MasterSeed so the inner emitter's RandISA subop map matches the
-		// plain engine's handler switch-cases (same module-uniform permutation).
-		VMImpl Inner(*HelperFn, InnerCfg, InnerRng, MasterSeed);
-		Inner.setFullHandlerRequirements();
-		if (!Inner.run()) {
-			LLVM_DEBUG(dbgs() << "[vm] nested-VM: failed to virtualize '"
-				<< HelperFn->getName() << "': " << Inner.FailReason << "\n");
-			if (ObfVerbose)
-				errs() << "[vm] nested-VM: failed to virtualize '" << HelperFn->getName()
-					<< "': " << Inner.FailReason << "\n";
+	InnerCfg.nestedVM = false; // 固定最多两层
+	InnerCfg.minBlocks = 1;
+	InnerCfg.hardened = NestedVMHardened;
+	InnerCfg.regEncrypt = InnerCfg.hardened || Cfg.regEncrypt;
+	InnerCfg.antiDebug = false; // 内层只复用响应状态，不新增传统检测器
+	SmallVector<std::unique_ptr<VMImpl>, 8> Inners;
+	VMRequirementSet Requirements;
+	for (const auto& H : kNestedHelperOrder) {
+		auto* HF = M.getFunction(nestedHelperName(H.Name));
+		if (!HF) continue;
+		auto InnerRng = R.fork((Twine("vm.nested.inner.") + HF->getName()).str());
+		auto Inner = std::make_unique<VMImpl>(*HF, InnerCfg, InnerRng, MasterSeed,
+			VMEngine::enginePoolOf(EngineId));
+		Inner->AntiDebug = AntiDebug;
+		Inner->BindAntiDebug = BindAntiDebug;
+		if (!Inner->prepare()) {
+			FailReason = "nested helper preparation failed: " + Inner->FailReason;
+			return false;
 		}
+		Requirements.merge(Inner->E.getRequirements());
+		Inners.push_back(std::move(Inner));
 	}
-	VMPlanCoordinator::setActive(PreviousCoordinator);
+	Requirements.closeDependencies(InnerCfg);
+	// 先冻结所有 helper 需求，再构建 owner 的独立 layer-0 引擎。
+	for (auto& Inner : Inners) {
+		Inner->setHandlerRequirements(Requirements);
+		if (!Inner->commit()) {
+			FailReason = "nested helper commit failed: " + Inner->FailReason;
+			return false;
+		}
+		Inner->F.setMetadata("obf.vm.nested.owner", MDNode::get(Ctx, {
+			ConstantAsMetadata::get(ConstantInt::get(I32Ty, EngineId)),
+			ConstantAsMetadata::get(ConstantInt::get(I32Ty, 2)),
+			ConstantAsMetadata::get(ConstantInt::getBool(Ctx, InnerCfg.hardened))}));
+	}
+	SS->NestedHelpersBuilt = true;
+	return true;
 }

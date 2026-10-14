@@ -101,7 +101,7 @@ jobs:
             -DCLANG_INCLUDE_TESTS=OFF \
             -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
             -DCLANG_ENABLE_ARCMT=OFF \
-            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt;lld;lldb;clang-format;xollvm-elf-hardener" \
+            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt;lld;lldb;clang-format;xollvm-elf-hardener;xollvm-link" \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
@@ -169,7 +169,7 @@ jobs:
 
       - name: 验证产物（交叉编译无法本机执行，只验 ELF 身份）
         run: |
-          for tool in clang opt xollvm-elf-hardener; do
+          for tool in clang opt xollvm-elf-hardener xollvm-link; do
             exe="install/bin/$tool"
             [ -x "$exe" ] || { echo "缺少发布工具: $tool"; exit 1; }
             file "$exe"

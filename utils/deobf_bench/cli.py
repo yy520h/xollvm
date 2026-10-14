@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 from runner.config import detect_tools
@@ -56,6 +57,14 @@ def main() -> int:
     if args.no_color:
         disable_color()
 
+    from .elf_runner import ATTACKS, run as run_elf
+    wanted = {a.strip() for a in args.attacks.split(',') if a.strip()}
+    if wanted & ATTACKS.keys():
+        if not wanted <= ATTACKS.keys():
+            print('error: run ELF-only attacks separately from legacy IR attacks')
+            return 1
+        return run_elf(args, wanted)
+
     all_cases = cases_mod.all_cases()
     if args.attacks:
         wanted = {a.strip() for a in args.attacks.split(",") if a.strip()}
@@ -82,10 +91,9 @@ def main() -> int:
 
     build_dir = Path(args.build_dir)
     tools = detect_tools(build_dir, args.config)
-    work = Path(args.work) if args.work else (Path.cwd() / "deobf_bench_work")
-    if work.exists():
-        shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True, exist_ok=True)
+    parent = Path(args.work) if args.work else (Path.cwd() / "deobf_bench_work")
+    parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix='run-', dir=parent))
 
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
     total = len(all_cases) * len(seeds)

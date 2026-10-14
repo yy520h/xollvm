@@ -92,6 +92,10 @@
  *   XOLLVM_OBFUSCATOR_CLANG      xollvm clang++（编译阶段）
  *
  * 退出码（xollvm-elf-hardener）：0 通过 / 2 malformed / 3 策略违规。
+ * vm(encodedTargets=1) 限 AArch64 LE ELF PIE，须通过正式安装入口链接：
+ *   XOLLVM_LINK_COMPILER=/path/to/clang++ bash /path/to/xollvm-link object.o -o app
+ * 入口顺序为 link→targets→audit→seal→verify→原子推广，失败保留旧输出。
+ * XOLLVM_ELF_HARDENER 可覆盖同目录工具；仅 targets 的 ELF 也可验收。
  *
  * 范围说明：manifest 自身参与摘要（窗口置零），覆盖 EHDR+程序头及全部
  * 文件支持的可执行 PT_LOAD；seal 后不能 strip 或修改这些字节。
@@ -445,9 +449,11 @@
  * vm                      alias: virtualize, virt        代码虚拟化
  *   将函数编译为由内置解释器执行的字节码。这是强度最高、开销也最大的技术。
  *
- *   preset  [light|medium|high|max]  预设参数组合，在下方显式参数之前应用，
+ *   preset  [medium|high|max]  预设参数组合，在下方显式参数之前应用，
  *                            但下方参数仍然可以覆盖预设值。
- *                            max = 全部能力 + 每个函数独立的变形引擎。
+ *                            max = 独立变形引擎、4 变体、两层嵌套、白盒 AES、
+ *                            96 opcode、字段布局、最终目标编码、auto wrapper。
+ *                            不自动启用检测器、root 检测或云值依赖。
  *   minBlocks        (1)     基本块少于此值时不进行虚拟化
  *   maxBlocks        (400)   基本块多于此值时不进行虚拟化（0 = 无限制）
  *   handlerVariants  [1-64] (3)  多态 handler 变体（1 = 关闭）；函数内每次
@@ -468,11 +474,21 @@
  *   rollingRegKey    (0)     每次存储时更新对应槽位的寄存器密钥
  *   nestedVM         (0)     使用第二个引擎虚拟化热点算术运算
  *   nestedVMOpcodes  (0)     嵌套 opcode 数量上限（0 = 所有符合条件的 opcode）
+ *   nestedVMHardened (0)     独立加固 owner 专属内层引擎；需要 nestedVM。
+ *                            最多两层，内层不再嵌套或另起检测监控线程。
  *   threadedDispatch (0)     将分发内联到每个 handler（无中央循环）
  *   keyedDispatch    (0)     使用指令指针对每个 opcode 字节加密
  *   superOps         (0)     fuse mul+add / shl+add / icmp+select /
  *                            and+icmp==0 chains into single super-op opcodes
- *   randISA          (0)     每次构建随机排列操作数字段编码
+ *   randISA          (0)     随机排列 subop/predicate/kind 的语义编码（ISA v2）
+ *   operandLayout    (0)     按 seed 排列固定指令字段；CALL/SWITCH 尾保持规范
+ *   extendedISA      (0)     发射新增立即数、算术链与 GEP 访存融合 opcode
+ *   encodedTargets   (0)     AArch64 ELF64LE PIE handler/engine 目标编码；需
+ *                            xollvm-link 后处理，编译报告仅标记 pending
+ *   whiteboxAES      (0)     密钥融合查表 AES-CTR；每实例 372736 字节表，
+ *                            无运行时 expanded-key 重建；需要 encBytecode。
+ *                            lazy 每调用独立 16 字节块缓存，允许逆向 seek。
+ *   wrapperFamily    {outlined|split|arena|auto} (outlined) wrapper 结构族
  *   cloudDispatch    (0)     云值驱动的动态 dispatch 偏移：运行时由
  *                            __zone_get_dispatch_offset() 返回一个由云值 V
  *                            派生的偏移（合法值=0；过期/缺失/篡改时非 0），
@@ -485,8 +501,9 @@
  *   metamorphicEngines (0)   使每个引擎的 handler 体多样化
  *                            （需要 enginePool 或 perFnEngine）
  *   antiDebug        (0)     传统 VM 反调试陷阱（仅显式启用）
- *   bindAntiDebug    (0)     将调试器检测绑定到 AES 密钥
- *                            （需要 hardened + antiDebug）
+ *   bindAntiDebug    (0)     将共享检测响应锁存绑定到字节码解码盐值
+ *                            （需要 hardened、有效检测源及 responseCorrupt）
+ *                            可由独立 antidebug 提供；不恢复白盒 AES 密钥。
  *   adDispatchThreshold  (5000)  分发门的 rdtsc 周期差阈值
  *   adHandlerThreshold   (5000)  handler 抽查的 rdtsc 周期差阈值（去抖）
  *   adDispatchInterval   (64)    每 N 次取指检查一次（必须是 2 的幂）
@@ -498,6 +515,20 @@
  *     iptables, selinux, rootRequired（默认均为 0，权限策略见 antidebug 小节）
  *     interval（1000 ms）、threshold（1000000 ns）、responseCorrupt（1）
  *     dynamic 至少需要一个检测器
+ *
+ *   VM 布尔参数仅接受 0/1/true/false；坏整数、未知 preset/wrapper 拒绝。
+ *   -obf-report-json 的 VM witness v2 分开 requested/effective、依赖关闭原因、
+ *   实际 wrapper、caller/engine opcode、变体和嵌套 helper；whitebox_instances
+ *   是当前 caller 的表数，module_whitebox_instances 是模块总数（含内层）。
+ *   descriptor 中的 key/add/rotation 可由静态分析逆解，不能视为不可破解。
+ *   最终 ELF 攻击接口：python -m utils.deobf_bench --build-dir PATH
+ *     --attacks aarch64-vm-targets 或 aarch64-vm-bytecode，结果明确区分
+ *     RECOVERED/NOT_RECOVERED_WITHIN_BUDGET/TIMEOUT/UNSUPPORTED/TOOL_ERROR。
+ *   字节码动态白盒提取适配器尚未实现，UNSUPPORTED 不代表防护成功。
+ *   成本 CLI：python utils/vm_hardening_cost.py --baseline-opt PATH
+ *     --current-opt PATH --seeds 1,42,20260930 --timeout 180 --output PATH
+ *   同一 NDK -O0 后端测量5类fixture；JSON保存逐阶段时间/RSS、section体积、
+ *   三次native计时和最终artifact hash。允许 --resume，历史工具hash必须一致。
  *
  *   （已移除的 useAES 参数仍会被接受但忽略；AES 是唯一的密码算法。）
  *

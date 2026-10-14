@@ -38,6 +38,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Layout.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Requirements.h"
 
 #include <cstring>
@@ -69,6 +70,7 @@ namespace llvm {
 		SmallVector<Value*, 8>           CalleeTab;  // callee table (CALL* targets)
 		// 6.2: parallel FunctionType table -- one entry per CalleeTab slot.
 		SmallVector<FunctionType*, 8>    CalleeFTyTab;
+		SmallVector<AttributeList, 8>   CalleeABIAttrs;
 		VMRequirementSet Requirements;
 
 		/// Metadata for an entry-block alloca created by PHI demotion.
@@ -123,6 +125,7 @@ namespace llvm {
 		/// superOps: fuse eligible i32 `mul`+`add` chains into a single
 		/// OP_MULADD opcode instead of two OP_BINOP opcodes.
 		void setSuperOps(bool on) { SuperOps = on; }
+		void setExtendedISA(bool On) { ExtendedISA = On; }
 
 		/// randISA (P9-A): module-uniform permutation of semantic operand-field
 		/// byte encodings. When null (or identity), subop bytes are written raw
@@ -130,6 +133,8 @@ namespace llvm {
 		/// module-wide instance the shared handler switch-cases were built from.
 		void setISAEnc(const ISAEnc* E) { IsaEnc = E; }
 		const ISAEnc* getISAEnc() const { return IsaEnc; }
+		void setLayout(const VMInstructionLayout& L) { Layout = L; }
+		const VMInstructionLayout& getLayout() const { return Layout; }
 		void setRequirements(VMRequirementSet *R) { RequirementSink = R; }
 		const VMRequirementSet &getRequirements() const { return Requirements; }
 
@@ -148,7 +153,10 @@ namespace llvm {
 		uint32_t           KeyedSalt = 0;
 		bool               KeyedDispatch = false;
 		bool               SuperOps = false;
+		bool               ExtendedISA = false;
 		const ISAEnc* IsaEnc = nullptr;
+		VMInstructionLayout Layout;
+		SmallVector<std::pair<uint32_t, VMOp>, 64> InstructionIPs;
 		// 外部接收器只在发射成功后获得快照，不参与临时收集。
 		VMRequirementSet *RequirementSink = nullptr;
 
@@ -208,6 +216,19 @@ namespace llvm {
 		// at the compare's position and yields the compare's i32 0/1 result.
 		DenseMap<Instruction*, Instruction*> FusedCmpToAnd;
 		DenseSet<Instruction*> SkippedAnds;
+		struct VMFusion {
+			Instruction* Consumer;
+			Instruction* Producer;
+			VMOp Opcode;
+			SmallVector<Value*, 5> Operands;
+			uint8_t Predicate = 0;
+			uint16_t Scale = 0;
+			uint8_t Alignment = 0;
+		};
+		DenseMap<Instruction*, VMFusion> Fusions;
+		DenseSet<Instruction*> SkippedFusions;
+		void scanExtendedSuperOps(Function& F);
+		bool legalFusion(Instruction* Producer, Instruction* Consumer, bool UniqueUse = true) const;
 
 		// superOps: identify fusion candidates in F -- `%m = mul i32 %a,%b`
 		// with exactly one use, that use being a direct `%d = add i32 %m,%c`
@@ -409,12 +430,15 @@ namespace llvm {
 		}
 
 		// 6.2: callee registration with its FunctionType.
-		uint8_t callee(Value* C, FunctionType* FTy) {
+		uint8_t callee(Value* C, FunctionType* FTy, AttributeList ABIAttrs) {
 			// Vararg callees are never deduplicated: each call site has a
 			// unique concrete FTy (arg count may differ between call sites).
 			if (!FTy->isVarArg())
-				for (unsigned I = 0; I < CalleeTab.size(); ++I) if (CalleeTab[I] == C) return (uint8_t)I;
+				for (unsigned I = 0; I < CalleeTab.size(); ++I)
+					if (CalleeTab[I] == C && CalleeFTyTab[I] == FTy && CalleeABIAttrs[I] == ABIAttrs)
+						return (uint8_t)I;
 			assert(CalleeTab.size() < 252); CalleeTab.push_back(C); CalleeFTyTab.push_back(FTy);
+			CalleeABIAttrs.push_back(ABIAttrs);
 			return (uint8_t)(CalleeTab.size() - 1);
 		}
 
@@ -422,6 +446,7 @@ namespace llvm {
 
 		uint8_t encOp(VMOp Op) const { return OpMap ? OpMap->encode(Op) : (uint8_t)Op; }
 		void bop(VMOp Op) {
+			InstructionIPs.push_back({ip(), Op});
 			Requirements.requireOpcode(Op);
 			uint8_t v = encOp(Op);
 			// keyedDispatch: K(IP) is baked in using ip() as it stands right now.

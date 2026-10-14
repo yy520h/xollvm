@@ -23,9 +23,9 @@ class CaseScore:
 
 
 def score_case(case_name: str, attack: str, results: List[AttackResult]) -> CaseScore:
-    passed = [r for r in results if r.status == "PASS"]
-    skipped = [r for r in results if r.status == "SKIP"]
-    failed = [r for r in results if r.status == "FAIL"]
+    passed = [r for r in results if r.status in ("PASS", "RECOVERED", "NOT_RECOVERED_WITHIN_BUDGET")]
+    skipped = [r for r in results if r.status in ("SKIP", "UNSUPPORTED")]
+    failed = [r for r in results if r.status in ("FAIL", "TIMEOUT", "TOOL_ERROR")]
 
     if failed:
         status = "FAIL"
@@ -38,7 +38,9 @@ def score_case(case_name: str, attack: str, results: List[AttackResult]) -> Case
 
     resilience = None
     if passed:
-        resilience = sum(r.resilience for r in passed if r.resilience is not None) / len(passed)
+        values = [r.resilience for r in passed if r.resilience is not None]
+        if values:
+            resilience = sum(values) / len(values)
 
     detail_source = failed or passed or skipped
     detail = detail_source[0].detail if detail_source else ""

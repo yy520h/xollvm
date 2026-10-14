@@ -28,6 +28,7 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscator/AESStubBitcode.h"
+#include "llvm/Transforms/Obfuscator/VMWhiteBoxAES.h"
 
 #include <functional>
 using namespace llvm;
@@ -179,6 +180,15 @@ static void provideStubKeyProviderBodies(Module& M) {
 //  buildBytecodeGlobal 
 
 void VMImpl::buildBytecodeGlobal() {
+	if (Cfg.whiteboxAES) {
+		auto T = VMWhiteBoxAES::generate(ArrayRef<uint8_t>(AESKey, 16), R.fork("vm.whitebox").u64());
+		if (!T) report_fatal_error(T.takeError());
+		GVWhiteBox = emitVMWhiteBoxInstance(M, *T);
+		SmallVector<uint8_t, 8> Nonce;
+		for (unsigned i = 0; i < 8; ++i) Nonce.push_back(AESNonce >> (i * 8));
+		auto* Init = ConstantDataArray::get(Ctx, Nonce);
+		GVAESNonce = new GlobalVariable(M, Init->getType(), true, GlobalValue::PrivateLinkage, Init, F.getName() + ".vm.whitebox.nonce");
+	}
 	SmallVector<Constant*, 1024> Bytes;
 	Bytes.reserve(E.BC.size());
 
@@ -258,10 +268,17 @@ void VMImpl::buildCalleeGlobal() {
 	auto* SS = VMEngine::getSharedState(M, EngineId);
 	SmallVector<uint8_t, 8> IdxBytes;
 	IdxBytes.reserve(E.CalleeFTyTab.size());
-	for (FunctionType* FTy : E.CalleeFTyTab) {
+	for (unsigned i = 0; i < E.CalleeFTyTab.size(); ++i) {
+		FunctionType* FTy = E.CalleeFTyTab[i];
+		AttributeList Attrs = E.CalleeABIAttrs[i];
 		auto [It, Inserted] = SS->FTyToIdx.try_emplace(
-			FTy, (uint8_t)SS->SharedFTys.size());
-		if (Inserted) SS->SharedFTys.push_back(FTy);
+			std::make_pair(FTy, Attrs.getRawPointer()), (uint8_t)SS->SharedFTys.size());
+		if (Inserted) {
+			if (SS->SharedFTys.size() >= 256)
+				report_fatal_error("CALL ABI: shared signature table exceeds 256 entries");
+			SS->SharedFTys.push_back(FTy);
+			SS->SharedCallAttrs.push_back(Attrs);
+		}
 		IdxBytes.push_back(It->second);
 	}
 	UniqueFTys.assign(SS->SharedFTys.begin(), SS->SharedFTys.end());
@@ -302,6 +319,35 @@ void VMImpl::buildEncryptCtor() {
 
 	unsigned BCLen = (unsigned)E.BC.size();
 	if (!BCLen) return;
+	if (Cfg.whiteboxAES) {
+		auto* Ctor = Function::Create(FunctionType::get(Type::getVoidTy(Ctx), false),
+			GlobalValue::InternalLinkage, F.getName() + ".vm.ctor.whitebox", M);
+		IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Ctor));
+		B.CreateMemCpy(GVBytecodeRT, Align(1), GVBytecode, Align(1), uint64_t(BCLen));
+		if (LazyDecrypt) B.CreateRetVoid();
+		else {
+			auto* Window = B.CreateAlloca(ArrayType::get(I8Ty, 16));
+			auto* Entry = B.GetInsertBlock();
+			auto* Block = BasicBlock::Create(Ctx, "block", Ctor); auto* Byte = BasicBlock::Create(Ctx, "byte", Ctor);
+			auto* Advance = BasicBlock::Create(Ctx, "advance", Ctor); auto* Done = BasicBlock::Create(Ctx, "done", Ctor);
+			B.CreateBr(Block); B.SetInsertPoint(Block);
+			auto* I = B.CreatePHI(I32Ty, 2); I->addIncoming(B.getInt32(0), Entry);
+			B.CreateCall(getVMWhiteBoxCTRFunction(M), {GVWhiteBox, GVAESNonce, I, Window});
+			B.CreateBr(Byte); B.SetInsertPoint(Byte);
+			auto* J = B.CreatePHI(I32Ty, 2); J->addIncoming(B.getInt32(0), Block);
+			Value* Index = B.CreateAdd(B.CreateMul(I, B.getInt32(16)), J);
+			Value* P = B.CreateGEP(I8Ty, GVBytecodeRT, Index);
+			Value* KS = B.CreateLoad(I8Ty, B.CreateGEP(I8Ty, Window, J));
+			B.CreateStore(B.CreateXor(B.CreateLoad(I8Ty, P), KS), P);
+			Value* Next = B.CreateAdd(J, B.getInt32(1)); J->addIncoming(Next, Byte);
+			B.CreateCondBr(B.CreateAnd(B.CreateICmpULT(Next, B.getInt32(16)),
+				B.CreateICmpULT(B.CreateAdd(Index, B.getInt32(1)), B.getInt32(BCLen))), Byte, Advance);
+			B.SetInsertPoint(Advance); Value* NI = B.CreateAdd(I, B.getInt32(1)); I->addIncoming(NI, Advance);
+			B.CreateCondBr(B.CreateICmpULT(B.CreateMul(NI, B.getInt32(16)), B.getInt32(BCLen)), Block, Done);
+			B.SetInsertPoint(Done); B.CreateRetVoid();
+		}
+		appendToGlobalCtors(M, Ctor, 65535, nullptr); return;
+	}
 
 	// Link the AES stub (shared with strenc)
 	Function* CTRDecryptFn = M.getFunction("__obf_aes_ctr_decrypt");
@@ -327,10 +373,22 @@ void VMImpl::buildEncryptCtor() {
 					// on cross-target builds. Drop it; the stub needs none.
 					if (auto* MDFlags = StubM->getModuleFlagsMetadata())
 						MDFlags->eraseFromParent();
+					SmallVector<std::string, 8> StubDefinitions;
+					for (Function& StubFn : *StubM) {
+						if (!StubFn.isDeclaration() && !StubFn.hasLocalLinkage())
+							StubDefinitions.push_back(StubFn.getName().str());
+					}
 					if (Linker::linkModules(M, std::move(StubM), 0)) {
 						llvm::report_fatal_error(
 							llvm::StringRef("[vm] AES stub linkModules failed — cannot build decryptor"),
 							/*gen_crash_diag=*/false);
+					}
+					// VM 独立引入的解密实现也必须局部化，避免多编译单元重复符号。
+					for (const std::string& Name : StubDefinitions) {
+						if (Function* StubFn = M.getFunction(Name)) {
+							StubFn->setLinkage(GlobalValue::PrivateLinkage);
+							StubFn->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+						}
 					}
 				}
 				else {

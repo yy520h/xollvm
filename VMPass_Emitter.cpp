@@ -41,6 +41,20 @@ STATISTIC(VMVirtRegs, "Virtual register slots allocated (v7)");
 
 // isize / bsize / emit(Instruction) / emit(BasicBlock) / run() 
 
+static const char* unsupportedCallABI(const CallInst& CI) {
+	if (CI.getCallingConv() != CallingConv::C || CI.hasOperandBundles() || CI.isMustTailCall())
+		return "CALL ABI: non-C convention, operand bundles or musttail unsupported";
+	for (AttributeSet AS : CI.getAttributes()) {
+		for (Attribute A : AS) {
+			if (A.isTypeAttribute() || A.hasAttribute(Attribute::InReg) ||
+				A.hasAttribute(Attribute::Nest) || A.hasAttribute(Attribute::SwiftSelf) ||
+				A.hasAttribute(Attribute::SwiftError) || A.hasAttribute(Attribute::SwiftAsync))
+				return "CALL ABI: aggregate/inreg/special parameter attribute unsupported";
+		}
+	}
+	return nullptr;
+}
+
 uint32_t BytecodeEmitter::isize(Instruction* I) {
 	if (isa<AllocaInst>(I) || isa<UnreachableInst>(I)) return 0;
 	if (isa<FreezeInst>(I)) {
@@ -236,6 +250,7 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 	}
 	if (Op == Instruction::Call) {
 		auto* CI = cast<CallInst>(I); unsigned NA = CI->arg_size();
+		if (const char* Why = unsupportedCallABI(*CI)) { markUnsupported(I, Why); return 0; }
 
 		if (auto* F = CI->getCalledFunction())
 			if (F->isIntrinsic()) { markUnsupported(I); return 0; }
@@ -306,15 +321,7 @@ uint32_t BytecodeEmitter::bsize(BasicBlock* BB) {
 }
 
 
-// superOps: find `%m = mul i32 %a,%b; %d = add i32 %m,%c` chains where %m
-// has exactly one use (the add) and that use is a direct i32 add (not
-// through a cast/phi/select). The fused OP_MULADD is emitted where the ADD
-// naturally sits in program order (see emit(Instruction*)), not at the
-// mul's position -- so no operand-availability check is needed here: SSA
-// dominance already guarantees every operand the add has in the original
-// program, including the mul's own inputs (which dominate the mul and
-// therefore the add too), is resolvable by the time the add's position is
-// reached, regardless of which block either instruction is in.
+// 旧融合也使用同 BB、无副作用边界约束，并在消费者位置发射。
 void BytecodeEmitter::scanSuperOps(Function& F) {
 	for (BasicBlock& BB : F) {
 		for (Instruction& I : BB) {
@@ -325,6 +332,8 @@ void BytecodeEmitter::scanSuperOps(Function& F) {
 			auto* Add = dyn_cast<Instruction>(I.user_back());
 			if (!Add || Add->getOpcode() != Instruction::Add) continue;
 			if (!Add->getType()->isIntegerTy(32)) continue;
+			if (!legalFusion(&I, Add)) continue;
+			if (SkippedFusions.count(&I) || SkippedFusions.count(Add) || Fusions.count(&I) || Fusions.count(Add)) continue;
 			if (FusedAddToMul.count(Add)) continue;  // add already claimed by another mul
 
 			FusedAddToMul[Add] = &I;
@@ -344,6 +353,8 @@ void BytecodeEmitter::scanSuperOps(Function& F) {
 			auto* Add = dyn_cast<Instruction>(I.user_back());
 			if (!Add || Add->getOpcode() != Instruction::Add) continue;
 			if (!Add->getType()->isIntegerTy(32)) continue;
+			if (!legalFusion(&I, Add)) continue;
+			if (SkippedFusions.count(&I) || SkippedFusions.count(Add) || Fusions.count(&I) || Fusions.count(Add)) continue;
 			if (FusedAddToMul.count(Add)) continue;   // add already fused by a mul
 			if (FusedAddToShl.count(Add)) continue;   // add already claimed by another shl
 			FusedAddToShl[Add] = &I;
@@ -393,6 +404,8 @@ void BytecodeEmitter::scanSuperOps(Function& F) {
 				Ok = false; break;
 			}
 			if (!Ok || !Sel) continue;
+			if (!legalFusion(Cmp, Sel, false)) continue;
+			if (SkippedFusions.count(Cmp) || SkippedFusions.count(Sel) || Fusions.count(Cmp) || Fusions.count(Sel)) continue;
 			if (FusedSelToCmp.count(Sel)) continue;
 			FusedSelToCmp[Sel] = Cmp;
 			SkippedCmps.insert(Cmp);
@@ -425,6 +438,8 @@ void BytecodeEmitter::scanSuperOps(Function& F) {
 			if (!And || And->getOpcode() != Instruction::And) continue;
 			if (!And->getType()->isIntegerTy(32)) continue;
 			if (!And->hasOneUse()) continue;         // consumed only by this compare
+			if (!legalFusion(And, Cmp)) continue;
+			if (SkippedFusions.count(Cmp) || SkippedFusions.count(And) || Fusions.count(Cmp) || Fusions.count(And)) continue;
 			if (SkippedAnds.count(And)) continue;    // and already claimed
 			FusedCmpToAnd[Cmp] = And;
 			SkippedAnds.insert(And);
@@ -438,6 +453,37 @@ void BytecodeEmitter::emit(Instruction* I) {
 		return;
 	if (isa<FreezeInst>(I))
 		return;
+	if (SkippedFusions.count(I)) return;
+	if (auto It = Fusions.find(I); It != Fusions.end()) {
+		const VMFusion& Fusion = It->second;
+		VMOp Op = Fusion.Opcode;
+		if (Op >= OP_GEP_LOAD8) {
+			bool Store = Op >= OP_GEP_STORE32;
+			bool Wide = Op == OP_GEP_LOAD64 || Op == OP_GEP_STORE64;
+			Value* Idx = Fusion.Operands[1];
+			bool WideIndex = Idx->getType()->isIntegerTy(64);
+			bop(Op);
+			b8(xorSalt(Store ? (Wide ? vr64(Fusion.Operands[2]) : vr(Fusion.Operands[2])) :
+				(Wide ? newVR64(I) : newVR(I))));
+			b8(xorSalt(pr(Fusion.Operands[0])));
+			b8(xorSalt(WideIndex ? vr64(Idx) : vr(Idx)));
+			b8(WideIndex ? 1 : 0);
+			u16(Fusion.Scale); b8(Fusion.Alignment);
+			return;
+		}
+		bool Is64 = Op == OP_MULADD64 || Op == OP_SHLADD64 || Op == OP_CMPSEL64 ||
+			Op == OP_ANDCMPZ64 || Op >= OP_XORADD64;
+		bool Compare = Op == OP_ANDCMPZ64;
+		bop(Op);
+		b8(xorSalt(Compare ? newVR(I) : Is64 ? newVR64(I) : newVR(I)));
+		for (unsigned i = 0; i < Fusion.Operands.size(); ++i) {
+			if (Op == OP_CMPSEL64 && i == 2) b8(encIcmpPred(Fusion.Predicate));
+			b8(xorSalt(Is64 ? vr64(Fusion.Operands[i]) : vr(Fusion.Operands[i])));
+		}
+		if (Compare) b8(encIcmpPred(Fusion.Predicate));
+		if (Op == OP_CMPSEL64 || Compare) Requirements.requireIcmpPredicate(Op, Fusion.Predicate);
+		return;
+	}
 
 	// superOps: this mul's result is computed inline by its fused add's
 	// OP_MULADD (below) instead of its own OP_BINOP.
@@ -517,6 +563,23 @@ void BytecodeEmitter::emit(Instruction* I) {
 			}
 		}
 
+		if (ExtendedISA && Sub <= BS_ASHR) {
+			Value* Left = I->getOperand(0);
+			auto* Imm = dyn_cast<ConstantInt>(I->getOperand(1));
+			if (!Imm && I->isCommutative()) {
+				Imm = dyn_cast<ConstantInt>(Left);
+				Left = I->getOperand(1);
+			}
+			// 非法位移保持原指令，不能取模把 poison 改成定义良好的结果。
+			if (Imm && (Sub < BS_SHL || Imm->getZExtValue() < (Is64 ? 64u : 32u))) {
+				VMOp ImmOp = static_cast<VMOp>((Is64 ? OP_ADDI64 : OP_ADDI32) + Sub);
+				bop(ImmOp);
+				b8(xorSalt(Is64 ? newVR64(I) : newVR(I)));
+				b8(xorSalt(Is64 ? vr64(Left) : vr(Left)));
+				if (Is64) u64(Imm->getZExtValue()); else u32(Imm->getZExtValue());
+				return;
+			}
+		}
 		Requirements.requireBinSubop(Is64 ? OP_BINOP64 : OP_BINOP,
 			(uint8_t)Sub);
 		bop(Is64 ? OP_BINOP64 : OP_BINOP);
@@ -987,6 +1050,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 		if (auto* F = CI->getCalledFunction())
 			if (F->isIntrinsic()) { markUnsupported(I); return; }
 
+		if (const char* Why = unsupportedCallABI(*CI)) { markUnsupported(I, Why); return; }
 		for (unsigned A = 0; A < CI->arg_size(); ++A) {
 			Type* AT = CI->getArgOperand(A)->getType();
 			if (AT->isPointerTy() || (AT->isIntegerTy() && AT->getIntegerBitWidth() <= 32)
@@ -1004,7 +1068,15 @@ void BytecodeEmitter::emit(Instruction* I) {
 			ConcreteArgTys.push_back(CI->getArgOperand(A)->getType());
 		FunctionType* ConcreteFTy = FunctionType::get(
 			CI->getType(), ConcreteArgTys, CI->getFunctionType()->isVarArg());
-		uint8_t FI = callee(Fn, ConcreteFTy);
+		// 仅保留影响整数扩展的 ABI 属性；优化提示不参与共享签名。
+		AttributeList ABIAttrs;
+		for (unsigned Idx = AttributeList::ReturnIndex; Idx <= CI->arg_size(); ++Idx) {
+			for (auto Kind : {Attribute::SExt, Attribute::ZExt}) {
+				if (CI->getAttributes().hasAttributeAtIndex(Idx, Kind))
+					ABIAttrs = ABIAttrs.addAttributeAtIndex(CI->getContext(), Idx, Kind);
+			}
+		}
+		uint8_t FI = callee(Fn, ConcreteFTy, ABIAttrs);
 		unsigned NAw = CI->arg_size();
 		if (NAw > 16) {
 			markUnsupported(I, "CALL arg count exceeds MaxArgs (16)");
@@ -1113,6 +1185,8 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 
 	// Reset per-run state
 	BC.clear();
+	InstructionIPs.clear();
+	if (!Layout.validate()) { setFail("invalid VM operand layout"); return false; }
 	Requirements = VMRequirementSet();
 	if (RequirementSink) *RequirementSink = VMRequirementSet();
 	bool Emitted = false;
@@ -1125,6 +1199,7 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	PR.clear();
 	CalleeTab.clear();
 	CalleeFTyTab.clear();
+	CalleeABIAttrs.clear();
 	PHIAllocas.clear();
 	ImmLoads.clear();
 	ImmLoads64.clear();
@@ -1135,6 +1210,8 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	KeyedOpIPs.clear();
 	NVR = NVR64 = NPR = NFR = 0;
 	FusedAddToMul.clear();
+	Fusions.clear();
+	SkippedFusions.clear();
 	SkippedMuls.clear();
 	FusedAddToShl.clear();
 	SkippedShls.clear();
@@ -1210,7 +1287,10 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	// superOps: identify fusion candidates before slot pre-assignment, so the
 	// pre-assignment loop below can skip handing a fused-away mul its own
 	// (unused) slot.
-	if (SuperOps) scanSuperOps(F);
+	if (SuperOps) {
+		if (ExtendedISA) scanExtendedSuperOps(F);
+		scanSuperOps(F);
+	}
 
 	// Pre-assign slots for *all* instruction results (except allocas/unreachable).
 	// This removes any reliance on basic-block iteration order for vr()/pr() lookups,
@@ -1218,6 +1298,7 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	for (BasicBlock& BB : F) {
 		for (Instruction& I : BB) {
 			if (isa<AllocaInst>(&I) || isa<UnreachableInst>(&I)) continue;
+			if (SkippedFusions.count(&I)) continue;
 			if (auto *Freeze = dyn_cast<FreezeInst>(&I)) {
 				Value *Operand = Freeze->getOperand(0);
 				Type *Ty = I.getType();
@@ -1296,6 +1377,7 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 		// the body (the prologue hasn't been written yet) and was baked with a
 		// key computed against its pre-splice IP -- see the re-key loop below.
 		size_t BodyOpCount = KeyedOpIPs.size();
+		size_t BodyInstructionCount = InstructionIPs.size();
 
 		for (auto& KV : ImmLoads) {
 			bop(OP_LOADI);
@@ -1317,6 +1399,8 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 		}
 
 		uint32_t PrologueLen = ip();
+		// 前半段记录是 body，后半段是 prologue；排列在最终 fixup 后执行。
+		for (unsigned i = 0; i < BodyInstructionCount; ++i) InstructionIPs[i].first += PrologueLen;
 		BC.append(Body.begin(), Body.end());
 
 		// keyedDispatch: re-key every body opcode byte now that its final
@@ -1373,6 +1457,23 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 		setFail("empty bytecode");
 		return false;
 	}
+	for (const auto& Entry : InstructionIPs) {
+		unsigned Start = Entry.first;
+		VMOp Op = Entry.second;
+		unsigned Size = Layout.size(Op);
+		if (Start > BC.size() || Size > BC.size() - Start) {
+			setFail("VM operand layout instruction truncated"); return false;
+		}
+		SmallVector<uint8_t, 32> Original(BC.begin() + Start, BC.begin() + Start + Size);
+		if (IsaEnc) {
+			if (Op == OP_CAST64) Original[3] = IsaEnc->encCast64Kind(Original[3]);
+			if (Op == OP_SELECT) Original[1] = IsaEnc->encSelectKind(Original[1]);
+			if (Op == OP_FCAST_FF || Op == OP_FCAST_FV || Op == OP_FCAST_FV64 ||
+				Op == OP_FCAST_VF || Op == OP_FCAST_V64F)
+				Original[3] = IsaEnc->encFCastKind(Original[3] & 0x7F) | (Original[3] & 0x80);
+		}
+		for (unsigned b = 1; b < Size; ++b) BC[Start + Layout.physicalByte(Op, b)] = Original[b];
+	}
 	VMBytecodeBytes += BC.size(); VMVirtRegs += NVR; VMVirtRegs += NVR64; VMVirtRegs += NPR; VMVirtRegs += NFR;
 
 	Requirements.NeedsRegFile[0] = NVR != 0;
@@ -1382,6 +1483,8 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 	Requirements.NeedsSuperOps = Requirements.contains(OP_MULADD) ||
 		Requirements.contains(OP_SHLADD) || Requirements.contains(OP_CMPSEL) ||
 		Requirements.contains(OP_ANDCMPZ);
+	for (unsigned Op = OP_MULADD64; Op <= OP_GEP_STORE64; ++Op)
+		Requirements.NeedsSuperOps |= Requirements.contains(static_cast<VMOp>(Op));
 	Requirements.NeedsConstStream = ConstInStream &&
 		(Requirements.contains(OP_LOADI) || Requirements.contains(OP_LOADI64) ||
 		 Requirements.contains(OP_LOADI_F));

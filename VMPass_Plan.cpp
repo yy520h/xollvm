@@ -112,15 +112,20 @@ bool VMPlanCoordinator::freeze() {
 				continue;
 			}
 			unsigned Base = (*Prepared)->Impl->EngineId;
-			if (Used.insert(Base).second) {
+			bool Nested = Group.Plan.Config.nestedVM;
+			if (!Used.count(Base) && (!Nested || !Used.count(Base & ~1u))) {
+				Used.insert(Base);
+				if (Nested) Used.insert(Base & ~1u);
 				Group.Plan.EngineId = Base;
 				continue;
 			}
 			unsigned Layer = VMEngine::engineLayer(Base);
 			unsigned Pool = (unsigned)(Group.Plan.Key.stableHash() & 0x3FFFFFFFu) | 0x40000000u;
 			unsigned New = VMEngine::makeEngineId(Pool, Layer);
-			while (!Used.insert(New).second)
+			while (Used.count(New) || (Nested && Used.count(New & ~1u)))
 				New = VMEngine::makeEngineId(++Pool, Layer);
+			Used.insert(New);
+			if (Nested) Used.insert(New & ~1u);
 			Group.Plan.EngineId = New;
 		}
 	}
@@ -161,26 +166,35 @@ bool VMPlanCoordinator::commit() {
 		// Apply the group's (possibly reassigned) engine id. prepare() does not
 		// bind EngineId; the engine function/state are built here in commit().
 		Candidate->Impl->EngineId = Plan->EngineId;
-		// Nested helpers are currently prepared during commit; their requirements
-		// are not frozen into the outer plan yet, so keep the complete handler
-		// domain for nested groups until helper closure moves before freeze.
-		if (Candidate->Config.nestedVM)
-			Candidate->Impl->setFullHandlerRequirements();
-		else
-			Candidate->Impl->setHandlerRequirements(Plan->Requirements);
+		// 内层在自己的 owner 中冻结需求，不污染 outer 的真实 opcode 集合。
+		Candidate->Impl->setHandlerRequirements(Plan->Requirements);
 		ValueToValueMapTy Map;
 		Function* Snapshot = CloneFunction(Candidate->Fn, Map);
 		Snapshot->setLinkage(GlobalValue::InternalLinkage);
+		auto RestoreCaller = [&] {
+			Function& F = *Candidate->Fn;
+			auto Linkage = F.getLinkage();
+			F.deleteBody(); F.setLinkage(Linkage);
+			ValueToValueMapTy Back;
+			for (Argument& A : F.args()) Back[Snapshot->getArg(A.getArgNo())] = &A;
+			SmallVector<ReturnInst*, 8> Returns;
+			CloneFunctionInto(&F, Snapshot, Back, CloneFunctionChangeType::LocalChangesOnly, Returns);
+			F.setAttributes(Snapshot->getAttributes());
+			F.setMetadata("obf.vm.caller", nullptr);
+			F.setMetadata("obf.antidebug.deferred", nullptr);
+			Candidate->Accepted = false;
+			Candidate->Impl->Committed = false;
+			Candidate->CommittedInsts = obf::countInstructions(F);
+		};
 		if (!Candidate->Impl->commit()) {
-			Snapshot->eraseFromParent();
-			if (Candidate->Required && Candidate->SensitiveStrict)
-				report_fatal_error(Twine("obfuscator: sensitive region '") +
-					Candidate->Region + "': VM commit failed for '" +
-					Candidate->Fn->getName() + "': " +
-					(Candidate->Impl->FailReason.empty()
-						? StringRef("unknown") : StringRef(Candidate->Impl->FailReason)),
-					/*gen_crash_diag=*/false);
-			return false;
+			Candidate->SkipReason = Candidate->Impl->FailReason.empty()
+				? "VM commit failed" : Candidate->Impl->FailReason;
+			if ((Candidate->Required && Candidate->SensitiveStrict) || ObfNoSkips)
+				report_fatal_error(Twine("obfuscator: VM commit failed for '") +
+					Candidate->Fn->getName() + "': " + Candidate->SkipReason, false);
+			// 普通可选模式恢复调用者，失败状态交给最终报告；不能留下空函数体。
+			RestoreCaller(); Snapshot->eraseFromParent();
+			continue;
 		}
 		// prepare 不增长原函数；硬预算必须在正式 wrapper 生成后检查。
 		auto Cfg = AnnotationParser::parseAnnotations(Candidate->Fn);
@@ -190,21 +204,8 @@ bool VMPlanCoordinator::commit() {
 		if (Budget.isEnabled() && Cap && obf::countInstructions(*Candidate->Fn) > Cap) {
 			if ((Candidate->Required && Candidate->SensitiveStrict) || ObfNoSkips)
 				report_fatal_error("obfuscator: VM wrapper exceeds hard IR budget", false);
-			Function& F = *Candidate->Fn;
-			auto Linkage = F.getLinkage();
-			auto Attrs = Snapshot->getAttributes();
-			F.deleteBody();
-			F.setLinkage(Linkage);
-			ValueToValueMapTy Back;
-			for (Argument& A : F.args()) Back[Snapshot->getArg(A.getArgNo())] = &A;
-			SmallVector<ReturnInst*, 8> Returns;
-			CloneFunctionInto(&F, Snapshot, Back, CloneFunctionChangeType::LocalChangesOnly, Returns);
-			F.setAttributes(Attrs);
-			F.setMetadata("obf.vm.caller", nullptr);
-			F.setMetadata("obf.antidebug.deferred", nullptr);
-			Candidate->Accepted = false;
+			RestoreCaller();
 			Candidate->SkipReason = "budget_rollback";
-			Candidate->Impl->Committed = false;
 		}
 		Snapshot->eraseFromParent();
 		Candidate->CommittedInsts = obf::countInstructions(*Candidate->Fn);
@@ -227,6 +228,34 @@ void VMPlanCoordinator::finalizeReports(obf::ObfReportSink& Sink) const {
 		if (!Candidate->Impl) continue;
 		for (auto& R : Sink.Functions) {
 			if (R.Name != Candidate->Fn->getName()) continue;
+			auto& Impl = *Candidate->Impl;
+			VMEngineWitness W;
+			W.EngineId = Impl.EngineId; W.ConfigKey = Candidate->Key;
+			W.Requested = Impl.RequestedCfg; W.Effective = Impl.Cfg;
+			W.CallerRequirements = Candidate->Requirements;
+			W.Requirements = Impl.HasHandlerRequirements ? Impl.HandlerRequirements : Candidate->Requirements;
+			W.Callers.push_back({R.Name, Candidate->Requirements});
+			W.ModuleSeed = Impl.MasterSeed; W.Maps = Impl.IsaEnc;
+			W.WrapperFamily = Impl.ActualWrapperFamily;
+			W.BindDisabledReason = Impl.BindDisabledReason;
+			W.Phase = Impl.Committed ? "committed" : "failed";
+			if (Impl.Committed) {
+				auto* SS = VMEngine::getSharedState(Impl.M, Impl.EngineId);
+				W.HandlerVariants = SS->NumVariants; W.Decoys = SS->NumDecoys;
+				W.HandlerTableEntries = OP_COUNT * W.HandlerVariants + 1 + (SS->EncDispatch ? OP_COUNT : 0) + W.Decoys;
+				for (unsigned Op = 0; Op < OP_COUNT; ++Op)
+					if (SS->OpcBB[Op][0] && SS->OpcBB[Op][0] != SS->Invalid)
+						W.RealHandlers.push_back(static_cast<VMOp>(Op));
+				if (Impl.Cfg.nestedVM) for (Function& HF : Impl.M) {
+					auto* MD = HF.getMetadata("obf.vm.nested.owner");
+					if (MD && cast<ConstantInt>(cast<ConstantAsMetadata>(MD->getOperand(0))->getValue())->getZExtValue() == Impl.EngineId)
+						++W.NestedHelperCount;
+				}
+				W.WhiteboxInstances = Impl.GVWhiteBox ? 1 : 0;
+				for (const auto& G : Impl.M.globals())
+					if (G.getName().starts_with("__vm_whitebox.")) ++W.ModuleWhiteboxInstances;
+			}
+			R.VM = std::move(W);
 			obf::DifficultyComponents Before;
 			Before.Cyclomatic = R.Difficulty.CyclomaticBefore;
 			R.Difficulty = obf::scoreDifficulty(Before, obf::computeDifficultyComponents(*Candidate->Fn));

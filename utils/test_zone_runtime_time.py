@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 
-@pytest.fixture(scope="module")
-def runtime_time_binary(tmp_path_factory):
+@pytest.fixture(scope="module", params=["plain", "vm"])
+def runtime_time_binary(tmp_path_factory, request):
     repo = Path(__file__).resolve().parents[1]
     root = repo.parents[2] if repo.parent.name == ".worktrees" else repo.parent
     runtime = root / "demo/jni/zone_runtime"
@@ -75,34 +75,78 @@ int main(int argc, char** argv) {
     r.issued_at = fresh ? 4990 : 990;
     r.expires_at = fresh ? 5050 : 1040;
     r.policy_version = 1; r.key_id = "key-1";
+    bool rejected = false;
+    if (std::strcmp(argv[1], "fresh-policy") == 0) { r.policy_version = 2; rejected = true; }
+    if (std::strcmp(argv[1], "fresh-key") == 0) { r.key_id = "other-key"; rejected = true; }
+    if (std::strcmp(argv[1], "fresh-operation") == 0) { r.operation = "other"; rejected = true; }
     if (!client.signTestResponse(&r)) return 3;
+    std::string request_hash = r.request_hash;
+    std::string device_hash = r.device_id_hash;
+    if (std::strcmp(argv[1], "fresh-request") == 0) { request_hash = std::string(64, 'c'); rejected = true; }
+    if (std::strcmp(argv[1], "fresh-device") == 0) { device_hash = std::string(64, 'c'); rejected = true; }
+    if (std::strcmp(argv[1], "fresh-signature") == 0) { r.next_state = "tampered"; rejected = true; }
+    bool expected_accept = fresh && !rejected;
     fake_time = 5000;
     bool dispatch = std::strstr(argv[1], "dispatch") != nullptr;
     bool accepted = dispatch ? client.verifyDispatchResponse(r, r.request_hash, r.device_id_hash)
-                             : client.acceptResponse(r, r.request_hash, r.device_id_hash);
-    std::cout << "accepted=" << accepted << " expected=" << fresh << '\n';
-    return accepted != fresh;
+                              : client.acceptResponse(r, request_hash, device_hash);
+    std::cout << "accepted=" << accepted << " expected=" << expected_accept << '\n';
+    return accepted != expected_accept || (!dispatch && client.hasState() != expected_accept);
 }
 '''.replace("VALUE_BYTES", ",".join(str(b) for b in value))
        .replace("EXPECTED_OFFSET", str(expected)))
     exe = work / "time-test"
+    client = runtime / "capability_client.cpp"
+    hardener = root / "build-sensitive/bin/xollvm-elf-hardener"
+    if request.param == "vm":
+        opt = root / "build-sensitive/bin/opt"
+        if not opt.exists() or not hardener.exists():
+            pytest.skip("sensitive toolchain unavailable")
+        ir = work / "capability.ll"
+        obf = work / "capability.obf.ll"
+        client = work / "capability.o"
+        compile_ir = subprocess.run(
+            [str(clang), "--target=aarch64-linux-android26", f"--sysroot={ndk / 'sysroot'}",
+             "-std=c++17", "-O0", "-g0", "-DXOLLVM_ZONE_OBFUSCATE=1",
+             f"-I{runtime}", f"-I{openssl / 'include'}", f"-I{runtime / 'openssl_core/src/include'}",
+             "-S", "-emit-llvm", str(runtime / "capability_client.cpp"), "-o", str(ir)],
+            capture_output=True, text=True, timeout=120)
+        assert compile_ir.returncode == 0, compile_ir.stderr
+        transform = subprocess.run(
+            [str(opt), "-passes=obfuscation", "-obf-seed=20260930", "-obf-verify",
+             "-S", str(ir), "-o", str(obf)], capture_output=True, text=True, timeout=120)
+        assert transform.returncode == 0, transform.stderr
+        obf.write_text("\n".join(line for line in obf.read_text().splitlines()
+                                 if not line.startswith("@llvm.global.annotations")) + "\n")
+        lower = subprocess.run([str(clang), "--target=aarch64-linux-android26", "-O0",
+                                "-c", str(obf), "-o", str(client)],
+                               capture_output=True, text=True, timeout=120)
+        assert lower.returncode == 0, lower.stderr
     result = subprocess.run(
         [str(clang), "--target=aarch64-linux-android26", f"--sysroot={ndk / 'sysroot'}",
          "-std=c++20", "-static-libstdc++", "-Wno-deprecated-declarations",
          f"-I{runtime}", f"-I{openssl / 'include'}", f"-I{runtime / 'openssl_core/src/include'}",
          str(src), str(runtime / "cloud_value_manager.cpp"),
-         str(runtime / "capability_client.cpp"), str(runtime / "capability_protocol.cpp"),
+          str(client), str(runtime / "capability_protocol.cpp"),
          "-Wl,--wrap=time", "-Wl,--wrap=clock_gettime", "-Wl,--wrap=pthread_create",
          "-Wl,--start-group", str(openssl / "libcrypto.a"),
          *[str(openssl / "providers" / lib) for lib in
            ("libcommon.a", "libdefault.a", "liblegacy.a")],
-         "-Wl,--end-group", "-ldl", "-pthread", "-o", str(exe)],
+          "-Wl,--end-group", "-Wl,--rosegment", "-ldl", "-pthread", "-o", str(exe)],
         capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
+    if request.param == "vm":
+        for command in (["audit", "--input", str(exe)],
+                        ["seal", "--input", str(exe), "--output", str(exe)]):
+            checked = subprocess.run([str(hardener), *command], capture_output=True,
+                                     text=True, timeout=30)
+            assert checked.returncode == 0, checked.stdout + checked.stderr
     return exe
 
 
-@pytest.mark.parametrize("case", ["cloud", "expired", "fresh", "dispatch-expired", "dispatch-fresh"])
+@pytest.mark.parametrize("case", ["cloud", "expired", "fresh", "dispatch-expired", "dispatch-fresh",
+                                  "fresh-policy", "fresh-key", "fresh-operation", "fresh-request",
+                                  "fresh-device", "fresh-signature"])
 def test_clock_progression(runtime_time_binary, case):
     run = subprocess.run([str(runtime_time_binary), case], capture_output=True, text=True, timeout=15)
     assert run.returncode == 0, run.stdout + run.stderr

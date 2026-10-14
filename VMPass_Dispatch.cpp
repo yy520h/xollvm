@@ -26,6 +26,8 @@
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
 #include "llvm/Transforms/Obfuscator/Rng.h"
+#include "llvm/Transforms/Obfuscator/VMTargetEncoding.h"
+#include "llvm/Transforms/Obfuscator/VMWhiteBoxAES.h"
 
 #include <functional>
 using namespace llvm;
@@ -83,20 +85,8 @@ void VMImpl::buildHandlerTable() {
 		unsigned P = (unsigned)OpMap.encode((VMOp)L);
 		assert(P < OP_COUNT && "opcode map out of range");
 		unsigned PermP = DispPerm[P];               // identity when ED off
-		// CALL handlers wire the module-shared SS->CallSW[RK] switch, which
-		// keeps only the LAST-built variant's switch; ensureCallFTyCases()
-		// extends only that one as later functions register new FunctionTypes.
-		// Routing to any earlier CALL variant would hit a switch that never
-		// received those cases -> default (vm.cl.ur, unreachable) -> UB.
-		// Pin ALL K slots for CALL opcodes to the last variant (K-1) so
-		// runtime vsel can never select an unwired CALL variant; all other
-		// opcodes keep full intra-function variant diversity.
-		bool IsCall = (L == OP_CALL_VOID || L == OP_CALL_INT || L == OP_CALL_PTR ||
-					   L == OP_CALL_INT64 || L == OP_CALL_F);
 		for (unsigned v = 0; v < K; ++v) {
-			unsigned VB = (K > 1 && IsCall) ? (K - 1) : v;
-			BasicBlock* HB = SharedEngineMode ? SS->OpcBB[L][VB]
-																: OpcBB[L][VB];
+			BasicBlock* HB = SharedEngineMode ? SS->OpcBB[L][v] : OpcBB[L][v];
 			if (!HB) HB = SharedEngineMode ? SS->Invalid : InvalidBB;
 			assert(HB && "missing opcode handler variant and invalid block");
 			Es[PermP * K + v] = BlockAddress::get(BAFn, HB);
@@ -141,6 +131,18 @@ void VMImpl::buildHandlerTable() {
 
 	for (unsigned i = 0; i < TableSize; ++i)
 		assert(Es[i] && "unfilled handler table slot (incl. dmap/decoys)");
+	if (Cfg.encodedTargets) {
+		SmallVector<bool, 128> Encode(TableSize, true);
+		Encode[OP_COUNT * K] = false;
+		for (unsigned P = 0; ED && P < OP_COUNT; ++P) Encode[OP_COUNT * K + 1 + P] = false;
+		Constant* Eng = Es[OP_COUNT * K];
+		Es[OP_COUNT * K] = ConstantPointerNull::get(cast<PointerType>(PtrTy));
+		GVHandlers = buildVMTargetDescriptor(M, Es, Encode, VMTargetFormat::HandlerRole,
+			R.fork("vm.targets.handler").u64(), F.getName() + ".vm.targets");
+		GVEngineTarget = buildVMTargetDescriptor(M, {Eng}, {true}, VMTargetFormat::EngineRole,
+			R.fork("vm.targets.engine").u64(), F.getName() + ".vm.engine.target");
+		return;
+	}
 
 	auto* ATy = ArrayType::get(PtrTy, TableSize);
 	GVHandlers = new GlobalVariable(M, ATy, true, GlobalValue::PrivateLinkage,
@@ -228,7 +230,7 @@ void VMImpl::buildDispatch() {
 		if (EncDispatch) {
 			Value* DmIdx  = LB.CreateAdd(P,
 				LB.getInt32(OP_COUNT * NumVariants + 1), "vm.dm.i");
-			Value* DmPtr  = LB.CreateGEP(PtrTy, EffHandlers, DmIdx, "vm.dm.p");
+			Value* DmPtr = Cfg.encodedTargets ? emitVMTargetRecord(LB, EffHandlers, DmIdx) : LB.CreateGEP(PtrTy, EffHandlers, DmIdx, "vm.dm.p");
 			Value* DmRaw  = LB.CreateLoad(PtrTy, DmPtr, "vm.dm.raw");
 			Value* DmInt  = LB.CreateTrunc(
 								LB.CreatePtrToInt(DmRaw, I64Ty, "vm.dm.i64"),
@@ -286,7 +288,7 @@ void VMImpl::buildDispatch() {
 
 		// GEP into handler table[table_slot]
 		Value* Slot = LB.CreateGEP(PtrTy, EffHandlers, TableSlot, "vm.ohsl");
-		Value* Hndl = LB.CreateLoad(PtrTy, Slot, "vm.hndl");
+		Value* Hndl = Cfg.encodedTargets ? emitVMTargetLoad(LB, EffHandlers, TableSlot, EffHandlers, "vm.hndl") : LB.CreateLoad(PtrTy, Slot, "vm.hndl");
 
 		// indirectbr with all opcode blocks (all variants) declared as successors
 		IndirectBrInst* IBR = LB.CreateIndirectBr(Hndl, OP_COUNT * NumVariants + 1);
@@ -358,7 +360,7 @@ void VMImpl::emitThreadedTail(IRBuilder<>& B) {
 	if (EncDispatch) {
 		Value* DmIdx = LB.CreateAdd(P,
 			LB.getInt32(OP_COUNT * NumVariants + 1), "vm.dm.i");
-		Value* DmPtr = LB.CreateGEP(PtrTy, EffHandlers, DmIdx, "vm.dm.p");
+		Value* DmPtr = Cfg.encodedTargets ? emitVMTargetRecord(LB, EffHandlers, DmIdx) : LB.CreateGEP(PtrTy, EffHandlers, DmIdx, "vm.dm.p");
 		Value* DmRaw = LB.CreateLoad(PtrTy, DmPtr, "vm.dm.raw");
 		Value* DmInt = LB.CreateTrunc(
 							LB.CreatePtrToInt(DmRaw, I64Ty, "vm.dm.i64"),
@@ -402,7 +404,7 @@ void VMImpl::emitThreadedTail(IRBuilder<>& B) {
 
 	// GEP into handler table[table_slot]
 	Value* Slot = LB.CreateGEP(PtrTy, EffHandlers, TableSlot, "vm.ohsl");
-	Value* Hndl = LB.CreateLoad(PtrTy, Slot, "vm.hndl");
+	Value* Hndl = Cfg.encodedTargets ? emitVMTargetLoad(LB, EffHandlers, TableSlot, EffHandlers, "vm.hndl") : LB.CreateLoad(PtrTy, Slot, "vm.hndl");
 
 	// indirectbr with all opcode blocks (all variants) declared as successors
 	IndirectBrInst* IBR = LB.CreateIndirectBr(Hndl, OP_COUNT * NumVariants + 2);
@@ -596,7 +598,7 @@ void VMImpl::populateVMEngine() {
 	// founding function's own ctor — the linker resolves this declaration
 	// against that definition.
 	if (LazyDecrypt) {
-		KeystreamFn = M.getFunction("__obf_aes_ctr_keystream_block");
+		KeystreamFn = Cfg.whiteboxAES ? getVMWhiteBoxCTRFunction(M) : M.getFunction("__obf_aes_ctr_keystream_block");
 		if (!KeystreamFn) {
 			FunctionType* KSFTy = FunctionType::get(Type::getVoidTy(Ctx),
 				{ PtrTy, PtrTy, I32Ty, PtrTy }, /*isVarArg=*/false);
@@ -702,6 +704,11 @@ void VMImpl::populateVMEngine() {
 	// Build dispatch loop
 	buildDispatch();
 	SS->ExitBB = ExitBB;
+	// 未列为任何 indirectbr 目标的静态诱饵可能被后端折叠成 blockaddress=1。
+	// 保留保守目标集合，正式编码表中的每个诱饵仍必须是真实可执行地址。
+	if (NumDecoys) for (BasicBlock& BB : *EF)
+		if (auto* IB = dyn_cast<IndirectBrInst>(BB.getTerminator()))
+			for (auto* Decoy : DecoyBB) IB->addDestination(Decoy);
 
 	// insert anti-debug timing gate between dispatch and fetch
 	buildAntiDebugGate(SS);
@@ -719,6 +726,10 @@ void VMImpl::populateVMEngine() {
 		ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(ReportCtx),
 			OP_COUNT * SS->NumVariants + 1 + (SS->EncDispatch ? OP_COUNT : 0) + SS->NumDecoys)),
 		ConstantAsMetadata::get(ConstantInt::get(Type::getInt1Ty(ReportCtx), SS->EncDispatch))
+	}));
+	if (Cfg.operandLayout) EF->setMetadata("obf.vm.layout", MDNode::get(ReportCtx, {
+		ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(ReportCtx), VMInstructionLayout::Version)),
+		ConstantAsMetadata::get(ConstantInt::get(Type::getInt64Ty(ReportCtx), Layout.fingerprint()))
 	}));
 
 	if (Cfg.hardened)
@@ -758,112 +769,10 @@ void VMImpl::ensureCallFTyCases() {
 		<< " -> " << NewCount << " FunctionTypes\n");
 
 	// For each CALL opcode (indexed by RetKind2 0..4):
-	for (unsigned RKIdx = 0; RKIdx < 5; ++RKIdx) {
-		auto& CSW = SS->CallSW[RKIdx];
-		if (!CSW.SW) continue;  // this CALL opcode wasn't built
-
-		VMEngine::RetKind2 RK = CSW.RK;
-		bool IsVoid = (RK == VMEngine::RK2_VOID);
-		Type* RetTy = (RK == VMEngine::RK2_PTR) ? (Type*)PtrTy
-			: (RK == VMEngine::RK2_I64) ? (Type*)I64Ty
-			: (RK == VMEngine::RK2_F64) ? (Type*)DoubleTy
-			: (RK == VMEngine::RK2_I32) ? (Type*)I32Ty
-			: (Type*)Type::getVoidTy(Ctx);
-
-		for (unsigned TIdx = OldCount; TIdx < NewCount; ++TIdx) {
-			FunctionType* SrcFTy = SS->SharedFTys[TIdx];
-			unsigned N = SrcFTy->getNumParams();
-			bool isVA = SrcFTy->isVarArg();
-
-			auto* CaseBB = BasicBlock::Create(Ctx,
-				"vm.cl.fty" + Twine(TIdx), EF);
-			CSW.SW->addCase(
-				cast<ConstantInt>(ConstantInt::get(I32Ty, TIdx)), CaseBB);
-			IRBuilder<> CB(CaseBB);
-
-			// Re-load args from the ENGINE's bytecode in this new case block.
-			// Reusing the Values captured in buildCall2 is invalid: they live in
-			// another basic block (no dominance) and were sized to the arity at
-			// first build. The CALL handler read the engine IP into its own
-			// block; recompute it here from SS->EngineVMIP and the same masks.
-			Value* CurIP = CB.CreateLoad(I32Ty, SS->EngineVMIP, "vm.cl.ip");
-			cast<LoadInst>(CurIP)->setVolatile(true);
-
-			// Engine-context byte loader: mirrors loadBC()/deobf() but uses the
-			// captured engine EffBC/EffSalt/masks instead of this VMImpl's.
-			// StrongBC and lazy contexts are intentionally NOT handled here:
-			// the engine's byte-load keying must match buildCall2 exactly, and
-			// the demo/engine configuration uses StrongBC off for the sensitive
-			// region. Assert so a mismatch is loud rather than silent.
-			if (CSW.StrongBC)
-				report_fatal_error("[vm] ensureCallFTyCases: StrongBC engine "
-					"call-arg reload not supported", /*gen_crash_diag=*/false);
-			auto engLoadBC = [&](IRBuilder<>& B, Value* IP, uint32_t Off,
-				const Twine& Nm) -> Value* {
-				Value* Idx32 = Off ? B.CreateAdd(IP, B.getInt32(Off), Nm + ".i32") : IP;
-				Value* Idx64 = B.CreateSExt(Idx32, I64Ty, Nm + ".ip64");
-				Value* Ptr = B.CreateGEP(I8Ty, CSW.EffBC, Idx64, Nm + ".p");
-				Value* Raw = B.CreateLoad(I8Ty, Ptr, Nm);
-				if (!CSW.EncBytecode) return Raw;
-				auto* SL = B.CreateLoad(I32Ty, CSW.EffSalt, Nm + ".s");
-				SL->setVolatile(true);
-				Value* Key32 = B.CreateAnd(B.CreateXor(SL, Idx32, Nm + ".kx"),
-					B.getInt32(0xFF), Nm + ".km");
-				Value* Key8 = B.CreateTrunc(Key32, I8Ty, Nm + ".k8");
-				return B.CreateXor(Raw, Key8, Nm + ".dec");
-			};
-			auto engDeobf = [&](IRBuilder<>& B, Value* Raw8, Value* MaskVal,
-				const Twine& Nm) -> Value* {
-				Value* Ext = B.CreateZExt(Raw8, I32Ty, Nm + ".e");
-				if (CSW.ObfRegIdx) {
-					auto* SL = B.CreateLoad(I32Ty, CSW.EffSalt, Nm + ".s");
-					SL->setVolatile(true);
-					Ext = B.CreateXor(Ext,
-						B.CreateAnd(SL, B.getInt32(0xFF), Nm + ".sb"), Nm + ".x");
-				}
-				return B.CreateAnd(Ext, MaskVal, Nm + ".m");
-			};
-
-			SmallVector<Type*, VMEngine::MaxArgs> ATys;
-			SmallVector<Value*, VMEngine::MaxArgs> CA;
-			for (unsigned i = 0; i < N && i < VMEngine::MaxArgs; ++i) {
-				Type* PT = SrcFTy->getParamType(i);
-				Value* AB = engLoadBC(CB, CurIP, CSW.ArgByteBase + 2 + i,
-					"vm.cl.ab");
-				Value* PIdx = engDeobf(CB, AB, CSW.MaskPR, "vm.cl.pi");
-				Value* VIdx = engDeobf(CB, AB, CSW.MaskVR, "vm.cl.vi");
-				Value* V64I = engDeobf(CB, AB, CSW.MaskVR64, "vm.cl.v64i");
-				Value* FIdx = engDeobf(CB, AB, CSW.MaskFR, "vm.cl.fxi");
-				if (PT->isFloatTy()) {
-					ATys.push_back(Type::getFloatTy(Ctx));
-					CA.push_back(CB.CreateFPTrunc(ldFR(CB, FIdx),
-						Type::getFloatTy(Ctx), "vm.cl.f32"));
-				}
-				else if (PT->isDoubleTy()) {
-					ATys.push_back(DoubleTy);
-					CA.push_back(ldFR(CB, FIdx));
-				}
-				else {
-					ATys.push_back(PtrTy);
-					if (PT->isPointerTy())
-						CA.push_back(ldPR(CB, PIdx));
-					else if (PT->isIntegerTy(64))
-						CA.push_back(CB.CreateIntToPtr(ldVR64(CB, V64I), PtrTy,
-							"vm.cl.i64p"));
-					else
-						CA.push_back(CB.CreateIntToPtr(ldVR(CB, VIdx), PtrTy,
-							"vm.cl.ivp"));
-				}
-			}
-
-			auto* CallFTy = FunctionType::get(RetTy, ATys, isVA);
-			auto* CI = CB.CreateCall(CallFTy, CSW.Callee, CA,
-				IsVoid ? "" : "vm.cl.rv");
-			if (!IsVoid && CSW.RetPHI)
-				CSW.RetPHI->addIncoming(CI, CB.GetInsertBlock());
-			CB.CreateBr(CSW.MergeBB);
-		}
-	}
+	for (unsigned RKIdx = 0; RKIdx < 5; ++RKIdx)
+		for (auto& CSW : SS->CallSW[RKIdx])
+			for (unsigned TIdx = OldCount; TIdx < NewCount; ++TIdx)
+				extendVMCallSwitch(CSW, SS->SharedFTys[TIdx], TIdx, SS->SharedCallAttrs[TIdx]);
 
 	SS->FTyCountAtLastBuild = NewCount;
 	if (ObfVerbose && NewCount > OldCount)

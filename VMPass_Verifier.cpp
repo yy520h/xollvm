@@ -18,7 +18,10 @@ namespace llvm {
 		std::string& OutErr, uint32_t& OutBadIP,
 		uint32_t SaltFull, bool BlindTargets, bool KeyedDispatch,
 		const VMRequirementSet *Allowed) {
-		const auto& BC = E.BC;
+		// 只规范化当前固定头，原 E.BC 保持实际排列；专用变长尾部照旧验证。
+		auto BC = E.BC;
+		const auto& Layout = E.getLayout();
+		if (!Layout.validate()) { OutErr = "invalid VM operand layout"; OutBadIP = 0; return false; }
 
 		// keyedDispatch: mirrors BytecodeEmitter::opKeyByteCT / VMImpl::opKeyByteIR
 		// op-for-op so the opcode byte at each IP is un-XOR'd the same way the
@@ -110,7 +113,7 @@ namespace llvm {
 		};
 		auto requireIcmp = [&](uint32_t IP, VMOp Op, uint8_t Physical) -> bool {
 			uint8_t Logical = decodeIcmp(Physical);
-			if (Logical == 0xFF || (Op == OP_ANDCMPZ &&
+			if (Logical == 0xFF || ((Op == OP_ANDCMPZ || Op == OP_ANDCMPZ64) &&
 				Logical != CmpInst::ICMP_EQ && Logical != CmpInst::ICMP_NE))
 				return fail(IP, "invalid ICMP predicate encoding");
 			if (Allowed && !Allowed->allowsIcmpPredicate(Op, Logical))
@@ -118,7 +121,7 @@ namespace llvm {
 			return true;
 		};
 		auto requireFCast = [&](uint32_t IP, VMOp Op, uint8_t Raw) -> bool {
-			if (Allowed && !Allowed->allowsFCastKind(Op, Raw & 0x7Fu,
+			if (Allowed && !Allowed->allowsFCastKind(Op, Isa.decFCastKind(Raw & 0x7Fu),
 				(Raw & FCAST_F32_FLAG) != 0))
 				return fail(IP, "FCAST kind/precision not in VM requirement set");
 			return true;
@@ -204,7 +207,48 @@ namespace llvm {
 				return fail(IP, Twine("invalid opcode byte ") + Twine((unsigned)Phys));
 
 			VMOp Opc = OpMap.decode(Phys);
+			unsigned HeaderSize = Layout.size(Opc);
+			if (HeaderSize > BC.size() - IP) return fail(IP, "VM operand layout header truncated");
+			SmallVector<uint8_t, 32> Header(BC.begin() + IP, BC.begin() + IP + HeaderSize);
+			for (unsigned b = 1; b < HeaderSize; ++b) BC[IP + b] = Header[Layout.physicalByte(Opc, b)];
 			if (!requireOpcode(IP, Opc)) return false;
+			if (Opc >= OP_ADDI32 && Opc <= OP_ASHRI64) {
+				bool Is64 = Opc >= OP_ADDI64;
+				unsigned Limit = Is64 ? E.NVR64 : E.NVR;
+				if (!chk(IP, Is64 ? "vreg64" : "vreg", decIdx(BC[IP + 1]), Limit) ||
+					!chk(IP, Is64 ? "vreg64" : "vreg", decIdx(BC[IP + 2]), Limit)) return false;
+				unsigned Sub = Opc - (Is64 ? OP_ADDI64 : OP_ADDI32);
+				uint64_t V = rdU32(IP + 3);
+				if (Is64) V |= uint64_t(rdU32(IP + 7)) << 32;
+				if (Sub >= BS_SHL && V >= (Is64 ? 64u : 32u)) return fail(IP, "immediate shift outside width");
+				IP += HeaderSize;
+				continue;
+			}
+			if (Opc >= OP_MULADD64 && Opc <= OP_MULXOR64) {
+				bool Is64 = Opc <= OP_ANDCMPZ64 || Opc >= OP_XORADD64;
+				unsigned Limit = Is64 ? E.NVR64 : E.NVR;
+				if (!chk(IP, "fusion dst", decIdx(BC[IP + 1]), Opc == OP_ANDCMPZ64 ? E.NVR : Limit)) return false;
+				if (!chk(IP, "fusion a", decIdx(BC[IP + 2]), Limit) ||
+					!chk(IP, "fusion b", decIdx(BC[IP + 3]), Limit)) return false;
+				if (Opc == OP_CMPSEL64 || Opc == OP_ANDCMPZ64) {
+					if (!requireIcmp(IP, Opc, BC[IP + 4])) return false;
+					if (Opc == OP_CMPSEL64 && (!chk(IP, "fusion true", decIdx(BC[IP + 5]), Limit) ||
+						!chk(IP, "fusion false", decIdx(BC[IP + 6]), Limit))) return false;
+				} else if (!chk(IP, "fusion c", decIdx(BC[IP + 4]), Limit)) return false;
+				IP += HeaderSize;
+				continue;
+			}
+			if (Opc >= OP_GEP_LOAD8 && Opc <= OP_GEP_STORE64) {
+				bool Wide = Opc == OP_GEP_LOAD64 || Opc == OP_GEP_STORE64;
+				if (BC[IP + 4] > 1) return fail(IP, "GEP memory invalid index kind");
+				if (!chk(IP, "GEP memory value", decIdx(BC[IP + 1]), Wide ? E.NVR64 : E.NVR) ||
+					!chk(IP, "GEP memory base", decIdx(BC[IP + 2]), E.NPR) ||
+					!chk(IP, "GEP memory index", decIdx(BC[IP + 3]), BC[IP + 4] ? E.NVR64 : E.NVR)) return false;
+				if ((BC[IP + 5] | BC[IP + 6]) == 0) return fail(IP, "GEP memory zero scale");
+				if (BC[IP + 7] > 63) return fail(IP, "GEP memory invalid alignment");
+				IP += HeaderSize;
+				continue;
+			}
 			switch (Opc) {
 			case OP_LOADI: {
 				if (IP + 6 > BC.size()) return fail(IP, "OP_LOADI truncated");
@@ -291,7 +335,7 @@ namespace llvm {
 			}
 			case OP_CAST64: {
 				if (IP + 4 > BC.size()) return fail(IP, "OP_CAST64 truncated");
-				unsigned Kind = (unsigned)BC[IP + 3];
+				unsigned Kind = Isa.decCast64Kind(BC[IP + 3]);
 				if (Allowed && !Allowed->allowsCastKind(OP_CAST64, Kind))
 					return fail(IP, "CAST64 kind not in VM requirement set");
 				if (Kind <= (unsigned)C64_SEXT32) {
@@ -446,7 +490,7 @@ namespace llvm {
 			}
 			case OP_SELECT: {
 				if (IP + 6 > BC.size()) return fail(IP, "OP_SELECT truncated");
-				uint8_t Kind = BC[IP + 1];
+				uint8_t Kind = Isa.decSelectKind(BC[IP + 1]);
 				if (Kind > 2) return fail(IP, "OP_SELECT invalid kind");
 				if (Allowed && !Allowed->SelectKinds.test(Kind))
 					return fail(IP, "SELECT kind not in VM requirement set");
@@ -542,7 +586,7 @@ namespace llvm {
 				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;
 				if (!chk(IP, "freg", decIdx(BC[IP + 2]), E.NFR)) return false;
 				{
-					unsigned K = BC[IP + 3];
+					unsigned K = Isa.decFCastKind(BC[IP + 3]);
 					if (K != FK_FPEXT && K != FK_FPTRUNC)
 						return fail(IP, Twine("OP_FCAST_FF invalid kind ") + Twine(K));
 				}
@@ -554,7 +598,7 @@ namespace llvm {
 				if (!chk(IP, "vreg", decIdx(BC[IP + 1]), E.NVR))  return false;
 				if (!chk(IP, "freg", decIdx(BC[IP + 2]), E.NFR))  return false;
 				{
-					unsigned K = BC[IP + 3];
+					unsigned K = Isa.decFCastKind(BC[IP + 3]);
 					if (K != FK_FPTOSI && K != FK_FPTOUI)
 						return fail(IP, Twine("OP_FCAST_FV invalid kind ") + Twine(K));
 				}
@@ -566,7 +610,7 @@ namespace llvm {
 				if (!chk(IP, "vreg64", decIdx(BC[IP + 1]), E.NVR64)) return false;
 				if (!chk(IP, "freg", decIdx(BC[IP + 2]), E.NFR))   return false;
 				{
-					unsigned K = BC[IP + 3];
+					unsigned K = Isa.decFCastKind(BC[IP + 3]);
 					if (K != FK_FPTOSI64 && K != FK_FPTOUI64)
 						return fail(IP, Twine("OP_FCAST_FV64 invalid kind ") + Twine(K));
 				}
@@ -578,7 +622,7 @@ namespace llvm {
 				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR)) return false;
 				if (!chk(IP, "vreg", decIdx(BC[IP + 2]), E.NVR)) return false;
 				{
-					unsigned K = BC[IP + 3] & 0x7Fu;  // mask FCAST_F32_FLAG
+					unsigned K = Isa.decFCastKind(BC[IP + 3] & 0x7Fu);  // 保留精度位
 					if (K != FK_SITOFP && K != FK_UITOFP)
 						return fail(IP, Twine("OP_FCAST_VF invalid kind ") + Twine(K));
 				}
@@ -590,7 +634,7 @@ namespace llvm {
 				if (!chk(IP, "freg", decIdx(BC[IP + 1]), E.NFR))   return false;
 				if (!chk(IP, "vreg64", decIdx(BC[IP + 2]), E.NVR64)) return false;
 				{
-					unsigned K = BC[IP + 3] & 0x7Fu;  // mask FCAST_F32_FLAG
+					unsigned K = Isa.decFCastKind(BC[IP + 3] & 0x7Fu);
 					if (K != FK_SI64TOFP && K != FK_UI64TOFP)
 						return fail(IP, Twine("OP_FCAST_V64F invalid kind ") + Twine(K));
 				}

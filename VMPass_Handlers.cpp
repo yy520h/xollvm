@@ -50,6 +50,9 @@ void VMImpl::buildOpcodeHandlers() {
 		// Marker = last block before this variant's blocks are appended.
 		BasicBlock* Marker = HFn->empty() ? nullptr : &HFn->back();
 		buildHandlersIntArith();
+		buildHandlersImmediate();
+		buildHandlersExtendedCompute();
+		buildHandlersExtendedMemory();
 		buildHandlersConv();
 		buildHandlersMem();
 		buildHandlersControl();
@@ -115,7 +118,7 @@ void VMImpl::buildHandlersIntArith() {
 			// inner-virtualized (see virtualizeNestedHelpersOnce()), instead
 			// of the inline switch below. Decode/load stay identical to the
 			// non-nested path; only the compute step differs.
-			Function* HelperFn = M.getFunction(kNestedBinopHelperName);
+			Function* HelperFn = M.getFunction(nestedHelperName(kNestedBinopHelperName));
 			Value* Sub8 = B.CreateTrunc(Sub, I8Ty, "vm.bo.sub8");
 			Value* Rv = B.CreateCall(HelperFn, { AV, BV, Sub8 }, "vm.bo.nested");
 			stVR(B, Dst, Rv);
@@ -260,7 +263,7 @@ void VMImpl::buildHandlersIntArith() {
 		if (NestedVM && opcodeNests(OP_BINOP64)) {
 			// See OP_BINOP's NestedVM branch: decode/load stay identical to
 			// the inline path below, only the compute step calls the helper.
-			Function* HelperFn = M.getFunction(kNestedBinop64HelperName);
+			Function* HelperFn = M.getFunction(nestedHelperName(kNestedBinop64HelperName));
 			Value* Sub8 = B.CreateTrunc(Sub, I8Ty, "vm.bo64.sub8");
 			Value* Rv = B.CreateCall(HelperFn, { AV, BV, Sub8 }, "vm.bo64.nested");
 			stVR64(B, Dst, Rv);
@@ -314,7 +317,7 @@ void VMImpl::buildHandlersIntArith() {
 		Value* AV = ldVR(B, AIdx), * BV = ldVR(B, BIdx);
 
 		if (NestedVM && opcodeNests(OP_ICMP)) {
-			Function* HelperFn = M.getFunction(kNestedIcmpHelperName);
+			Function* HelperFn = M.getFunction(nestedHelperName(kNestedIcmpHelperName));
 			Value* Pred8 = B.CreateTrunc(Pred, I8Ty, "vm.ic.pred8");
 			Value* Rv = B.CreateCall(HelperFn, { AV, BV, Pred8 }, "vm.ic.nested");
 			stVR(B, Dst, Rv);
@@ -381,7 +384,7 @@ void VMImpl::buildHandlersIntArith() {
 		Value* AV = ldVR64(B, AIdx), * BV = ldVR64(B, BIdx);
 
 		if (NestedVM && opcodeNests(OP_ICMP64)) {
-			Function* HelperFn = M.getFunction(kNestedIcmp64HelperName);
+			Function* HelperFn = M.getFunction(nestedHelperName(kNestedIcmp64HelperName));
 			Value* Pred8 = B.CreateTrunc(Pred, I8Ty, "vm.ic64.pred8");
 			Value* Rv = B.CreateCall(HelperFn, { AV, BV, Pred8 }, "vm.ic64.nested");
 			stVR(B, Dst, Rv);
@@ -418,7 +421,7 @@ void VMImpl::buildHandlersIntArith() {
 		Value* SV = ldVR(B, Src);
 
 		if (NestedVM && opcodeNests(OP_CAST)) {
-			Function* HelperFn = M.getFunction(kNestedCastHelperName);
+			Function* HelperFn = M.getFunction(nestedHelperName(kNestedCastHelperName));
 			Value* Kind8 = B.CreateTrunc(Kind, I8Ty, "vm.ca.kind8");
 			Value* Rv = B.CreateCall(HelperFn, { SV, Kind8 }, "vm.ca.nested");
 			stVR(B, Dst, Rv);
@@ -438,6 +441,78 @@ void VMImpl::buildHandlersIntArith() {
 	}
 }
 
+void VMImpl::buildHandlersImmediate() {
+	for (unsigned O = OP_ADDI32; O <= OP_ASHRI64; ++O) {
+		VMOp Op = static_cast<VMOp>(O);
+		if (!needsOpcode(Op)) continue;
+		bool Is64 = O >= OP_ADDI64;
+		unsigned Sub = O - (Is64 ? OP_ADDI64 : OP_ADDI32);
+		auto B = mkOpc(Op, vmOpcodeName(Op));
+		Value* IP = advIP(B, Layout.size(Op) - 1);
+		Value* D = Is64 ? rdVR64(B, IP, 0, "vm.imm.d") : rdVR(B, IP, 0, "vm.imm.d");
+		Value* A = Is64 ? ldVR64(B, rdVR64(B, IP, 1, "vm.imm.a")) : ldVR(B, rdVR(B, IP, 1, "vm.imm.a"));
+		Value* V = rdU32(B, IP, 2, "vm.imm.lo");
+		if (Is64) V = B.CreateOr(B.CreateZExt(V, I64Ty),
+			B.CreateShl(B.CreateZExt(rdU32(B, IP, 6, "vm.imm.hi"), I64Ty), B.getInt64(32)));
+		Value* R = nullptr;
+		switch (Sub) {
+		case BS_ADD: R = B.CreateAdd(A, V); break;
+		case BS_SUB: R = B.CreateSub(A, V); break;
+		case BS_MUL: R = B.CreateMul(A, V); break;
+		case BS_AND: R = B.CreateAnd(A, V); break;
+		case BS_OR: R = B.CreateOr(A, V); break;
+		case BS_XOR: R = B.CreateXor(A, V); break;
+		case BS_SHL: R = B.CreateShl(A, V); break;
+		case BS_LSHR: R = B.CreateLShr(A, V); break;
+		case BS_ASHR: R = B.CreateAShr(A, V); break;
+		default: llvm_unreachable("invalid immediate opcode");
+		}
+		if (Is64) stVR64(B, D, R); else stVR(B, D, R);
+		nextInsn(B);
+	}
+}
+
+void VMImpl::buildHandlersExtendedCompute() {
+	for (unsigned O = OP_MULADD64; O <= OP_MULXOR64; ++O) {
+		VMOp Op = static_cast<VMOp>(O);
+		if (!needsOpcode(Op)) continue;
+		bool Is64 = O <= OP_ANDCMPZ64 || O >= OP_XORADD64;
+		auto B = mkOpc(Op, vmOpcodeName(Op));
+		Value* IP = advIP(B, Layout.size(Op) - 1);
+		auto Load = [&](unsigned Off) {
+			return Is64 ? ldVR64(B, rdVR64(B, IP, Off, "vm.fuse.arg")) : ldVR(B, rdVR(B, IP, Off, "vm.fuse.arg"));
+		};
+		Value* D = Op == OP_ANDCMPZ64 || !Is64 ? rdVR(B, IP, 0, "vm.fuse.d") : rdVR64(B, IP, 0, "vm.fuse.d");
+		Value* A = Load(1), *V = Load(2), *R = nullptr;
+		if (Op == OP_CMPSEL64 || Op == OP_ANDCMPZ64) {
+			Value* Pred = rdByte(B, IP, 3, "vm.fuse.pred");
+			Value* Condition = B.getFalse();
+			for (unsigned P = CmpInst::ICMP_EQ; P <= CmpInst::ICMP_SLE; ++P) {
+				if (!needsIcmpPredicate(Op, P)) continue;
+				Value* Compare = Op == OP_ANDCMPZ64 ? B.CreateICmp(static_cast<CmpInst::Predicate>(P), B.CreateAnd(A, V), B.getInt64(0))
+					: B.CreateICmp(static_cast<CmpInst::Predicate>(P), A, V);
+				Condition = B.CreateSelect(B.CreateICmpEQ(Pred, B.getInt32(IsaEnc.encIcmpPred(P))), Compare, Condition);
+			}
+			R = Op == OP_ANDCMPZ64 ? B.CreateZExt(Condition, I32Ty) : B.CreateSelect(Condition, Load(4), Load(5));
+		} else {
+			Value* C = Load(3);
+			if (Op == OP_MULADD64) R = B.CreateAdd(B.CreateMul(A, V), C);
+			else if (Op == OP_SHLADD64) R = B.CreateAdd(B.CreateShl(A, V), C);
+			else switch (O - (Is64 ? OP_XORADD64 : OP_XORADD32)) {
+			case 0: R = B.CreateAdd(B.CreateXor(A, V), C); break;
+			case 1: R = B.CreateAdd(B.CreateAnd(A, V), C); break;
+			case 2: R = B.CreateAdd(B.CreateOr(A, V), C); break;
+			case 3: R = B.CreateXor(B.CreateAdd(A, V), C); break;
+			case 4: R = B.CreateXor(B.CreateSub(A, V), C); break;
+			case 5: R = B.CreateXor(B.CreateMul(A, V), C); break;
+			default: llvm_unreachable("invalid computation fusion");
+			}
+		}
+		if (Op == OP_ANDCMPZ64 || !Is64) stVR(B, D, R); else stVR64(B, D, R);
+		nextInsn(B);
+	}
+}
+
 void VMImpl::buildHandlersConv() {
 	if (!needsOpcode(OP_SELECT) && !needsOpcode(OP_PTRTOINT) && !needsOpcode(OP_INTTOPTR) &&
 		!needsOpcode(OP_CAST) && !needsOpcode(OP_CAST64) && !needsOpcode(OP_PTRTOINT64)) return;
@@ -447,8 +522,8 @@ void VMImpl::buildHandlersConv() {
 		auto B = mkOpc(OP_SELECT, "select");
 		Value* IP = advIP(B, 5);
 		Value* Kind = rdByte(B, IP, 0, "vm.sl.k");
-		Value* IsPtr = B.CreateICmpEQ(Kind, B.getInt32(1), "vm.sl.isp");
-		Value* IsI64 = B.CreateICmpEQ(Kind, B.getInt32(2), "vm.sl.is64");
+		Value* IsPtr = B.CreateICmpEQ(Kind, B.getInt32(IsaEnc.encSelectKind(1)), "vm.sl.isp");
+		Value* IsI64 = B.CreateICmpEQ(Kind, B.getInt32(IsaEnc.encSelectKind(2)), "vm.sl.is64");
 		bool NeedInt = needsSelectKind(0);
 		bool NeedPtr = needsSelectKind(1);
 		bool NeedI64 = needsSelectKind(2);
@@ -524,7 +599,10 @@ void VMImpl::buildHandlersConv() {
 		Value* IP = advIP(B, 3);
 		Value* Kind = rdByte(B, IP, 2, "vm.c64.k");
 
-		Value* IsTrunc = B.CreateICmpUGE(Kind, B.getInt32((uint32_t)C64_TRUNC1), "vm.c64.tr");
+		// 编码值不再有大小关系，按明确的截断 case 分类。
+		Value* IsTrunc = B.getFalse();
+		for (uint8_t K : {C64_TRUNC1, C64_TRUNC8, C64_TRUNC16, C64_TRUNC32})
+			IsTrunc = B.CreateOr(IsTrunc, B.CreateICmpEQ(Kind, B.getInt32(IsaEnc.encCast64Kind(K))), "vm.c64.tr");
 		BasicBlock* ExtBB = BasicBlock::Create(Ctx, "vm.c64.ext", HFn);
 		BasicBlock* TrBB = BasicBlock::Create(Ctx, "vm.c64.trn", HFn);
 		B.CreateCondBr(IsTrunc, TrBB, ExtBB);
@@ -554,13 +632,13 @@ void VMImpl::buildHandlersConv() {
 			Value* S32 = BE.CreateSExt(SV, I64Ty, "vm.c64.s32");
 
 			Value* R = Z32; // default
-			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32((uint32_t)C64_ZEXT1)), Z1, R, "vm.c64.r");
-			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32((uint32_t)C64_ZEXT8)), Z8, R, "vm.c64.r");
-			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32((uint32_t)C64_ZEXT16)), Z16, R, "vm.c64.r");
-			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32((uint32_t)C64_ZEXT32)), Z32, R, "vm.c64.r");
-			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32((uint32_t)C64_SEXT8)), S8, R, "vm.c64.r");
-			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32((uint32_t)C64_SEXT16)), S16, R, "vm.c64.r");
-			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32((uint32_t)C64_SEXT32)), S32, R, "vm.c64.r");
+			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32(IsaEnc.encCast64Kind(C64_ZEXT1))), Z1, R, "vm.c64.r");
+			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32(IsaEnc.encCast64Kind(C64_ZEXT8))), Z8, R, "vm.c64.r");
+			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32(IsaEnc.encCast64Kind(C64_ZEXT16))), Z16, R, "vm.c64.r");
+			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32(IsaEnc.encCast64Kind(C64_ZEXT32))), Z32, R, "vm.c64.r");
+			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32(IsaEnc.encCast64Kind(C64_SEXT8))), S8, R, "vm.c64.r");
+			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32(IsaEnc.encCast64Kind(C64_SEXT16))), S16, R, "vm.c64.r");
+			R = BE.CreateSelect(BE.CreateICmpEQ(Kind, BE.getInt32(IsaEnc.encCast64Kind(C64_SEXT32))), S32, R, "vm.c64.r");
 
 			stVR64(BE, Dst, R);
 			nextInsn(BE);
@@ -580,10 +658,10 @@ void VMImpl::buildHandlersConv() {
 			Value* T32 = Lo32;
 
 			Value* R = T32; // default
-			R = BT.CreateSelect(BT.CreateICmpEQ(Kind, BT.getInt32((uint32_t)C64_TRUNC1)), T1, R, "vm.c64.tr");
-			R = BT.CreateSelect(BT.CreateICmpEQ(Kind, BT.getInt32((uint32_t)C64_TRUNC8)), T8, R, "vm.c64.tr");
-			R = BT.CreateSelect(BT.CreateICmpEQ(Kind, BT.getInt32((uint32_t)C64_TRUNC16)), T16, R, "vm.c64.tr");
-			R = BT.CreateSelect(BT.CreateICmpEQ(Kind, BT.getInt32((uint32_t)C64_TRUNC32)), T32, R, "vm.c64.tr");
+			R = BT.CreateSelect(BT.CreateICmpEQ(Kind, BT.getInt32(IsaEnc.encCast64Kind(C64_TRUNC1))), T1, R, "vm.c64.tr");
+			R = BT.CreateSelect(BT.CreateICmpEQ(Kind, BT.getInt32(IsaEnc.encCast64Kind(C64_TRUNC8))), T8, R, "vm.c64.tr");
+			R = BT.CreateSelect(BT.CreateICmpEQ(Kind, BT.getInt32(IsaEnc.encCast64Kind(C64_TRUNC16))), T16, R, "vm.c64.tr");
+			R = BT.CreateSelect(BT.CreateICmpEQ(Kind, BT.getInt32(IsaEnc.encCast64Kind(C64_TRUNC32))), T32, R, "vm.c64.tr");
 
 			stVR(BT, Dst, R);
 			nextInsn(BT);
@@ -654,8 +732,8 @@ void VMImpl::buildHandlersMem() {
 		Value* IP = advIP(B, 5);   // 3 reg bytes + 2 elemsz bytes
 		Value* DP = rdPR(B, IP, 0, "vm.gp.d"), * BP = rdPR(B, IP, 1, "vm.gp.b"), * Idx = rdVR(B, IP, 2, "vm.gp.i");
 		// Reconstruct elemsz (plain u16le, not obfuscated ├ö├ç├Â it's a stride constant)
-		Value* ELo = B.CreateZExt(loadBC(B, IP, 3, "vm.gp.el"), I64Ty, "vm.gp.elo");
-		Value* EHi = B.CreateZExt(loadBC(B, IP, 4, "vm.gp.eh"), I64Ty, "vm.gp.ehi");
+		Value* ELo = B.CreateZExt(loadOperandByte(B, IP, 3, "vm.gp.el"), I64Ty, "vm.gp.elo");
+		Value* EHi = B.CreateZExt(loadOperandByte(B, IP, 4, "vm.gp.eh"), I64Ty, "vm.gp.ehi");
 		Value* ESz = B.CreateOr(ELo, B.CreateShl(EHi, B.getInt64(8), "vm.gp.es"), "vm.gp.esz");
 		// Byte offset = (i64)idx_value * elemsz
 		Value* IdxVal = B.CreateSExt(ldVR(B, Idx), I64Ty, "vm.gp.iv");
@@ -669,8 +747,8 @@ void VMImpl::buildHandlersMem() {
 		Value* IP = advIP(B, 5);
 		Value* DP = rdPR(B, IP, 0, "vm.gp64.d"), * BP = rdPR(B, IP, 1, "vm.gp64.b");
 		Value* Idx = rdVR64(B, IP, 2, "vm.gp64.i");
-		Value* ELo = B.CreateZExt(loadBC(B, IP, 3, "vm.gp64.el"), I64Ty, "vm.gp64.elo");
-		Value* EHi = B.CreateZExt(loadBC(B, IP, 4, "vm.gp64.eh"), I64Ty, "vm.gp64.ehi");
+		Value* ELo = B.CreateZExt(loadOperandByte(B, IP, 3, "vm.gp64.el"), I64Ty, "vm.gp64.elo");
+		Value* EHi = B.CreateZExt(loadOperandByte(B, IP, 4, "vm.gp64.eh"), I64Ty, "vm.gp64.ehi");
 		Value* ESz = B.CreateOr(ELo, B.CreateShl(EHi, B.getInt64(8), "vm.gp64.es"), "vm.gp64.esz");
 		Value* IdxVal = ldVR64(B, Idx);
 		Value* ByteOff = B.CreateMul(IdxVal, ESz, "vm.gp64.bo");
@@ -738,6 +816,42 @@ void VMImpl::buildHandlersMem() {
 	}
 
 
+}
+
+void VMImpl::buildHandlersExtendedMemory() {
+	for (unsigned O = OP_GEP_LOAD8; O <= OP_GEP_STORE64; ++O) {
+		VMOp Op = static_cast<VMOp>(O);
+		if (!needsOpcode(Op)) continue;
+		bool Store = O >= OP_GEP_STORE32;
+		bool Wide = Op == OP_GEP_LOAD64 || Op == OP_GEP_STORE64;
+		unsigned Width = Op == OP_GEP_LOAD8 ? 8 : Op == OP_GEP_LOAD16 ? 16 : Wide ? 64 : 32;
+		auto B = mkOpc(Op, vmOpcodeName(Op));
+		Value* IP = advIP(B, Layout.size(Op) - 1);
+		Value* Dst = Wide ? rdVR64(B, IP, 0, "vm.gm.d") : rdVR(B, IP, 0, "vm.gm.d");
+		Value* Base = ldPR(B, rdPR(B, IP, 1, "vm.gm.base"));
+		Value* Kind = rdByte(B, IP, 3, "vm.gm.kind");
+		// 未选文件可能没有该 slot，必须只读实际 kind。
+		auto* Narrow = BasicBlock::Create(Ctx, "vm.gm.index32", HFn);
+		auto* Broad = BasicBlock::Create(Ctx, "vm.gm.index64", HFn);
+		auto* Merge = BasicBlock::Create(Ctx, "vm.gm.address", HFn);
+		B.CreateCondBr(B.CreateICmpEQ(Kind, B.getInt32(0)), Narrow, Broad);
+		IRBuilder<> BN(Narrow), BW(Broad);
+		Value* N = BN.CreateSExt(ldVR(BN, rdVR(BN, IP, 2, "vm.gm.idx")), I64Ty);
+		Value* W = ldVR64(BW, rdVR64(BW, IP, 2, "vm.gm.idx"));
+		BN.CreateBr(Merge); BW.CreateBr(Merge); B.SetInsertPoint(Merge);
+		auto* Index = B.CreatePHI(I64Ty, 2); Index->addIncoming(N, Narrow); Index->addIncoming(W, Broad);
+		Value* Lo = B.CreateZExt(loadOperandByte(B, IP, 4, "vm.gm.scale.lo"), I64Ty);
+		Value* Hi = B.CreateZExt(loadOperandByte(B, IP, 5, "vm.gm.scale.hi"), I64Ty);
+		Value* Scale = B.CreateOr(Lo, B.CreateShl(Hi, 8));
+		Value* Address = B.CreateGEP(I8Ty, Base, B.CreateMul(Index, Scale));
+		// 最低对齐避免对合法未对齐访问引入额外假设，源对齐字段仍供 verifier 校验。
+		if (Store) B.CreateAlignedStore(Wide ? ldVR64(B, Dst) : ldVR(B, Dst), Address, Align(1));
+		else {
+			Value* V = B.CreateAlignedLoad(IntegerType::get(Ctx, Width), Address, Align(1));
+			if (Wide) stVR64(B, Dst, V); else stVR(B, Dst, B.CreateZExtOrTrunc(V, I32Ty));
+		}
+		nextInsn(B);
+	}
 }
 
 void VMImpl::buildHandlersControl() {
@@ -917,6 +1031,8 @@ void VMImpl::buildHandlersControl() {
 void VMImpl::buildHandlersFloat() {
 	if (!needsOpcode(OP_LOADI_F) && !needsOpcode(OP_MOVR_F) && !needsOpcode(OP_BINOP_F) &&
 		!needsOpcode(OP_FCMP) && !needsOpcode(OP_FCAST_FF) && !needsOpcode(OP_LOAD_F) &&
+		!needsOpcode(OP_FCAST_FV) && !needsOpcode(OP_FCAST_FV64) &&
+		!needsOpcode(OP_FCAST_VF) && !needsOpcode(OP_FCAST_V64F) &&
 		!needsOpcode(OP_STORE_F) && !needsOpcode(OP_RET_F) && !needsOpcode(OP_SELECT_F) &&
 		!needsOpcode(OP_FNEG) && !needsOpcode(OP_LOAD_F32) && !needsOpcode(OP_STORE_F32)) return;
 	// OP_LOADI_F -- [dst_fr:u8 imm:f64le]    freg[dst] = imm 
@@ -927,7 +1043,7 @@ void VMImpl::buildHandlersFloat() {
 		// Reconstruct f64 from 8 LE bytes
 		Value* Bits = B.getInt64(0);
 		for (unsigned i = 0; i < 8; ++i) {
-			Value* ByteV = B.CreateZExt(loadBC(B, IP, 1 + i, "vm.lif.b"), I64Ty, "vm.lif.bz");
+			Value* ByteV = B.CreateZExt(loadOperandByte(B, IP, 1 + i, "vm.lif.b"), I64Ty, "vm.lif.bz");
 			if (i) ByteV = B.CreateShl(ByteV, B.getInt64(i * 8), "vm.lif.bs");
 			Bits = B.CreateOr(Bits, ByteV, "vm.lif.or");
 		}
@@ -962,7 +1078,7 @@ void VMImpl::buildHandlersFloat() {
 			// Compute via the pure helper (separately inner-virtualized). The
 			// helper takes the full subop byte and applies the f32 rounding
 			// itself, so the result is final.
-			Function* HelperFn = M.getFunction(kNestedBinopFHelperName);
+			Function* HelperFn = M.getFunction(nestedHelperName(kNestedBinopFHelperName));
 			Value* Sub8b = B.CreateTrunc(Sub8, I8Ty, "vm.bof.sub8");
 			Value* Rv = B.CreateCall(HelperFn, { AV, BV, Sub8b }, "vm.bof.nested");
 			stFR(B, Dst, Rv);
@@ -1033,7 +1149,7 @@ void VMImpl::buildHandlersFloat() {
 		Value* BV = ldFR(B, BIdx);
 
 		if (NestedVM && opcodeNests(OP_FCMP)) {
-			Function* HelperFn = M.getFunction(kNestedFcmpHelperName);
+			Function* HelperFn = M.getFunction(nestedHelperName(kNestedFcmpHelperName));
 			Value* Pred8 = B.CreateTrunc(Pred, I8Ty, "vm.fcp.pred8");
 			Value* Rv = B.CreateCall(HelperFn, { AV, BV, Pred8 }, "vm.fcp.nested");
 			stVR(B, Dst, Rv);
@@ -1110,7 +1226,7 @@ void VMImpl::buildHandlersFloat() {
 		Value* Kind = rdByte(B, IP, 2, "vm.cff.k");
 		Value* Narrow = B.CreateFPExt(
 			B.CreateFPTrunc(SV, Type::getFloatTy(Ctx), "vm.cff.nt"), DoubleTy, "vm.cff.ne");
-		Value* IsExt = B.CreateICmpEQ(Kind, B.getInt32(FK_FPEXT), "vm.cff.ie");
+		Value* IsExt = B.CreateICmpEQ(Kind, B.getInt32(IsaEnc.encFCastKind(FK_FPEXT)), "vm.cff.ie");
 		stFR(B, Dst, B.CreateSelect(IsExt, SV, Narrow, "vm.cff.r"));
 		nextInsn(B);
 	}
@@ -1124,7 +1240,7 @@ void VMImpl::buildHandlersFloat() {
 		Value* Kind = rdByte(B, IP, 2, "vm.cfv.k");
 		Value* SI = B.CreateFPToSI(SV, I32Ty, "vm.cfv.si");
 		Value* UI = B.CreateFPToUI(SV, I32Ty, "vm.cfv.ui");
-		Value* IsS = B.CreateICmpEQ(Kind, B.getInt32(FK_FPTOSI), "vm.cfv.is");
+		Value* IsS = B.CreateICmpEQ(Kind, B.getInt32(IsaEnc.encFCastKind(FK_FPTOSI)), "vm.cfv.is");
 		stVR(B, Dst, B.CreateSelect(IsS, SI, UI, "vm.cfv.r"));
 		nextInsn(B);
 	}
@@ -1138,7 +1254,7 @@ void VMImpl::buildHandlersFloat() {
 		Value* Kind = rdByte(B, IP, 2, "vm.cfv64.k");
 		Value* SI = B.CreateFPToSI(SV, I64Ty, "vm.cfv64.si");
 		Value* UI = B.CreateFPToUI(SV, I64Ty, "vm.cfv64.ui");
-		Value* IsS = B.CreateICmpEQ(Kind, B.getInt32(FK_FPTOSI64), "vm.cfv64.is");
+		Value* IsS = B.CreateICmpEQ(Kind, B.getInt32(IsaEnc.encFCastKind(FK_FPTOSI64)), "vm.cfv64.is");
 		stVR64(B, Dst, B.CreateSelect(IsS, SI, UI, "vm.cfv64.r"));
 		nextInsn(B);
 	}
@@ -1156,7 +1272,7 @@ void VMImpl::buildHandlersFloat() {
 			B.CreateAnd(Kind, B.getInt32(0x80)), B.getInt32(0), "vm.cvf.f32");
 		Value* SI = B.CreateSIToFP(SV, DoubleTy, "vm.cvf.si");
 		Value* UI = B.CreateUIToFP(SV, DoubleTy, "vm.cvf.ui");
-		Value * IsS = B.CreateICmpEQ(KindOp, B.getInt32(FK_SITOFP), "vm.cvf.is");
+		Value * IsS = B.CreateICmpEQ(KindOp, B.getInt32(IsaEnc.encFCastKind(FK_SITOFP)), "vm.cvf.is");
 		Value * Result = B.CreateSelect(IsS, SI, UI, "vm.cvf.r");
 		Value * Narrow = B.CreateFPExt(
 			B.CreateFPTrunc(Result, Type::getFloatTy(Ctx), "vm.cvf.nt"),
@@ -1178,7 +1294,7 @@ void VMImpl::buildHandlersFloat() {
 			B.CreateAnd(Kind, B.getInt32(0x80)), B.getInt32(0), "vm.cv64f.f32");
 		Value* SI = B.CreateSIToFP(SV, DoubleTy, "vm.cv64f.si");
 		Value* UI = B.CreateUIToFP(SV, DoubleTy, "vm.cv64f.ui");
-		Value * IsS = B.CreateICmpEQ(KindOp, B.getInt32(FK_SI64TOFP), "vm.cv64f.is");
+		Value * IsS = B.CreateICmpEQ(KindOp, B.getInt32(IsaEnc.encFCastKind(FK_SI64TOFP)), "vm.cv64f.is");
 		Value * Result = B.CreateSelect(IsS, SI, UI, "vm.cv64f.r");
 		Value * Narrow = B.CreateFPExt(
 			B.CreateFPTrunc(Result, Type::getFloatTy(Ctx), "vm.cv64f.nt"),
@@ -1353,40 +1469,6 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 	}
 
 	const unsigned NFTy = (unsigned)UniqueFTys.size();
-	// 只按真实形参数预读参数字节；超过 NArgs 的槽位不读取，避免越界。
-	// 同时按 SrcFTy 的真实参数类型分别选择 ptr / i32 / i64 / float / double
-	// 寄存器文件，保留 ABI 语义（修复 #2：float 被当 double 调）。
-	SmallVector<Value*, MaxArgs> PVals, IVals, I64Vs, F32Vs, FregVals;
-	SmallVector<Type*, MaxArgs> RealPTys;
-	// EffectiveNArgs must cover the WIDEST callee signature across all unique
-	// FunctionTypes, not just UniqueFTys[0]: call sites with more params index
-	// these vectors up to their own arity. Sizing to FTy[0] under-reads and
-	// crashes the per-FTy switch below (OOB) when a later type has more params.
-	unsigned EffectiveNArgs = 0;
-	for (FunctionType* FT : UniqueFTys)
-		EffectiveNArgs = std::max<unsigned>(EffectiveNArgs,
-			std::min<unsigned>(FT->getNumParams(), MaxArgs));
-	for (unsigned i = 0; i < EffectiveNArgs; ++i) {
-		// arg bytes now start at Base+2 (was Base+5).
-		Value* AB = loadBC(B, CurIP, Base + 2 + i, "vm.cl.ab");
-		Value* PIdx = deobf(B, AB, MaskPR, "vm.cl.pi");
-		Value* VIdx = deobf(B, AB, MaskVR, "vm.cl.vi");
-		Value* V64I = deobf(B, AB, MaskVR64, "vm.cl.v64i");
-
-		Value* FIdx = deobf(B, AB, MaskFR, "vm.cl.fxi");
-		PVals.push_back(ldPR(B, PIdx));
-		IVals.push_back(B.CreateIntToPtr(ldVR(B, VIdx), PtrTy, "vm.cl.ivp"));
-		I64Vs.push_back(B.CreateIntToPtr(ldVR64(B, V64I), PtrTy, "vm.cl.i64p"));
-
-		FregVals.push_back(ldFR(B, FIdx));
-		F32Vs.push_back(B.CreateFPTrunc(FregVals.back(), Type::getFloatTy(Ctx), "vm.cl.f32"));
-		// RealPTys is per-arg-slot type info from the first type only; the
-		// switch below re-derives from SrcFTy when the slot index exceeds it.
-		if (UniqueFTys.empty() || i >= UniqueFTys[0]->getNumParams())
-			RealPTys.push_back(PtrTy);
-		else
-			RealPTys.push_back(UniqueFTys[0]->getParamType(i));
-	}
 
 
 
@@ -1421,76 +1503,25 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 
 	// Always create the switch (even with 0 cases in shared mode).
 	auto* FTySW = B.CreateSwitch(FTyIdx, UnreachBB, std::max(NFTy, 1u));
-	for (unsigned TIdx = 0; TIdx < NFTy; ++TIdx) {
-		FunctionType* SrcFTy = UniqueFTys[TIdx];
-		unsigned N = SrcFTy->getNumParams();
-		bool     isVA = SrcFTy->isVarArg();
-
-		auto* CaseBB = BasicBlock::Create(Ctx, "vm.cl.fty" + Twine(TIdx), HFn);
-		FTySW->addCase(B.getInt32(TIdx), CaseBB);
-		IRBuilder<> CB(CaseBB);
-
-		SmallVector<Type*, MaxArgs> ATys;
-		SmallVector<Value*, MaxArgs> CA;
-		for (unsigned i = 0; i < N && i < MaxArgs; ++i) {
-			// The register file for arg i MUST come from THIS callee's type
-			// (SrcFTy), not from UniqueFTys[0]: two callees in one engine can
-			// have different signatures (e.g. 4-arg vs 5-arg), and reusing
-			// FTy[0]'s param types selects the wrong file (i32 vs i64 vs ptr).
-			Type* PT = SrcFTy->getParamType(i);
-			if (PT->isFloatTy()) {
-				// 修复 #2：float 参数必须用真实 float 类型，不能升 double。
-				ATys.push_back(Type::getFloatTy(Ctx));
-				CA.push_back(F32Vs[i]);
-			}
-			else if (PT->isDoubleTy()) {
-				ATys.push_back(DoubleTy);
-				CA.push_back(FregVals[i]);
-			}
-			else {
-				ATys.push_back(PtrTy);
-				if (PT->isPointerTy())
-					CA.push_back(PVals[i]);
-				else if (PT->isIntegerTy(64))
-					CA.push_back(I64Vs[i]);
-				else
-					CA.push_back(IVals[i]);
-			}
-		}
-
-
-		auto* CallFTy = FunctionType::get(RetTy, ATys, isVA);
-		auto* CI = CB.CreateCall(CallFTy, Callee, CA, IsVoid ? "" : "vm.cl.rv");
-		if (!IsVoid && RetPHI) RetPHI->addIncoming(CI, CB.GetInsertBlock());
-		CB.CreateBr(MergeBB);
-	}
+	VMEngine::SharedState::CallSwitchInfo CSW;
+	CSW.SW = FTySW; CSW.MergeBB = MergeBB; CSW.RetPHI = RetPHI;
+	CSW.Callee = Callee; CSW.RK = RK; CSW.Variant = CurVariant;
+	CSW.Decode = byteDecodeContext(); CSW.OperandIP = CurIP;
+	CSW.MaskVR = MaskVR; CSW.MaskVR64 = MaskVR64;
+	CSW.MaskFR = MaskFR; CSW.MaskPR = MaskPR;
+	CSW.Regs = EffRegs; CSW.Regs64 = EffRegs64;
+	CSW.Fregs = EffFregs; CSW.Pregs = EffPregs;
+	CSW.RegKeys = EffRegKeys; CSW.Reg64Keys = EffReg64Keys;
+	CSW.FRegKeys = EffFRegKeys; CSW.RegEncrypt = RegEncrypt;
+	CSW.ObfRegIdx = ObfRegIdx; CSW.ArgByteBase = Base + 2;
+	for (unsigned TIdx = 0; TIdx < NFTy; ++TIdx)
+		extendVMCallSwitch(CSW, UniqueFTys[TIdx], TIdx,
+			VMEngine::getSharedState(M, EngineId)->SharedCallAttrs[TIdx]);
 
 	// Store switch info for ensureCallFTyCases() to extend later.
 	if (SharedEngineMode) {
 		auto* SS = VMEngine::getSharedState(M, EngineId);
-		auto& CSW = SS->CallSW[(unsigned)RK];
-		CSW.SW = FTySW;
-		CSW.MergeBB = MergeBB;
-		CSW.RetPHI = RetPHI;
-		CSW.Callee = Callee;
-		CSW.RK = RK;
-		CSW.PVals.assign(PVals.begin(), PVals.end());
-		CSW.IVals.assign(IVals.begin(), IVals.end());
-		CSW.I64Vs.assign(I64Vs.begin(), I64Vs.end());
-		CSW.F32Vs.assign(F32Vs.begin(), F32Vs.end());
-		CSW.FregVals.assign(FregVals.begin(), FregVals.end());
-		// Capture the engine's reload context so ensureCallFTyCases() can
-		// re-load args from the engine bytecode for later-registered callees.
-		CSW.EffBC = EffBC;
-		CSW.EffSalt = EffSalt;
-		CSW.MaskVR = MaskVR;
-		CSW.MaskVR64 = MaskVR64;
-		CSW.MaskFR = MaskFR;
-		CSW.MaskPR = MaskPR;
-		CSW.EncBytecode = EncBytecode;
-		CSW.StrongBC = StrongBC;
-		CSW.ObfRegIdx = ObfRegIdx;
-		CSW.ArgByteBase = Base + 2;
+		SS->CallSW[(unsigned)RK].push_back(std::move(CSW));
 	}
 
 	IRBuilder<> MB(MergeBB);
@@ -1503,4 +1534,59 @@ void VMImpl::buildCall2(VMOp Opc, const Twine& Name, llvm::VMEngine::RetKind2 RK
 		}
 	}
 	nextInsn(MB);
+}
+
+void VMImpl::extendVMCallSwitch(VMEngine::SharedState::CallSwitchInfo& C,
+	FunctionType* FT, unsigned TIdx, AttributeList ABIAttrs) {
+	Type* RT = FT->getReturnType();
+	bool IsVoid = C.RK == RK2_VOID;
+	bool Match = IsVoid ? RT->isVoidTy()
+		: C.RK == RK2_PTR ? RT->isPointerTy()
+		: C.RK == RK2_I64 ? RT->isIntegerTy(64)
+		: C.RK == RK2_F64 ? RT->isFloatingPointTy() : RT->isIntegerTy(32);
+	if (!Match) return;
+	auto* Case = BasicBlock::Create(Ctx, "vm.cl.fty" + Twine(TIdx) + ".v" + Twine(C.Variant),
+		C.SW->getFunction());
+	C.SW->addCase(cast<ConstantInt>(ConstantInt::get(I32Ty, TIdx)), Case);
+	IRBuilder<> B(Case);
+	SmallVector<Value*, MaxArgs> Args;
+	for (unsigned i = 0; i < FT->getNumParams(); ++i) {
+		Type* PT = FT->getParamType(i);
+		Value* Idx = B.CreateZExt(emitVMByteLoad(B, C.Decode,
+			B.CreateAdd(C.OperandIP, B.getInt32(C.ArgByteBase + i)), "vm.cl.ab"), I32Ty);
+		if (C.ObfRegIdx) {
+			auto* Salt = B.CreateLoad(I32Ty, C.Decode.Salt); Salt->setVolatile(true);
+			Idx = B.CreateXor(Idx, B.CreateAnd(Salt, B.getInt32(255)));
+		}
+		Value* Mask = PT->isPointerTy() ? C.MaskPR : PT->isIntegerTy(64) ? C.MaskVR64
+			: PT->isFloatingPointTy() ? C.MaskFR : C.MaskVR;
+		Idx = B.CreateAnd(Idx, Mask);
+		Value* Regs = PT->isPointerTy() ? C.Pregs : PT->isIntegerTy(64) ? C.Regs64
+			: PT->isFloatingPointTy() ? C.Fregs : C.Regs;
+		Type* Storage = PT->isPointerTy() ? PtrTy : PT->isIntegerTy(64) ? I64Ty
+			: PT->isFloatingPointTy() ? DoubleTy : I32Ty;
+		Value* V = B.CreateLoad(Storage, B.CreateGEP(Storage, Regs, Idx));
+		Value* Keys = PT->isIntegerTy(64) ? C.Reg64Keys
+			: PT->isFloatingPointTy() ? C.FRegKeys : C.RegKeys;
+		if (C.RegEncrypt && Keys && !PT->isPointerTy()) {
+			Type* KT = PT->isFloatingPointTy() || PT->isIntegerTy(64) ? I64Ty : I32Ty;
+			Value* K = B.CreateLoad(KT, B.CreateGEP(KT, Keys, Idx));
+			if (PT->isFloatingPointTy())
+				V = B.CreateBitCast(B.CreateXor(B.CreateBitCast(V, I64Ty), K), DoubleTy);
+			else V = B.CreateXor(V, K);
+		}
+		if (PT->isFloatTy()) V = B.CreateFPTrunc(V, PT);
+		else if (PT->isIntegerTy() && PT != Storage) V = B.CreateTrunc(V, PT);
+		Args.push_back(V);
+	}
+	// 精确类型调用保证整数/浮点/指针 ABI，不把整数伪装为指针。
+	auto* Call = B.CreateCall(FT, C.Callee, Args, IsVoid ? "" : "vm.cl.rv");
+	Call->setCallingConv(CallingConv::C);
+	Call->setAttributes(ABIAttrs);
+	if (!IsVoid) {
+		Value* V = Call;
+		if (RT->isFloatTy()) V = B.CreateFPExt(V, DoubleTy);
+		C.RetPHI->addIncoming(V, B.GetInsertBlock());
+	}
+	B.CreateBr(C.MergeBB);
 }

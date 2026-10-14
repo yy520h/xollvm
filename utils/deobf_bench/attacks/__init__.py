@@ -14,6 +14,11 @@ of a potentially multi-minute angr/Z3 call.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+import os
+import signal
+import subprocess
+import time
 from typing import Callable, Dict, Optional
 
 
@@ -50,6 +55,42 @@ class AttackResult:
 AttackFn = Callable[..., AttackResult]
 
 _REGISTRY: Dict[str, AttackFn] = {}
+
+ELF_STATUSES = {'RECOVERED', 'NOT_RECOVERED_WITHIN_BUDGET', 'TIMEOUT', 'UNSUPPORTED', 'TOOL_ERROR'}
+
+
+def run_attack_process(case, attack, seed, argv, *, timeout, tool, technique, cwd=None, env=None):
+    """超时会终止并回收攻击子进程，错误不产生安全分数。"""
+    start = time.monotonic()
+    status, detail, extra = 'TOOL_ERROR', '', {}
+    try:
+        with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, cwd=cwd, env=env, start_new_session=True) as p:
+            try:
+                stdout, stderr = p.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # objdump 等后代也必须停止，不能只杀最外层 Python。
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                p.communicate()
+                raise
+        if p.returncode:
+            detail = f'attack exit={p.returncode}: {stderr[-2000:]}'
+        else:
+            data = json.loads(stdout)
+            status = data['status']
+            if status not in ELF_STATUSES:
+                raise ValueError(f'unknown status {status}')
+            detail, extra = data.get('detail', ''), data.get('extra', {})
+    except subprocess.TimeoutExpired:
+        status, detail = 'TIMEOUT', f'attack exceeded {timeout}s; subprocess terminated'
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        status, detail = 'TOOL_ERROR', str(e)
+    resilience = 0.0 if status == 'RECOVERED' else None
+    return AttackResult(case, attack, seed, status, resilience, detail, tool, technique,
+                        time.monotonic() - start, extra)
 
 
 def register(name: str) -> Callable[[AttackFn], AttackFn]:

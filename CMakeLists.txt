@@ -114,6 +114,12 @@ set(OBF_SOURCES
   VMPass_Impl.cpp
   VMPass_AntiDebug.cpp
   VMPass_Crypto.cpp
+  VMPass_Decode.cpp
+  VMPass_Layout.cpp
+  VMPass_SuperOps.cpp
+  VMPass_Targets.cpp
+  VMWhiteBoxAES.cpp
+  VMPass_WhiteBox.cpp
   VMPass_Dispatch.cpp
   VMPass_Handlers.cpp
   VMPass_Harden.cpp
@@ -210,6 +216,9 @@ endif()
 # where AddLLVM's add_llvm_executable is available.
 if(DEFINED LLVM_MAIN_SRC_DIR)
   add_subdirectory(tools/xollvm-elf-hardener)
+  install(PROGRAMS tools/xollvm-link DESTINATION bin COMPONENT xollvm-link)
+  add_custom_target(xollvm-link)
+  add_llvm_install_targets(install-xollvm-link COMPONENT xollvm-link DEPENDS xollvm-link)
 endif()
 
 if(LLVM_INCLUDE_TESTS AND DEFINED LLVM_MAIN_SRC_DIR)
@@ -220,6 +229,12 @@ if(LLVM_INCLUDE_TESTS AND DEFINED LLVM_MAIN_SRC_DIR)
     VMPass_Requirements.cpp
     VMPass_Emitter.cpp
     VMPass_Verifier.cpp
+    VMPass_Decode.cpp
+    VMPass_Layout.cpp
+    VMPass_SuperOps.cpp
+    VMPass_Targets.cpp
+    VMWhiteBoxAES.cpp
+    VMPass_WhiteBox.cpp
   )
   if(LLVM_OBFUSCATOR_LINK_INTO_TOOLS)
     target_compile_definitions(VMRequirementsTests PRIVATE OBF_TEST_VM_IMPL=1)
