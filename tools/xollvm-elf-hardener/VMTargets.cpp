@@ -192,12 +192,37 @@ std::vector<uint8_t> serialize(const Block& B, ArrayRef<Reloc> Rs) {
 	else if (B.Kind == 1) {
 		V = {'A','P','S','2'}; Sleb(Rs.size()); Sleb(0);
 		uint64_t Slot = 0, Add = 0;
+		auto DeltaRun = [&](unsigned I, uint64_t Previous) {
+			uint64_t Delta = Rs[I].Slot - Previous;
+			unsigned N = 1;
+			while (I + N < Rs.size() && Rs[I + N].Info == Rs[I].Info &&
+				Rs[I + N].Slot - Rs[I + N - 1].Slot == Delta) ++N;
+			return N;
+		};
 		for (unsigned i = 0; i < Rs.size();) {
 			uint64_t Delta = Rs[i].Slot - Slot, Info = Rs[i].Info;
-			unsigned N = 1;
-			while (i + N < Rs.size() && Rs[i + N].Info == Info && Rs[i + N].Slot - Rs[i + N - 1].Slot == Delta) ++N;
-			Sleb(N); Sleb(11); Sleb(Delta); Sleb(Info);
-			for (unsigned j = 0; j < N; ++j) { Sleb(Rs[i+j].Add - Add); Add = Rs[i+j].Add; }
+			unsigned N = DeltaRun(i, Slot);
+			bool GroupOffsets = N >= 8;
+			if (!GroupOffsets) {
+				// 不等间隔仍可共享 Info，避免为每条重定位重复写四个组头字段。
+				N = 1;
+				while (i + N < Rs.size() && Rs[i + N].Info == Info &&
+					DeltaRun(i + N, Rs[i + N - 1].Slot) < 8) ++N;
+			}
+			uint64_t AddDelta = Rs[i].Add - Add;
+			bool GroupAddends = true;
+			for (unsigned j = 1; j < N; ++j)
+				// APS2 共享的是整组的最终 addend，而不是逐项递增的 delta。
+				if (Rs[i + j].Add != Rs[i].Add) GroupAddends = false;
+			Sleb(N); Sleb(9 | (GroupOffsets ? 2 : 0) | (GroupAddends ? 4 : 0));
+			if (GroupOffsets) Sleb(Delta);
+			Sleb(Info);
+			if (GroupAddends) Sleb(AddDelta);
+			for (unsigned j = 0; j < N; ++j) {
+				if (!GroupOffsets) Sleb(Rs[i + j].Slot - Slot);
+				if (!GroupAddends) Sleb(Rs[i + j].Add - Add);
+				Slot = Rs[i + j].Slot; Add = Rs[i + j].Add;
+			}
 			Slot = Rs[i + N - 1].Slot; i += N;
 		}
 	} else {

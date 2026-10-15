@@ -156,3 +156,28 @@ def test_link_without_output_is_rejected(env):
     assert p.returncode != 0
     assert "explicit -o" in p.stderr
     assert not (tmp / "a.out").exists()
+
+
+def test_link_finalizes_encoded_targets_before_audit_and_promotion(env):
+    from vm_hardening_support import annotation, transform, build_native, run_case
+    envd, canned, _real, tmp = env
+    ir = transform(tmp, '''define i32 @target(i32 %x) {
+  %r = add i32 %x, 7
+  ret i32 %r
+}
+''' + annotation(['target'], 'vm(preset=max,nestedVM=0)'))
+    pending = build_native(tmp, ir, '''#include <cstdio>
+extern "C" int target(int);
+int main() { if (target(5) != 12) return 1; puts("equal"); }
+''')
+    shutil.copyfile(pending, canned)
+    out = tmp / 'final'
+    p = subprocess.run(['bash', str(WRAPPER), '-o', str(out)],
+                       capture_output=True, text=True, env=envd, timeout=120)
+    assert p.returncode == 0, p.stdout + p.stderr
+    # stub linker 的复制不保留执行位，真实链接器会设置它。
+    out.chmod(out.stat().st_mode | stat.S_IEXEC)
+    run_case(out)
+    verified = subprocess.run([envd['XOLLVM_ELF_HARDENER'], 'verify', '--input', str(out)],
+                              capture_output=True, text=True, timeout=30)
+    assert verified.returncode == 0, verified.stderr

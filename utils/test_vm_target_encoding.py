@@ -315,6 +315,74 @@ def test_multiple_archive_objects_keep_distinct_descriptors(tmp_path):
     run_case(exe)
 
 
+def test_android_packed_irregular_relocations_survive_target_filter(tmp_path):
+    """不等间隔数据重定位不能因 VM 槽过滤后低效重编码而溢出原 APS2 空间。"""
+    ir = transform(tmp_path, SOURCE + annotation(['target'], 'vm(encodedTargets=1,hardened=0)'))
+    rows = [('nullptr' if i % 7 in (1, 2, 4) else f'&cells[{i % 11}]') for i in range(768)]
+    harness = '''#include <cstdio>
+static int cells[] = {0,1,2,3,4,5,6,7,8,9,10};
+static int* volatile refs[] = {''' + ','.join(rows) + '''};
+extern "C" unsigned long target(unsigned long,unsigned long);
+int main() {
+    for (unsigned i = 0; i < 768; ++i) {
+        if (i % 7 == 1 || i % 7 == 2 || i % 7 == 4) {
+            if (refs[i] != nullptr) return 1;
+        } else if (!refs[i] || *refs[i] != int(i % 11)) return 2;
+    }
+    if (target(9,4) != 13) return 3;
+    puts("equal");
+}
+'''
+    build_native(tmp_path, ir, harness)
+    exe = relink(tmp_path, 'android')
+    before = exe.read_bytes()
+    originals = relative_relocations(before)
+    removed = {va + 32 + i * 32 for off, va, count, _ in descriptors(before)
+               for i in range(count) if struct.unpack_from('<I', before, off+32+i*32+28)[0]}
+    checked([tools().hardener, 'targets', '--input', exe, '--output', exe])
+    assert relative_relocations(exe.read_bytes()) == {
+        slot: addend for slot, addend in originals.items() if slot not in removed}
+    checked([tools().hardener, 'verify', '--input', exe])
+    run_case(exe)
+
+
+def test_android_grouped_addends_preserve_each_relocation(tmp_path):
+    # 独立 ELF fixture：16 个保留 addend 每次递增 4，不能按单个共享 addend 编码。
+    def sleb(value):
+        result = bytearray()
+        while True:
+            byte = value & 127
+            value >>= 7
+            done = (value == 0 and not byte & 64) or (value == -1 and byte & 64)
+            result.append(byte if done else byte | 128)
+            if done:
+                return result
+    rows = [(0x10320, 0x20000)] + [(0x11000+i*8, (i+1)*4) for i in range(16)]
+    packed = bytearray(b'APS2') + sleb(len(rows)) + sleb(0)
+    slot = addend = 0
+    # 合法但有充足空间的未分组 APS2，避免测试依赖链接器压缩启发式。
+    for address, value in rows:
+        packed += sleb(1) + sleb(8) + sleb(address-slot) + sleb(1027) + sleb(value-addend)
+        slot, addend = address, value
+    data = bytearray(0x3004)
+    ident = b'\x7fELF' + bytes([2,1,1]) + bytes(9)
+    struct.pack_into('<16sHHIQQQIHHHHHH', data, 0, ident, 3, 183, 1, 0, 64, 0, 0, 64, 56, 3, 0, 0, 0)
+    for index, header in enumerate([(1,6,0,0x10000,0x10000,0x3000,0x3000,0x1000),
+                                     (1,5,0x3000,0x20000,0x20000,4,4,0x1000),
+                                     (2,6,0x200,0x10200,0x10200,64,64,8)]):
+        struct.pack_into('<IIQQQQQQ', data, 64+index*56, *header)
+    for index, (tag, value) in enumerate([(0x60000011,0x10400), (0x60000012,len(packed)), (9,24), (0,0)]):
+        struct.pack_into('<qQ', data, 0x200+index*16, tag, value)
+    struct.pack_into('<8sIIIIQ', data, 0x300, b'XOVMTGT1', 1, 0, 1, 2, 0)
+    struct.pack_into('<QQQII', data, 0x320, 0, 17, 23, 7, 1)
+    data[0x400:0x400+len(packed)] = packed
+    exe = tmp_path/'grouped-addends.elf'
+    exe.write_bytes(data)
+    checked([tools().hardener, 'targets', '--input', exe, '--output', exe])
+    assert relative_relocations(exe.read_bytes()) == dict(rows[1:])
+    checked([tools().hardener, 'verify', '--input', exe])
+
+
 @pytest.mark.parametrize('damage', ['empty-target-set', 'slot-symbol', 'metadata-relocation', 'truncated'])
 def test_structural_damage_rejects_without_output_change(tmp_path, damage):
     ir = transform(tmp_path, SOURCE + annotation(['target'], 'vm(encodedTargets=1,hardened=0)'))
