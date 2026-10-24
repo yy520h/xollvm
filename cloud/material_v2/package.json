@@ -1,0 +1,15 @@
+{
+  "name": "xovm2-material-backend",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test cloud/material_v2/test/*.test.mjs",
+    "start": "node cloud/material_v2/main.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}
