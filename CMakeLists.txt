@@ -109,6 +109,7 @@ set(OBF_SOURCES
   VMPass.cpp
   VMPass_Requirements.cpp
   VMPass_Emitter.cpp
+  VMPass_Material.cpp
   VMPass_Plan.cpp
   VMPass_Verifier.cpp
   VMPass_Impl.cpp
@@ -204,6 +205,30 @@ if(TARGET obj.Obfuscator)
   add_dependencies(obj.Obfuscator aes_stub_inc integrity_stub_inc)
 endif()
 
+if(DEFINED LLVM_MAIN_SRC_DIR)
+  add_executable(xollvm-cloud-material-fs-helper
+    tools/cloud-material/material-fs-helper.cpp)
+  target_compile_features(xollvm-cloud-material-fs-helper PRIVATE cxx_std_20)
+  if(ANDROID)
+    set(_MATERIAL_NDK_ROOT "$ENV{XOLLVM_NDK}")
+    if(NOT _MATERIAL_NDK_ROOT)
+      set(_MATERIAL_NDK_ROOT "$ENV{HOME}/android-ndk-r30-ollvm-r23-beta3")
+    endif()
+    set(_MATERIAL_NDK_CXX "${_MATERIAL_NDK_ROOT}/toolchains/llvm/prebuilt/linux-arm64/sysroot/usr/lib/aarch64-linux-android")
+    target_link_options(xollvm-cloud-material-fs-helper PRIVATE -nostdlib++)
+    target_link_libraries(xollvm-cloud-material-fs-helper PRIVATE
+      "${_MATERIAL_NDK_CXX}/libc++_static.a"
+      "${_MATERIAL_NDK_CXX}/libc++abi.a")
+  else()
+    target_link_options(xollvm-cloud-material-fs-helper PRIVATE -static-libstdc++)
+  endif()
+  set_target_properties(xollvm-cloud-material-fs-helper PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${LLVM_BINARY_DIR}/bin")
+  install(TARGETS xollvm-cloud-material-fs-helper RUNTIME DESTINATION bin)
+  install(PROGRAMS tools/cloud-material/export.mjs
+    DESTINATION bin RENAME xollvm-cloud-material-export)
+endif()
+
 # 生成当前 LLVM 的类型表，避免回落到系统安装版本的 GenVT.inc。
 if(TARGET vt_gen)
   add_dependencies(Obfuscator vt_gen)
@@ -221,13 +246,18 @@ if(DEFINED LLVM_MAIN_SRC_DIR)
   add_llvm_install_targets(install-xollvm-link COMPONENT xollvm-link DEPENDS xollvm-link)
 endif()
 
+option(XOLLVM_ENABLE_MATERIAL_PACKAGE_TEST_BRIDGE
+  "Enable the Android AArch64 Task 1 parser bridge in VMRequirementsTests" OFF)
+
 if(LLVM_INCLUDE_TESTS AND DEFINED LLVM_MAIN_SRC_DIR)
   add_custom_target(ObfuscatorUnitTests)
   set(LLVM_LINK_COMPONENTS Core Support AsmParser)
   add_unittest(ObfuscatorUnitTests VMRequirementsTests
     utils/VMRequirementsTest.cpp
+    utils/VMMaterialTest.cpp
     VMPass_Requirements.cpp
     VMPass_Emitter.cpp
+    VMPass_Material.cpp
     VMPass_Verifier.cpp
     VMPass_Decode.cpp
     VMPass_Layout.cpp
@@ -236,8 +266,56 @@ if(LLVM_INCLUDE_TESTS AND DEFINED LLVM_MAIN_SRC_DIR)
     VMWhiteBoxAES.cpp
     VMPass_WhiteBox.cpp
   )
+  add_dependencies(VMRequirementsTests xollvm-cloud-material-fs-helper)
+  target_compile_definitions(VMRequirementsTests PRIVATE OBF_TEST_VM_IMPL=1)
+  if(XOLLVM_ENABLE_MATERIAL_PACKAGE_TEST_BRIDGE)
+    if(NOT ANDROID OR NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+      message(FATAL_ERROR
+        "XOLLVM_ENABLE_MATERIAL_PACKAGE_TEST_BRIDGE requires Android AArch64")
+    endif()
+    set(_MATERIAL_PROJECT_ROOT "$ENV{XOLLVM_PROJECT_ROOT}")
+    if(NOT IS_ABSOLUTE "${_MATERIAL_PROJECT_ROOT}")
+      message(FATAL_ERROR
+        "XOLLVM_ENABLE_MATERIAL_PACKAGE_TEST_BRIDGE requires absolute XOLLVM_PROJECT_ROOT")
+    endif()
+    set(_MATERIAL_ZONE "${_MATERIAL_PROJECT_ROOT}/demo/jni/zone_runtime")
+    set(_MATERIAL_SSL "${_MATERIAL_PROJECT_ROOT}/demo/obj/openssl/arm64-v8a")
+    if(NOT EXISTS "${_MATERIAL_ZONE}/Core/nlohmann/json.hpp" OR
+       NOT EXISTS "${_MATERIAL_SSL}/libcrypto.a")
+      message(FATAL_ERROR "material package test bridge dependencies missing")
+    endif()
+    target_sources(VMRequirementsTests PRIVATE
+      runtime/cloud_material/material_package.cpp)
+    target_compile_definitions(VMRequirementsTests PRIVATE
+      XOLLVM_MATERIAL_PACKAGE_TEST_BRIDGE=1)
+    target_compile_features(VMRequirementsTests PRIVATE cxx_std_20)
+    target_include_directories(VMRequirementsTests PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_include_directories(VMRequirementsTests SYSTEM PRIVATE
+      "${_MATERIAL_ZONE}/Core"
+      "${_MATERIAL_SSL}/include"
+      "${_MATERIAL_ZONE}/openssl_core/src/include")
+    target_link_libraries(VMRequirementsTests PRIVATE
+      "${_MATERIAL_SSL}/libcrypto.a" "${CMAKE_DL_LIBS}")
+  endif()
+  if(ANDROID)
+    set(_OBF_NDK_ROOT "$ENV{XOLLVM_NDK}")
+    if(NOT _OBF_NDK_ROOT)
+      set(_OBF_NDK_ROOT "$ENV{HOME}/android-ndk-r30-ollvm-r23-beta3")
+    endif()
+    set(_OBF_NDK_CXX "${_OBF_NDK_ROOT}/toolchains/llvm/prebuilt/linux-arm64/sysroot/usr/lib/aarch64-linux-android")
+    if(NOT EXISTS "${_OBF_NDK_CXX}/libc++_static.a" OR
+       NOT EXISTS "${_OBF_NDK_CXX}/libc++abi.a")
+      message(FATAL_ERROR "VMRequirementsTests requires the NDK static libc++; set XOLLVM_NDK")
+    endif()
+    target_link_options(VMRequirementsTests PRIVATE -nostdlib++)
+    target_link_libraries(VMRequirementsTests PRIVATE
+      "${_OBF_NDK_CXX}/libc++_static.a"
+      "${_OBF_NDK_CXX}/libc++abi.a")
+  else()
+    target_link_options(VMRequirementsTests PRIVATE -static-libstdc++)
+  endif()
   if(LLVM_OBFUSCATOR_LINK_INTO_TOOLS)
-    target_compile_definitions(VMRequirementsTests PRIVATE OBF_TEST_VM_IMPL=1)
     target_link_libraries(VMRequirementsTests PRIVATE Obfuscator)
     llvm_config(VMRequirementsTests Linker BitReader TransformUtils Analysis ScalarOpts IPO)
   endif()

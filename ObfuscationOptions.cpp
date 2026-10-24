@@ -1,5 +1,9 @@
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Path.h"
+#include "llvm/ADT/SmallString.h"
 #include <cctype>
 
 using namespace llvm;
@@ -81,6 +85,23 @@ cl::opt<std::string> llvm::ObfReportDir(
 	"obf-report-dir",
 	cl::desc("Directory to emit obfuscation report artifacts (CFG DOT + default JSON). Empty=off"),
 	cl::init(""));
+
+cl::opt<std::string> llvm::ObfMaterialExportDir(
+	"obf-material-export-dir",
+	cl::desc("Existing private directory for cloud material export (required for cloudMaterial)"),
+	cl::init(""));
+
+void llvm::validateMaterialExportDirectory() {
+	if (ObfMaterialExportDir.empty())
+		report_fatal_error("vm: material export requires -obf-material-export-dir", false);
+	if (!sys::fs::is_directory(ObfMaterialExportDir))
+		report_fatal_error("vm: material export directory does not exist or is not a directory", false);
+	// 解析 dir/. 同时检查目录可遍历；LLVM Execute 专门拒绝目录。
+	SmallString<256> Searchable(ObfMaterialExportDir.getValue());
+	sys::path::append(Searchable, ".");
+	if (sys::fs::access(Searchable, sys::fs::AccessMode::Write))
+		report_fatal_error("vm: material export directory is not writable/searchable", false);
+}
 
 cl::opt<std::string> llvm::ObfReportJson(
 	"obf-report-json",

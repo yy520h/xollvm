@@ -22,6 +22,7 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
+#include "llvm/Transforms/Obfuscator/ObfuscationPipeline.h"
 #include "llvm/Transforms/Obfuscator/FunctionObfContextAnalysis.h"
 #include "llvm/Transforms/Obfuscator/SensitiveDecision.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
@@ -29,6 +30,7 @@
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Metadata.h"
+#include <unordered_set>
 
 using namespace llvm;
 
@@ -38,9 +40,82 @@ using namespace llvm;
 // VMPassConfig
 // ============================================================================
 
+StringRef llvm::cloudMaterialModeName(CloudMaterialMode Mode) {
+	switch (Mode) {
+	case CloudMaterialMode::Off: return "off";
+	case CloudMaterialMode::Session: return "session";
+	case CloudMaterialMode::Lease: return "lease";
+	case CloudMaterialMode::Operation: return "operation";
+	}
+	llvm_unreachable("invalid cloud material mode");
+}
+
+void VMPassConfig::failCloudMaterial(StringRef Reason) const {
+	if (usesCloudMaterial())
+		report_fatal_error(Twine("vm: cloud material region '") + materialRegion + "': " + Reason, false);
+}
+
+void llvm::validateCloudMaterialBudgets(const PassConfig& PC) {
+	auto Validate = [](StringRef Key, StringRef Value) {
+		uint64_t N = 0;
+		if (Value.empty() || Value.find_first_not_of("0123456789") != StringRef::npos ||
+			Value.getAsInteger(10, N) || N > UINT32_MAX)
+			report_fatal_error(Twine("vm: invalid unsigned value for ") + Key, false);
+	};
+	for (StringRef Key : {"budget", "budgetMax", "budgetMultiplier"}) {
+		if (auto I = PC.params.find(Key.str()); I != PC.params.end())
+			Validate(Key, I->second);
+	}
+	for (const auto& [Key, Value] : PC.rawBudgetParams)
+		Validate(Key, Value);
+}
+
+void VMPassConfig::validateDeclaration(Function& F) {
+	if (!F.isDeclaration()) return;
+	auto Config = AnnotationParser::parseAnnotations(&F);
+	for (const auto& PC : Config.passes) {
+		if (PC.passName != "vm" || !PC.enabled) continue;
+		auto Mode = PC.params.find("cloudMaterial");
+		if (Mode == PC.params.end() || Mode->second == "off") continue;
+		ObfuscationPipeline::validateMaterialConfig(Config);
+		// 先保留非法模式等具体诊断，再报告无法保护无函数体的边界。
+		auto VM = fromPassConfig(PC);
+		VM.failCloudMaterial("cloudMaterial requires a function body");
+	}
+}
+
 VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC, bool Normalize) {
 	VMPassConfig Cfg;
 	Cfg.enable = PC.enabled;
+	std::unordered_set<std::string> Known = {"preset", "cloudMaterial", "materialRegion",
+		"wrapperFamily", "budget", "budgetMax", "budgetMultiplier"};
+	if (auto I = PC.params.find("cloudMaterial"); I != PC.params.end()) {
+		StringRef Mode = I->second;
+		if (Mode == "off") Cfg.cloudMaterial = CloudMaterialMode::Off;
+		else if (Mode == "session") Cfg.cloudMaterial = CloudMaterialMode::Session;
+		else if (Mode == "lease") Cfg.cloudMaterial = CloudMaterialMode::Lease;
+		else if (Mode == "operation") Cfg.cloudMaterial = CloudMaterialMode::Operation;
+		else report_fatal_error("vm: unknown cloudMaterial mode", false);
+	}
+	if (auto I = PC.params.find("materialRegion"); I != PC.params.end())
+		Cfg.materialRegion = I->second;
+	if (PC.params.count("materialExportDir") || PC.params.count("obf-material-export-dir"))
+		report_fatal_error("vm: use CLI -obf-material-export-dir, not an annotation path", false);
+	if (Cfg.usesCloudMaterial()) {
+		auto Alnum = [](unsigned char C) {
+			return (C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') || (C >= '0' && C <= '9');
+		};
+		bool Valid = !Cfg.materialRegion.empty() && Cfg.materialRegion.size() <= 128 &&
+			Alnum(Cfg.materialRegion.front());
+		for (unsigned char C : Cfg.materialRegion)
+			Valid &= Alnum(C) || C == '.' || C == '_' || C == ':' || C == '/' || C == '-';
+		if (!Valid) Cfg.failCloudMaterial("materialRegion requires protocol Name [A-Za-z0-9][A-Za-z0-9._:/-]{0,127}");
+		validateCloudMaterialBudgets(PC);
+		if (Cfg.cloudMaterial == CloudMaterialMode::Operation)
+			Cfg.failCloudMaterial("operation material not implemented");
+		if (auto I = PC.params.find("preset"); I != PC.params.end() && I->second == "max")
+			Cfg.failCloudMaterial("preset=max is not supported with cloudMaterial");
+	}
 
 	// preset=<medium|high|max>: shortcut bundle applied before explicit knobs
 	// below, so any explicit knob in the annotation overrides the preset.
@@ -106,6 +181,7 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC, bool Normalize) 
 	}
 
 	auto getUInt = [&](StringRef K, unsigned& O) {
+		Known.insert(K.str());
 		auto It = PC.params.find(K.str());
 		if (It != PC.params.end()) {
 			uint64_t N = 0;
@@ -115,6 +191,7 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC, bool Normalize) 
 		}
 		};
 	auto getBool = [&](StringRef K, bool& O) {
+		Known.insert(K.str());
 		auto It = PC.params.find(K.str());
 		if (It != PC.params.end()) {
 			StringRef V = It->second;
@@ -155,7 +232,8 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC, bool Normalize) 
 	getBool("extendedISA", Cfg.extendedISA);
 	getBool("encodedTargets", Cfg.encodedTargets);
 	getBool("whiteboxAES", Cfg.whiteboxAES);
-	if (Cfg.whiteboxAES && !Cfg.encBytecode) report_fatal_error("whiteboxAES requires encBytecode=1");
+	if (!Cfg.usesCloudMaterial() && Cfg.whiteboxAES && !Cfg.encBytecode)
+		report_fatal_error("whiteboxAES requires encBytecode=1");
 	getUInt("enginePoolSize", Cfg.enginePoolSize);
 	getBool("metamorphicEngines", Cfg.metamorphicEngines);
 	getBool("perFnEngine", Cfg.perFnEngine);
@@ -167,15 +245,34 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC, bool Normalize) 
 		else report_fatal_error("vm: unknown wrapperFamily", false);
 	}
 
+	if (Cfg.usesCloudMaterial()) {
+		// 只拒绝显式开启；默认旧路径在 effective 中标记为被材料替代。
+		for (StringRef K : {"encBytecode", "strongBytecode", "whiteboxAES", "lazyDecrypt",
+			"encDispatch", "keyedDispatch", "nestedVM", "nestedVMHardened", "cloudDispatch",
+			"nativeJIT", "bindAntiDebug"}) {
+			bool Enabled = false;
+			getBool(K, Enabled);
+			if (Enabled) Cfg.failCloudMaterial((Twine(K) + " not implemented with cloudMaterial").str());
+		}
+		if (PC.params.count("constInStream") && !Cfg.constInStream)
+			Cfg.failCloudMaterial("constInStream=1 is required");
+		for (const auto& [K, V] : PC.params)
+			if (!Known.count(K)) Cfg.failCloudMaterial("unknown cloudMaterial option: " + K);
+		if (!Cfg.validate()) Cfg.failCloudMaterial("invalid minBlocks/maxBlocks");
+	}
 	// 请求报告保留依赖归一化之前的值，与实际引擎配置分开。
 	if (!Normalize) return Cfg;
-	// lazyDecrypt requires encBytecode — nothing to defer if bytecode isn't encrypted.
-	if (!Cfg.encBytecode) Cfg.lazyDecrypt = false;
-	// hardened requires encBytecode (meaningful only with encrypted bytecode)
-	if (!Cfg.encBytecode) Cfg.hardened = false;
-	// constInStream requires encBytecode — the whole point is to hide constants
-	// in the encrypted stream instead of plaintext wrapper stores.
-	if (!Cfg.encBytecode) Cfg.constInStream = false;
+	if (Cfg.usesCloudMaterial()) {
+		// 独立归一化：关闭旧字节码路径不等于关闭材料常量流或 hardened。
+		Cfg.encBytecode = Cfg.strongBytecode = Cfg.lazyDecrypt = Cfg.whiteboxAES = false;
+		Cfg.encDispatch = Cfg.keyedDispatch = false;
+		Cfg.constInStream = true;
+	} else {
+		// 旧路径的依赖归一化仅适用于非材料模式。
+		if (!Cfg.encBytecode) Cfg.lazyDecrypt = false;
+		if (!Cfg.encBytecode) Cfg.hardened = false;
+		if (!Cfg.encBytecode) Cfg.constInStream = false;
+	}
 	// hardened implies regEncrypt — encrypted registers complement MBA-obscured handlers
 	if (Cfg.hardened) Cfg.regEncrypt = true;
 	// 检测来源在合并独立 antidebug pass 后确定；此处保留请求。
@@ -201,10 +298,29 @@ bool VMPassConfig::validate() const {
 // ============================================================================
 
 PreservedAnalyses VMPass::run(Function& F, FunctionAnalysisManager& AM) {
-	if (F.isDeclaration()) return PreservedAnalyses::all();
+	if (F.isDeclaration()) {
+		VMPassConfig::validateDeclaration(F);
+		return PreservedAnalyses::all();
+	}
+	ObfuscationPipeline::validateMaterialConfig(getObfConfig(F, AM));
 
 	VMCtx VCtx(F, AM);
 	if (!VCtx.Cfg.enable) return PreservedAnalyses::all();
+	if (VCtx.Cfg.usesCloudMaterial()) {
+		Triple T(F.getParent()->getTargetTriple().normalize());
+		if (!T.isAndroid() || !T.isAArch64() || !T.isLittleEndian())
+			VCtx.Cfg.failCloudMaterial("requires Android AArch64 little-endian");
+		for (BasicBlock& BB : F) for (Instruction& I : BB) {
+			if (auto* Call = dyn_cast<CallBase>(&I)) {
+				const Function* Callee = Call->getCalledFunction();
+				StringRef Name = Callee ? Callee->getName() : StringRef();
+				if (Call->hasFnAttr(Attribute::ReturnsTwice) ||
+					Name == "longjmp" || Name == "_longjmp" || Name == "siglongjmp" ||
+					Name.starts_with("llvm.eh.sjlj."))
+					VCtx.Cfg.failCloudMaterial("non-local exit is not supported");
+			}
+		}
+	}
 
 	// Task 4: a sensitive(strict=1) region's function is registered before
 	// eligibility so it cannot silently disappear. Provenance (declaration
@@ -246,6 +362,7 @@ PreservedAnalyses VMPass::run(Function& F, FunctionAnalysisManager& AM) {
 	{
 		std::string Reason; raw_string_ostream RS(Reason);
 		if (!isVMEligible(F, VCtx.FOC, VCtx.Cfg, &RS)) {
+			VCtx.Cfg.failCloudMaterial(Reason);
 			LLVM_DEBUG(dbgs() << "[vm] skip '" << F.getName() << "': " << RS.str() << "\n");
 			if (ObfVerbose) errs() << "[vm] skip '" << F.getName() << "': " << Reason << "\n";
 			auto& MutFOC = *AM.getResult<FunctionObfContextAnalysis>(F);
@@ -281,6 +398,7 @@ PreservedAnalyses VMPass::run(Function& F, FunctionAnalysisManager& AM) {
 	if (auto* Coordinator = VMPlanCoordinator::active()) {
 		if (!Impl->prepare()) {
 			std::string R = Impl->FailReason.empty() ? "impl_failed" : Impl->FailReason;
+			VCtx.Cfg.failCloudMaterial(R);
 			auto& MutFOC = *AM.getResult<FunctionObfContextAnalysis>(F);
 			llvm::obf::recordObfPassSkip(MutFOC, "vm", R);
 			if (SensitiveRequired) {
@@ -309,7 +427,12 @@ PreservedAnalyses VMPass::run(Function& F, FunctionAnalysisManager& AM) {
 		F.setMetadata("obf.vm.caller", MDNode::get(F.getContext(), {}));
 		return PreservedAnalyses::all();
 	}
+	if (VCtx.Cfg.usesCloudMaterial()) {
+		if (!Impl->prepare()) VCtx.Cfg.failCloudMaterial(Impl->FailReason);
+		validateMaterialExportDirectory();
+	}
 	if (!Impl->run()) {
+		VCtx.Cfg.failCloudMaterial(Impl->FailReason);
 		LLVM_DEBUG(dbgs() << "[vm] fail '" << F.getName() << "': " << Impl->FailReason << "\n");
 		if (ObfVerbose) {
 			if (!Impl->FailReason.empty())

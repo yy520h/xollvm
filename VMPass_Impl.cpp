@@ -328,6 +328,8 @@ bool VMImpl::prepare() {
 
 bool VMImpl::commit() {
 	if (!Prepared || Committed) return false;
+	// 任务 3/8 接管此处前禁止进入静态全局、解密 ctor 和旧 wrapper。
+	Cfg.failCloudMaterial("cloud material emission not implemented (Tasks 3/8)");
 	if (Cfg.encodedTargets) {
 		Triple T(M.getTargetTriple());
 		if (!T.isAArch64() || !T.isLittleEndian() || !T.isOSBinFormatELF())

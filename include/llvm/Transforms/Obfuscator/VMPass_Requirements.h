@@ -66,6 +66,8 @@ class EngineConfigKey {
 	// 有序命名字段同时驱动比较、稳定 hash 和报告，避免三个清单漂移。
 	std::vector<std::pair<std::string, uint64_t>> Fields;
 	unsigned BoolFields = 0;
+	CloudMaterialMode MaterialMode = CloudMaterialMode::Off;
+	std::string MaterialRegion;
 
 public:
 	bool operator==(const EngineConfigKey &Other) const;
@@ -106,6 +108,8 @@ struct VMEngineWitness {
 	std::string WrapperFamily;
 	std::string BindDisabledReason;
 	std::string Phase;
+	bool MaterialDependencyEmitted = false;
+	bool NativeFallbackRemoved = false;
 	unsigned NestedHelperCount = 0;
 	unsigned WhiteboxInstances = 0;
 	unsigned ModuleWhiteboxInstances = 0;

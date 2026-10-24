@@ -16,6 +16,9 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
 #include "llvm/Transforms/Obfuscator/SensitiveDecision.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
+#include "llvm/Transforms/Obfuscator/ObfuscationPipeline.h"
+#include "llvm/Transforms/Obfuscator/ObfuscationAnnotationAnalysis.h"
+#include "llvm/Transforms/Obfuscator/VMPass.h"
 #ifdef OBF_TEST_VM_IMPL
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
 #include "llvm/Support/raw_ostream.h"
@@ -27,6 +30,55 @@
 #endif
 
 using namespace llvm;
+
+static VMPassConfig materialConfig(StringRef Options, bool Normalize = true) {
+	auto C = AnnotationParser::parseAnnotationString((Twine("obf: vm(") + Options + ")").str());
+	return VMPassConfig::fromPassConfig(*C.getPassConfig("vm"), Normalize);
+}
+
+TEST(VMCloudMaterial, IndependentNormalizationAndWitness) {
+	auto Requested = materialConfig("cloudMaterial=lease,materialRegion=auth,hardened=1,encBytecode=0", false);
+	auto Effective = materialConfig("cloudMaterial=lease,materialRegion=auth,hardened=1,encBytecode=0");
+	EXPECT_TRUE(Effective.constInStream);
+	EXPECT_TRUE(Effective.hardened);
+	EXPECT_TRUE(Effective.regEncrypt);
+	EXPECT_TRUE(Effective.obfRegIdx);
+	EXPECT_TRUE(Effective.randISA);
+	EXPECT_FALSE(Effective.encDispatch);
+	VMEngineWitness W;
+	W.Requested = Requested; W.Effective = Effective;
+	W.ConfigKey = EngineConfigKey::fromConfig(Effective, 0, 0);
+	W.Phase = "preflight_only";
+	auto J = W.toJson();
+	EXPECT_EQ(J.getString("bytecodeSource"), "cloud_material");
+	EXPECT_EQ(J.getObject("effective")->getString("cloudMaterial"), "lease");
+	EXPECT_EQ(J.getObject("effective")->getString("materialRegion"), "auth");
+	EXPECT_EQ(J.getObject("disabled_reasons")->getString("encBytecode"), "replaced_by_cloud_material");
+	EXPECT_EQ(J.getBoolean("material_dependency_emitted"), false);
+}
+
+TEST(VMCloudMaterial, ModeRegionAndLegacyNeverShareEngineGroups) {
+	LLVMContext C; Module M("material-groups", C);
+	VMPlanCoordinator P;
+	const char* Options[] = {"cloudMaterial=session,materialRegion=auth",
+		"cloudMaterial=lease,materialRegion=auth", "cloudMaterial=lease,materialRegion=other",
+		"", "cloudDispatch=1"};
+	std::vector<EngineConfigKey> Keys;
+	for (unsigned I = 0; I < 5; ++I) {
+		auto Config = materialConfig(Options[I]);
+		auto Key = EngineConfigKey::fromConfig(Config, 0, 0);
+		for (const auto& Previous : Keys) {
+			EXPECT_FALSE(Key == Previous);
+			EXPECT_NE(Key.stableHash(), Previous.stableHash());
+		}
+		Keys.push_back(Key);
+		auto* F = Function::Create(FunctionType::get(Type::getVoidTy(C), false),
+			GlobalValue::ExternalLinkage, "f" + std::to_string(I), M);
+		ASSERT_NE(P.addCandidate(*F, Config, Key, BytecodeEmitter{}, {}), nullptr);
+	}
+	ASSERT_TRUE(P.freeze());
+	EXPECT_EQ(P.groupCount(), 5u);
+}
 
 TEST(VMWhiteBoxAES, FIPSKnownAnswerAndRandomReference) {
 	std::array<uint8_t, 16> Key = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
@@ -1153,6 +1205,95 @@ TEST(SensitiveDecisionConfigTest, RequiresEnabledVM) {
 }
 
 #ifdef OBF_TEST_VM_IMPL
+template <typename Action>
+static void expectMaterialFatal(Action Run, StringRef Diagnostic) {
+#ifdef __ANDROID__
+	int FDs[2]; ASSERT_EQ(pipe(FDs), 0);
+	pid_t PID = fork(); ASSERT_GE(PID, 0);
+	if (PID == 0) {
+		close(FDs[0]); dup2(FDs[1], STDERR_FILENO); close(FDs[1]);
+		Run(); _exit(0);
+	}
+	close(FDs[1]); std::string Error; char Buf[1024]; ssize_t N;
+	while ((N = read(FDs[0], Buf, sizeof(Buf))) > 0) Error.append(Buf, N);
+	close(FDs[0]); int Status = 0; ASSERT_EQ(waitpid(PID, &Status, 0), PID);
+	EXPECT_TRUE(WIFSIGNALED(Status) || (WIFEXITED(Status) && WEXITSTATUS(Status) != 0));
+	EXPECT_NE(Error.find(Diagnostic.str()), std::string::npos) << Error;
+#else
+	EXPECT_DEATH(Run(), Diagnostic.str());
+#endif
+}
+
+TEST(VMCloudMaterial, DirectCoordinatorCommitCannotSilentlySkipUnpreparedCandidate) {
+	LLVMContext C; Module M("unprepared", C);
+	auto* F = Function::Create(FunctionType::get(Type::getVoidTy(C), false),
+		GlobalValue::ExternalLinkage, "f", M);
+	auto Config = materialConfig("cloudMaterial=lease,materialRegion=auth");
+	VMPlanCoordinator P;
+	auto* Candidate = P.addCandidate(*F, Config, EngineConfigKey::fromConfig(Config, 0, 0), BytecodeEmitter{}, {});
+	ASSERT_NE(Candidate, nullptr);
+	EXPECT_FALSE(Candidate->Required);
+	ASSERT_TRUE(P.freeze());
+	expectMaterialFatal([&] { P.commit(); }, "not prepared");
+}
+
+TEST(VMCloudMaterial, ProtocolNameBoundaries) {
+	for (const std::string& Name : {std::string("1auth/payment:read"), std::string(128, 'a')}) {
+		auto Cfg = materialConfig("cloudMaterial=lease,materialRegion=" + Name);
+		EXPECT_EQ(Cfg.materialRegion, Name);
+	}
+	for (const std::string& Name : {std::string("_auth"), std::string(129, 'a')})
+		expectMaterialFatal([&] { materialConfig("cloudMaterial=lease,materialRegion=" + Name); }, "materialRegion");
+}
+
+TEST(VMCloudMaterial, BudgetBoundaries) {
+	for (StringRef Key : {"budget", "budgetMax", "budgetMultiplier"}) {
+		for (StringRef Value : {"2junk", "-1", "4294967296", ""}) {
+			// 直接配置 API 也必须拒绝，不能仅依靠模块入口检查。
+			PassConfig PC; PC.enabled = true;
+			PC.params = {{"cloudMaterial", "lease"}, {"materialRegion", "auth"}, {Key.str(), Value.str()}};
+			expectMaterialFatal([&] { VMPassConfig::fromPassConfig(PC); },
+				(Twine("invalid unsigned value for ") + Key).str());
+		}
+	}
+	auto C = AnnotationParser::parseAnnotationString(
+		"obf: vm(cloudMaterial=lease,materialRegion=auth), shield(budgetMax=2junk)");
+	expectMaterialFatal([&] { ObfuscationPipeline::validateMaterialConfig(C); },
+		"invalid unsigned value for budgetMax");
+}
+
+TEST(VMCloudMaterial, DeclarationCacheAndDirectPassRejectMissingBody) {
+	LLVMContext C; SMDiagnostic D;
+	std::string Spec = "obf: vm(cloudMaterial=lease,materialRegion=auth)";
+	auto M = parseAssemblyString("declare i32 @f(i32)\n@ann = private constant [" +
+		std::to_string(Spec.size() + 1) + " x i8] c\"" + Spec + "\\00\"\n"
+		"@llvm.global.annotations = appending global [1 x {ptr,ptr,ptr,i32,ptr}] "
+		"[{ptr,ptr,ptr,i32,ptr} {ptr @f,ptr @ann,ptr @ann,i32 0,ptr null}]", D, C);
+	ASSERT_NE(M, nullptr) << D.getMessage().str();
+	expectMaterialFatal([&] {
+		ModuleAnalysisManager MAM;
+		ObfuscationAnnotationAnalysis().run(*M, MAM);
+	}, "cloudMaterial requires a function body");
+	expectMaterialFatal([&] {
+		FunctionAnalysisManager FAM;
+		VMPass().run(*M->getFunction("f"), FAM);
+	}, "cloudMaterial requires a function body");
+}
+
+TEST(VMCloudMaterial, DirectEmissionIsGuardedBeforeLegacyGlobals) {
+	LLVMContext C; SMDiagnostic D;
+	auto M = parseAssemblyString("target triple = \"aarch64-unknown-linux-android26\"\n"
+		"define i32 @f(i32 %x) { %r = add i32 %x,7\n ret i32 %r }", D, C);
+	ASSERT_NE(M, nullptr);
+	auto Config = materialConfig("cloudMaterial=session,materialRegion=auth,hardened=1");
+	obf::Rng R(42); VMImpl Impl(*M->getFunction("f"), Config, R, 42);
+	ASSERT_TRUE(Impl.prepare()) << Impl.FailReason;
+	EXPECT_TRUE(M->global_empty());
+	EXPECT_FALSE(Impl.Committed);
+	EXPECT_TRUE(Impl.E.getRequirements().NeedsConstStream);
+	expectMaterialFatal([&] { Impl.commit(); }, "cloud material emission not implemented");
+}
+
 TEST(VMCallVariants, IncrementalTypesReachEveryVariant) {
 	for (unsigned Order = 0; Order != 2; ++Order) {
 		LLVMContext C;

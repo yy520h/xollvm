@@ -5,6 +5,7 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -1436,6 +1437,10 @@ bool BytecodeEmitter::run(Function& F, uint8_t S, const DataLayout& D) {
 		ImmLoads64.clear();
 		ImmLoadsF.clear();
 	}
+	// const prologue 在 body 之后收集记录但在最终字节流之前；导出快照必须按
+	// 最终 IP 排列，不能让消费者扫描变长指令尾部重建边界。
+	llvm::sort(InstructionIPs,
+		[](const auto& A, const auto& B) { return A.first < B.first; });
 
 	// Patch all forward-branch placeholders now that every BlockIP is known.
 	for (const Fixup& FX : Fixups) {

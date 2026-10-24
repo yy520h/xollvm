@@ -45,8 +45,10 @@ ObfuscationAnnotationAnalysis::run(Module& M, ModuleAnalysisManager& MAM) {
 	}
 
 	for (Function& F : M) {
-		if (F.isDeclaration())
+		if (F.isDeclaration()) {
+			VMPassConfig::validateDeclaration(F);
 			continue;
+		}
 
 		ObfuscationConfig Cfg = AnnotationParser::parseAnnotations(&F);
 		if (!Cfg.passes.empty())

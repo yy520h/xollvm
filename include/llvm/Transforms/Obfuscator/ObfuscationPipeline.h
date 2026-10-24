@@ -24,6 +24,7 @@ namespace llvm {
 
 	class ObfuscationPipeline {
 	public:
+		static void validateMaterialConfig(const ObfuscationConfig& Config);
 		// Build a function pass pipeline based on configuration (legacy).
 		static void buildPipeline(FunctionPassManager& FPM,
 			const ObfuscationConfig& config);

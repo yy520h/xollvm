@@ -91,8 +91,10 @@ namespace llvm {
 		explicit ObfuscationFunctionDriverPass(unsigned Start = 0, unsigned Initial = 0)
 			: Start(Start), OriginalInsts(Initial) {}
 		PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
-			if (F.isDeclaration())
+			if (F.isDeclaration()) {
+				VMPassConfig::validateDeclaration(F);
 				return PreservedAnalyses::all();
+			}
 
 			// Never re-drive functions the obfuscator itself synthesized
 			// (VM engine/handlers, helpers). On LLVM 23 the function-pass
@@ -100,6 +102,11 @@ namespace llvm {
 			// the 100k+ instruction __vm_engine back through here.
 			if (llvm::obf::isObfGenerated(F))
 				return PreservedAnalyses::all();
+			// 材料配置须在全局门限之前解析，不能被普通跳过逻辑吞掉。
+			VMPassConfig MaterialConfig;
+			ObfuscationPipeline::validateMaterialConfig(getObfConfig(F, FAM));
+			if (auto PC = getObfConfig(F, FAM).getPassConfig("vm"); PC && PC->enabled)
+				MaterialConfig = VMPassConfig::fromPassConfig(*PC);
 
 			// Global cost/safety caps (deterministic skip).
 			auto& FOC = *FAM.getResult<FunctionObfContextAnalysis>(F);
@@ -125,6 +132,7 @@ namespace llvm {
 			}
 
 			// Function-level cap: optionally fatal under -obf-no-skips.
+			if (!FuncSkipReason.empty()) MaterialConfig.failCloudMaterial(FuncSkipReason);
 			if (!FuncSkipReason.empty() && llvm::ObfNoSkips) {
 				report_fatal_error(
 					Twine("obfuscator: -obf-no-skips: function '")
@@ -372,6 +380,7 @@ namespace llvm {
 				// --- Budget gate: skip if exhausted ---
 				unsigned CurrentInsts = llvm::obf::countInstructions(F);
 				if (Budget.isExhausted(CurrentInsts)) {
+					MaterialConfig.failCloudMaterial("budget exhausted before pass '" + Entry.Name + "'");
 					if (ObfVerbose)
 						errs() << "[budget] " << F.getName() << ": EXHAUSTED (" << CurrentInsts
 						<< " >= " << Budget.limit() << "), skipping '" << Entry.Name
@@ -426,6 +435,7 @@ namespace llvm {
 				if (Snap) {
 					unsigned PostRunInsts = llvm::obf::countInstructions(F);
 					if (PostRunInsts > HardCap) {
+						MaterialConfig.failCloudMaterial("budget rollback on pass '" + Entry.Name + "'");
 						restoreFunctionSnapshot(F, Snap);
 						Snap->eraseFromParent();
 						Snap = nullptr;
@@ -458,6 +468,7 @@ namespace llvm {
 					auto& FOC3 = *FAM.getResult<FunctionObfContextAnalysis>(F);
 					auto It = FOC3.PassSkipReasons.find(Entry.Name);
 					if (It != FOC3.PassSkipReasons.end() && !It->second.empty()) {
+						if (Entry.Name == "vm") MaterialConfig.failCloudMaterial(It->second);
 						Budget.markLastRecordSkipped(It->second,
 							llvm::obf::countInstructions(F));
 						if (ObfVerbose)
@@ -648,6 +659,9 @@ namespace llvm {
 				return PreservedAnalyses::all();
 			}
 
+			// 模块变换（尤其 fmerge）可能剪掉注解，必须先验证材料请求。
+			for (Function& F : M)
+				ObfuscationPipeline::validateMaterialConfig(Cache.getConfig(F));
 			ModulePassManager MPM;
 
 			if (ObfVerify)
@@ -691,6 +705,19 @@ namespace llvm {
 			// Task 4: a strict sensitive candidate that never prepared must fail
 			// the build before commit, not silently vanish.
 			Coordinator.verifyRequiredCandidates();
+			// 暂存阶段先完成所有候选预检，再写真实配置报告并拒绝发射。
+			if (Coordinator.hasCloudMaterial()) {
+				validateMaterialExportDirectory();
+				if (Error E = Coordinator.prepareMaterialExports())
+					report_fatal_error(Twine("vm: canonical material preparation failed: ") +
+						toString(std::move(E)), false);
+				if (llvm::obf::isReportEnabled()) {
+					Coordinator.finalizeReports(MAM.getResult<ObfReportAnalysis>(M));
+					if (Error E = llvm::obf::maybeWriteObfReportJson(M, MAM))
+						report_fatal_error(Twine("vm: material preflight report failed: ") + toString(std::move(E)), false);
+				}
+				report_fatal_error("vm: cloud material emission not implemented (Tasks 3/8)", false);
+			}
 			if (!Coordinator.freeze() || !Coordinator.commit())
 				return PreservedAnalyses::none();
 			Coordinator.verifySensitiveCommits();

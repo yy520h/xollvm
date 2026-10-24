@@ -8,11 +8,108 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Requirements.h"
 
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
 
 using namespace llvm;
 
 namespace llvm {
+
+	bool verifyCanonicalBytecode(ArrayRef<uint8_t> Bytecode,
+		ArrayRef<uint32_t> InstructionOffsets, ArrayRef<uint8_t> LogicalOpcodes,
+		const VMInstructionLayout& Layout, const VMOpcodeMap& OpcodeMap,
+		ArrayRef<uint8_t> CallArities, ArrayRef<uint8_t> CallReturnKinds,
+		uint32_t TargetKey,
+		std::string& OutErr, uint32_t& OutBadIP,
+		uint64_t* OutTargetLookupOperations) {
+		if (OutTargetLookupOperations) *OutTargetLookupOperations = 0;
+		auto fail = [&](uint32_t IP, const Twine& Message) {
+			OutBadIP = IP;
+			OutErr = Message.str();
+			return false;
+		};
+		if (Bytecode.empty() || InstructionOffsets.empty() ||
+			InstructionOffsets.size() != LogicalOpcodes.size() ||
+			InstructionOffsets.front() != 0 || !Layout.validate())
+			return fail(0, "canonical bytecode record precondition failed");
+		SmallVector<uint8_t, 0> InstructionStarts((Bytecode.size() + 7) / 8);
+		for (uint32_t Offset : InstructionOffsets) {
+			if (Offset >= Bytecode.size())
+				return fail(Offset, "canonical bytecode instruction offset out of bounds");
+			InstructionStarts[Offset >> 3] |= static_cast<uint8_t>(1u << (Offset & 7));
+		}
+		auto readU16 = [&](uint32_t Offset) {
+			return static_cast<uint16_t>(Bytecode[Offset] |
+				(static_cast<uint16_t>(Bytecode[Offset + 1]) << 8));
+		};
+		auto readU32 = [&](uint32_t Offset) {
+			return static_cast<uint32_t>(Bytecode[Offset]) |
+				(static_cast<uint32_t>(Bytecode[Offset + 1]) << 8) |
+				(static_cast<uint32_t>(Bytecode[Offset + 2]) << 16) |
+				(static_cast<uint32_t>(Bytecode[Offset + 3]) << 24);
+		};
+		uint32_t IP = 0;
+		for (size_t I = 0; I < InstructionOffsets.size(); ++I) {
+			if (InstructionOffsets[I] != IP)
+				return fail(IP, "canonical bytecode records do not partition the stream");
+			uint8_t Logical = LogicalOpcodes[I];
+			if (Logical >= OP_COUNT || Bytecode[IP] != OpcodeMap.L2P[Logical])
+				return fail(IP, "canonical bytecode opcode record mismatch");
+			VMOp Op = static_cast<VMOp>(Logical);
+			uint32_t Size = Layout.size(Op);
+			if (!Size || Size > Bytecode.size() - IP)
+				return fail(IP, "canonical bytecode instruction header truncated");
+			auto validateTarget = [&](uint32_t Target) {
+				if (OutTargetLookupOperations) ++*OutTargetLookupOperations;
+				return Target < Bytecode.size() &&
+					(InstructionStarts[Target >> 3] & (1u << (Target & 7)));
+			};
+			auto validFieldTarget = [&](unsigned Field) {
+				uint32_t Target = readU32(IP + Field) ^ TargetKey;
+				return validateTarget(Target);
+			};
+			if (Op == OP_CALL_VOID || Op == OP_CALL_INT || Op == OP_CALL_INT64 ||
+				Op == OP_CALL_PTR || Op == OP_CALL_F) {
+				unsigned CalleeOffset = Layout.offset(Op, VMFieldRole::Callee);
+				unsigned CountOffset = Layout.offset(Op, VMFieldRole::ArgCount);
+				uint8_t Callee = Bytecode[IP + CalleeOffset];
+				uint8_t Count = Bytecode[IP + CountOffset];
+				uint8_t ExpectedKind = Op == OP_CALL_VOID ? 0 : Op == OP_CALL_INT ? 1 :
+					Op == OP_CALL_PTR ? 2 : Op == OP_CALL_INT64 ? 3 : 4;
+				if (Count > 16 || Callee >= CallArities.size() || CallArities[Callee] != Count)
+					return fail(IP, "canonical bytecode CALL structure invalid");
+				if (Callee >= CallReturnKinds.size() || CallReturnKinds[Callee] != ExpectedKind)
+					return fail(IP, "canonical bytecode CALL return kind invalid");
+				if (Count > Bytecode.size() - IP - Size)
+					return fail(IP, "canonical bytecode CALL tail truncated");
+				Size += Count;
+			} else if (Op == OP_SWITCH) {
+				unsigned CountOffset = Layout.offset(Op, VMFieldRole::CaseCount);
+				uint16_t Count = readU16(IP + CountOffset);
+				if (Count > (Bytecode.size() - IP - Size) / 8)
+					return fail(IP, "canonical bytecode SWITCH tail truncated");
+				if (!validFieldTarget(Layout.offset(Op, VMFieldRole::Target)))
+					return fail(IP, "canonical bytecode branch target is not an instruction boundary");
+				for (uint32_t Case = 0; Case < Count; ++Case)
+					if (!validateTarget(readU32(IP + Size + Case * 8 + 4) ^ TargetKey))
+						return fail(IP, "canonical bytecode branch target is not an instruction boundary");
+				Size += static_cast<uint32_t>(Count) * 8;
+			} else if (Op == OP_JMP) {
+				if (!validFieldTarget(Layout.offset(Op, VMFieldRole::Target)))
+					return fail(IP, "canonical bytecode branch target is not an instruction boundary");
+			} else if (Op == OP_JMPC) {
+				if (!validFieldTarget(Layout.offset(Op, VMFieldRole::Target)) ||
+					!validFieldTarget(Layout.offset(Op, VMFieldRole::FalseTarget)))
+					return fail(IP, "canonical bytecode branch target is not an instruction boundary");
+			}
+			if (Size > Bytecode.size() - IP)
+				return fail(IP, "canonical bytecode variable tail truncated");
+			IP += Size;
+		}
+		if (IP != Bytecode.size())
+			return fail(IP, "canonical bytecode records do not cover the stream");
+		return true;
+	}
 
 	bool verifyBytecode(const BytecodeEmitter& E, uint8_t CTSalt, const VMOpcodeMap& OpMap,
 		std::string& OutErr, uint32_t& OutBadIP,
