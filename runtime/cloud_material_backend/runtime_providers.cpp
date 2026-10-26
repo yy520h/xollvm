@@ -73,8 +73,8 @@ std::variant<RuntimeProviderBundle, BackendError> RuntimeProviderFactory::resolv
         !policyResult.configure_policy || !policyResult.authorize_control ||
         (!policyResult.issue && !policyResult.build_payload) ||
         !trustResult.validate_final_artifact || !trustResult.artifact_evidence ||
-        !policyResult.authorize_admin ||
-        !trustResult.trust_handler)
+        !policyResult.authorize_admin || !trustResult.trust_handler ||
+        (config.raw_port != 0 && !policyResult.build_window_material))
         return std::variant<RuntimeProviderBundle, BackendError>(
             BackendError{"provider_unavailable"});
     result.random_bytes = std::move(signerResult.random_bytes);
@@ -85,6 +85,8 @@ std::variant<RuntimeProviderBundle, BackendError> RuntimeProviderFactory::resolv
     result.authorize_control = std::move(policyResult.authorize_control);
     result.issue = std::move(policyResult.issue);
     result.build_payload = std::move(policyResult.build_payload);
+    result.raw_api = std::move(policyResult.raw_api);
+    result.build_window_material = std::move(policyResult.build_window_material);
     result.validate_final_artifact = std::move(trustResult.validate_final_artifact);
     result.artifact_evidence = std::move(trustResult.artifact_evidence);
     result.authorize_admin = std::move(policyResult.authorize_admin);

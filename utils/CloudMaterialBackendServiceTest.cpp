@@ -71,6 +71,30 @@ RequestFacts facts(std::string type = "material.issue") {
     return result;
 }
 
+RequestFacts rawRegistrationFacts(char request = '4', char digest = '5') {
+    auto result = facts("session.open");
+    result.request_id = std::string(32, request);
+    result.request_digest = std::string(64, digest);
+    result.region_id.clear();
+    result.mode.clear();
+    return result;
+}
+
+RawSessionRegistrationInput rawRegistrationInput(char nonce = '6', char key = '7') {
+    return {std::string(64, nonce), std::string(64, key)};
+}
+
+RawSessionMetadata rawSessionMetadata(char session = '8', char serverNonce = '9',
+                                      char serverKey = 'a', char genesis = 'b') {
+    return {std::string(32, session), std::string(64, serverNonce),
+            std::string(64, serverKey), std::string(64, genesis), 1, 5000};
+}
+
+bool hasError(const auto &outcome, std::string_view code) {
+    const auto *error = std::get_if<BackendError>(&outcome);
+    return error && error->code == code;
+}
+
 void openTestSession(SessionState &state, const RequestFacts &material,
                      const AnonymousGrant &materialGrant) {
     auto open = facts("session.open");
@@ -143,6 +167,157 @@ TEST(anonymous_policy_authorizes_session_control_without_material_scope_fields) 
     EXPECT_TRUE(std::holds_alternative<AnonymousGrant>(result));
 }
 
+TEST(anonymous_policy_idempotently_accounts_canonical_requests) {
+    AnonymousPolicy policy;
+    auto request = facts();
+    auto snapshot = RepositoryTestAccess::snapshot(request);
+    const auto rule = AnonymousPolicy::BuildRule{
+        .software_id = request.software_id,
+        .final_artifact_hash = request.final_artifact_hash,
+        .regions = {request.region_id},
+        .modes = {request.mode},
+        .valid_until_ms = 2000,
+        .revision = 0,
+        .request_budget = 1,
+        .enabled = true,
+    };
+    policy.setRule(request.build_id, rule);
+
+    EXPECT_TRUE(std::holds_alternative<AnonymousGrant>(
+        policy.authorize(*snapshot, request, 1000, 1)));
+    EXPECT_TRUE(std::holds_alternative<AnonymousGrant>(
+        policy.authorize(*snapshot, request, 1000, 1)));
+
+    auto conflicting = request;
+    conflicting.request_digest = std::string(64, '6');
+    const auto conflict = policy.authorize(*snapshot, conflicting, 1000, 1);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(conflict));
+    if (const auto *error = std::get_if<BackendError>(&conflict))
+        EXPECT_TRUE(error->code == "request_conflict");
+
+    auto distinct = request;
+    distinct.request_id = std::string(64, '7');
+    distinct.request_digest = std::string(64, '8');
+    const auto exhausted = policy.authorize(*snapshot, distinct, 1000, 1);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(exhausted));
+    if (const auto *error = std::get_if<BackendError>(&exhausted))
+        EXPECT_TRUE(error->code == "build_unavailable");
+}
+
+TEST(anonymous_policy_serializes_concurrent_exact_retries) {
+    AnonymousPolicy policy;
+    auto request = facts();
+    auto snapshot = RepositoryTestAccess::snapshot(request);
+    policy.setRule(request.build_id, AnonymousPolicy::BuildRule{
+        .software_id = request.software_id,
+        .final_artifact_hash = request.final_artifact_hash,
+        .regions = {request.region_id}, .modes = {request.mode},
+        .valid_until_ms = 2000, .revision = 0, .request_budget = 1,
+        .enabled = true});
+
+    std::vector<std::future<std::variant<AnonymousGrant, BackendError>>> retries;
+    for (unsigned index = 0; index != 16; ++index) {
+        retries.push_back(std::async(std::launch::async, [&] {
+            return policy.authorize(*snapshot, request, 1000, 1);
+        }));
+    }
+    for (auto &retry : retries)
+        EXPECT_TRUE(std::holds_alternative<AnonymousGrant>(retry.get()));
+
+    auto distinct = request;
+    distinct.request_id = std::string(64, '7');
+    distinct.request_digest = std::string(64, '8');
+    EXPECT_TRUE(std::holds_alternative<BackendError>(
+        policy.authorize(*snapshot, distinct, 1000, 1)));
+}
+
+TEST(anonymous_policy_cache_is_bounded_and_rule_replacement_resets_it) {
+    AnonymousPolicy policy(1);
+    auto first = facts();
+    auto snapshot = RepositoryTestAccess::snapshot(first);
+    const auto rule = AnonymousPolicy::BuildRule{
+        .software_id = first.software_id,
+        .final_artifact_hash = first.final_artifact_hash,
+        .regions = {first.region_id},
+        .modes = {first.mode},
+        .valid_until_ms = 2000,
+        .revision = 0,
+        .request_budget = 4,
+        .enabled = true,
+    };
+    policy.setRule(first.build_id, rule);
+    EXPECT_TRUE(std::holds_alternative<AnonymousGrant>(
+        policy.authorize(*snapshot, first, 1000, 1)));
+
+    auto second = first;
+    second.request_id = std::string(64, '7');
+    second.request_digest = std::string(64, '8');
+    EXPECT_TRUE(std::holds_alternative<BackendError>(
+        policy.authorize(*snapshot, second, 1000, 1)));
+
+    policy.setRule(first.build_id, rule);
+    EXPECT_TRUE(std::holds_alternative<AnonymousGrant>(
+        policy.authorize(*snapshot, second, 1000, 1)));
+
+    AnonymousPolicy replacement(2);
+    replacement.setRule(first.build_id, rule);
+    policy.replaceWith(std::move(replacement));
+    EXPECT_TRUE(std::holds_alternative<AnonymousGrant>(
+        policy.authorize(*snapshot, first, 1000, 1)));
+    EXPECT_TRUE(std::holds_alternative<AnonymousGrant>(
+        policy.authorize(*snapshot, second, 1000, 1)));
+}
+
+TEST(anonymous_policy_reservation_rolls_back_and_survives_policy_replacement) {
+    AnonymousPolicy policy;
+    auto request = facts();
+    auto snapshot = RepositoryTestAccess::snapshot(request);
+    const auto rule = AnonymousPolicy::BuildRule{
+        .software_id = request.software_id,
+        .final_artifact_hash = request.final_artifact_hash,
+        .regions = {request.region_id},
+        .modes = {request.mode},
+        .valid_until_ms = 2000,
+        .revision = 0,
+        .request_budget = 1,
+        .enabled = true,
+    };
+    policy.setRule(request.build_id, rule);
+
+    {
+        auto pending = policy.reserve(*snapshot, request, 1000, 1);
+        EXPECT_TRUE(std::holds_alternative<AnonymousPolicy::Reservation>(pending));
+        auto distinct = request;
+        distinct.request_id = std::string(64, '7');
+        distinct.request_digest = std::string(64, '8');
+        EXPECT_TRUE(std::holds_alternative<BackendError>(
+            policy.reserve(*snapshot, distinct, 1000, 1)));
+    }
+
+    auto distinct = request;
+    distinct.request_id = std::string(64, '7');
+    distinct.request_digest = std::string(64, '8');
+    auto released = policy.reserve(*snapshot, distinct, 1000, 1);
+    EXPECT_TRUE(std::holds_alternative<AnonymousPolicy::Reservation>(released));
+    std::get<AnonymousPolicy::Reservation>(std::move(released)).commit();
+
+    policy.setRule(request.build_id, rule);
+    auto stale = policy.reserve(*snapshot, request, 1000, 1);
+    EXPECT_TRUE(std::holds_alternative<AnonymousPolicy::Reservation>(stale));
+    policy.clear();
+    auto token = std::get<AnonymousPolicy::Reservation>(std::move(stale));
+    EXPECT_TRUE(token.commit());
+    EXPECT_TRUE(token.commit());
+    EXPECT_TRUE(std::holds_alternative<BackendError>(
+        policy.reserve(*snapshot, request, 1000, 1)));
+
+    AnonymousPolicy replacement;
+    replacement.setRule(request.build_id, rule);
+    policy.replaceWith(std::move(replacement));
+    EXPECT_TRUE(std::holds_alternative<AnonymousPolicy::Reservation>(
+        policy.reserve(*snapshot, request, 1000, 1)));
+}
+
 TEST(relay_authentication_uses_fixed_backend_subject_and_scopes) {
     RelayAuthenticator authenticator("relay-secret-long-enough-for-tests");
     auto grant = authenticator.authenticate("relay-secret-long-enough-for-tests",
@@ -162,6 +337,156 @@ TEST(relay_authentication_rejects_wrong_credential) {
     RelayAuthenticator authenticator("relay-secret-long-enough-for-tests");
     auto result = authenticator.authenticate("wrong-credential", facts(), 1000);
     EXPECT_TRUE(std::holds_alternative<BackendError>(result));
+}
+
+TEST(raw_session_registration_is_fresh_only_and_anchors_genesis) {
+    SessionState sessions;
+    const auto request = rawRegistrationFacts();
+    RelayAuthenticator issuer("test-relay-credential-that-is-long-enough", 10000);
+    const auto grant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", request, 1000));
+    unsigned callbacks = 0;
+    auto registered = sessions.registerRawSession(
+        request, grant, 1000, rawRegistrationInput(), [&](std::uint64_t counter)
+            -> std::variant<RawSessionMetadata, BackendError> {
+            ++callbacks;
+            EXPECT_TRUE(counter == 1);
+            return rawSessionMetadata();
+        });
+    EXPECT_TRUE(std::holds_alternative<RawSessionRegistrationResult>(registered));
+    if (const auto *result = std::get_if<RawSessionRegistrationResult>(&registered)) {
+        EXPECT_TRUE(result->counter == 1);
+        EXPECT_TRUE(result->session == rawSessionMetadata());
+    }
+
+    auto replay = sessions.registerRawSession(
+        request, grant, 1000, rawRegistrationInput(), [&](std::uint64_t)
+            -> std::variant<RawSessionMetadata, BackendError> {
+            ++callbacks;
+            return rawSessionMetadata('c');
+        });
+    EXPECT_TRUE(hasError(replay, "replay_detected"));
+    EXPECT_TRUE(callbacks == 1);
+
+    auto conflictFacts = request;
+    conflictFacts.request_digest = std::string(64, 'c');
+    const auto conflictGrant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", conflictFacts, 1000));
+    auto conflict = sessions.registerRawSession(
+        conflictFacts, conflictGrant, 1000, rawRegistrationInput('d', 'e'),
+        [&](std::uint64_t) -> std::variant<RawSessionMetadata, BackendError> {
+            ++callbacks;
+            return rawSessionMetadata('d');
+        });
+    EXPECT_TRUE(hasError(conflict, "request_conflict"));
+    EXPECT_TRUE(callbacks == 1);
+
+    auto issue = facts();
+    issue.request_id = std::string(64, 'd');
+    issue.request_digest = std::string(64, 'e');
+    const auto issueGrant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", issue, 1000));
+    WindowAdvanceInput wrong;
+    wrong.session_id = std::string(32, '8');
+    wrong.region_id = kRegion;
+    wrong.generation = 7;
+    wrong.window_id = 1;
+    wrong.previous_state = std::string(64, 'c');
+    wrong.next_state = std::string(64, 'd');
+    wrong.expires_at_ms = 1800;
+    wrong.encoded_response = {std::byte{1}};
+    auto rejected = sessions.transact(issue, issueGrant, 1000,
+        [wrong](SessionState::Transaction &tx) mutable {
+            WindowPreflightInput preflight;
+            preflight.session_id = wrong.session_id;
+            preflight.region_id = wrong.region_id;
+            preflight.generation = wrong.generation;
+            preflight.window_id = wrong.window_id;
+            preflight.previous_state = wrong.previous_state;
+            preflight.expires_at_ms = wrong.expires_at_ms;
+            tx.preflightWindow(std::move(preflight));
+            return tx.finalizeWindow(WindowFinalizeInput{
+                std::move(wrong.next_state), std::move(wrong.encoded_response)});
+        });
+    EXPECT_TRUE(hasError(rejected, "window_chain_mismatch"));
+
+    issue.request_id = std::string(64, 'f');
+    issue.request_digest = std::string(64, '1');
+    const auto anchoredGrant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", issue, 1000));
+    wrong.previous_state = std::string(64, 'b');
+    auto anchored = sessions.transact(issue, anchoredGrant, 1000,
+        [wrong](SessionState::Transaction &tx) mutable {
+            WindowPreflightInput preflight;
+            preflight.session_id = wrong.session_id;
+            preflight.region_id = wrong.region_id;
+            preflight.generation = wrong.generation;
+            preflight.window_id = wrong.window_id;
+            preflight.previous_state = wrong.previous_state;
+            preflight.expires_at_ms = wrong.expires_at_ms;
+            tx.preflightWindow(std::move(preflight));
+            return tx.finalizeWindow(WindowFinalizeInput{
+                std::move(wrong.next_state), std::move(wrong.encoded_response)});
+        });
+    EXPECT_TRUE(std::holds_alternative<StateResult>(anchored));
+}
+
+TEST(raw_session_registration_rejects_invalid_metadata_and_collisions) {
+    SessionState sessions;
+    RelayAuthenticator issuer("test-relay-credential-that-is-long-enough", 10000);
+    auto request = rawRegistrationFacts();
+    auto grant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", request, 1000));
+
+    auto invalid = sessions.registerRawSession(
+        request, grant, 1000, rawRegistrationInput(), [](std::uint64_t)
+            -> std::variant<RawSessionMetadata, BackendError> {
+            auto metadata = rawSessionMetadata();
+            metadata.initial_state_commitment = std::string(64, '0');
+            return metadata;
+        });
+    EXPECT_TRUE(hasError(invalid, "invalid_key"));
+
+    auto first = sessions.registerRawSession(
+        request, grant, 1000, rawRegistrationInput(), [](std::uint64_t)
+            -> std::variant<RawSessionMetadata, BackendError> {
+            return rawSessionMetadata();
+        });
+    EXPECT_TRUE(std::holds_alternative<RawSessionRegistrationResult>(first));
+
+    request = rawRegistrationFacts('c', 'd');
+    grant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", request, 1000));
+    auto sameOwnerCollision = sessions.registerRawSession(
+        request, grant, 1000, rawRegistrationInput('c', 'd'), [](std::uint64_t)
+            -> std::variant<RawSessionMetadata, BackendError> {
+            return rawSessionMetadata();
+        });
+    EXPECT_TRUE(hasError(sameOwnerCollision, "request_conflict"));
+
+    SessionState mismatched;
+    auto legacyFacts = facts("session.open");
+    legacyFacts.request_id = std::string(64, 'a');
+    legacyFacts.request_digest = std::string(64, 'b');
+    auto legacyGrant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", legacyFacts, 1000));
+    auto legacy = mismatched.transact(legacyFacts, legacyGrant, 1000,
+        [](SessionState::Transaction &tx) {
+            return tx.openSession(std::string(32, '8'), "legacy-epoch", 5000,
+                "legacy-server", "legacy-server-key", "legacy-client", "legacy-client-key");
+        });
+    EXPECT_TRUE(std::holds_alternative<StateResult>(legacy));
+    auto other = rawRegistrationFacts();
+    other.build_id = std::string(64, '2');
+    other.final_artifact_hash = std::string(64, '6');
+    auto otherGrant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", other, 1000));
+    auto wrongOwnerCollision = mismatched.registerRawSession(
+        other, otherGrant, 1000, rawRegistrationInput(), [](std::uint64_t)
+            -> std::variant<RawSessionMetadata, BackendError> {
+            return rawSessionMetadata();
+        });
+    EXPECT_TRUE(hasError(wrongOwnerCollision, "unauthorized"));
 }
 
 TEST(session_state_is_idempotent_and_rejects_replay_and_reuse) {
@@ -188,6 +513,106 @@ TEST(session_state_is_idempotent_and_rejects_replay_and_reuse) {
         return tx.allocate("session-a", "region-a", "client-nonce", "different-key");
     });
     EXPECT_TRUE(std::holds_alternative<BackendError>(replay));
+}
+
+TEST(session_state_cached_replies_require_live_matching_session_identity) {
+    RelayAuthenticator issuer("test-relay-credential-that-is-long-enough", 10000);
+    auto request = facts();
+    auto grant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", request, 1000));
+
+    SessionState expiredState;
+    openTestSession(expiredState, request, grant);
+    auto issued = expiredState.transact(request, grant, 1000,
+        [](SessionState::Transaction &tx) {
+            return tx.allocate("session-a", kRegion, "issue-nonce", "issue-key");
+        });
+    EXPECT_TRUE(std::holds_alternative<StateResult>(issued));
+
+    auto mismatched = request;
+    mismatched.region_id = std::string(64, '9');
+    auto mismatchedGrant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", mismatched, 1000));
+    bool mismatchCalled = false;
+    auto wrongIdentity = expiredState.transact(mismatched, mismatchedGrant, 1000,
+        [&](SessionState::Transaction &) {
+            mismatchCalled = true;
+            return StateResult{};
+        });
+    EXPECT_FALSE(mismatchCalled);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(wrongIdentity));
+
+    bool expiryCalled = false;
+    auto expired = expiredState.transact(request, grant, 1900,
+        [&](SessionState::Transaction &) {
+            expiryCalled = true;
+            return StateResult{};
+        });
+    EXPECT_FALSE(expiryCalled);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(expired));
+
+    SessionState closedState;
+    openTestSession(closedState, request, grant);
+    issued = closedState.transact(request, grant, 1000,
+        [](SessionState::Transaction &tx) {
+            return tx.allocate("session-a", kRegion, "close-issue-nonce", "close-issue-key");
+        });
+    EXPECT_TRUE(std::holds_alternative<StateResult>(issued));
+    auto closeRequest = facts("session.close");
+    closeRequest.request_id = std::string(64, 'c');
+    closeRequest.request_digest = std::string(64, 'd');
+    auto closeGrant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", closeRequest, 1000));
+    auto closed = closedState.transact(closeRequest, closeGrant, 1000,
+        [](SessionState::Transaction &tx) {
+            return tx.closeSession("session-a", "epoch-a", 1100,
+                "close-server", "close-server-key", "close-client", "close-client-key");
+        });
+    EXPECT_TRUE(std::holds_alternative<StateResult>(closed));
+    bool staleCalled = false;
+    auto stale = closedState.transact(request, grant, 1100,
+        [&](SessionState::Transaction &) {
+            staleCalled = true;
+            return StateResult{};
+        });
+    EXPECT_FALSE(staleCalled);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(stale));
+    bool closeRetryCalled = false;
+    auto closeRetry = closedState.transact(closeRequest, closeGrant, 1100,
+        [&](SessionState::Transaction &) {
+            closeRetryCalled = true;
+            return StateResult{};
+        });
+    EXPECT_FALSE(closeRetryCalled);
+    EXPECT_TRUE(std::holds_alternative<StateResult>(closeRetry));
+    if (std::holds_alternative<StateResult>(closeRetry))
+        EXPECT_TRUE(std::get<StateResult>(closeRetry).closed);
+}
+
+TEST(session_state_capacity_counts_exact_response_bytes_atomically) {
+    SessionState state;
+    auto request = facts();
+    RelayAuthenticator issuer("test-relay-credential-that-is-long-enough", 10000);
+    auto grant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", request, 1000));
+    openTestSession(state, request, grant);
+    auto oversized = state.transact(request, grant, 1000,
+        [](SessionState::Transaction &tx) {
+            auto result = tx.allocate("session-a", kRegion, "capacity-nonce", "capacity-key");
+            tx.setResponse(std::vector<std::byte>(8 * 1024 * 1024, std::byte{0x5a}));
+            return result;
+        });
+    EXPECT_TRUE(std::holds_alternative<BackendError>(oversized));
+    if (const auto *error = std::get_if<BackendError>(&oversized))
+        EXPECT_TRUE(error->code == "state_capacity");
+
+    auto retry = state.transact(request, grant, 1000,
+        [](SessionState::Transaction &tx) {
+            auto result = tx.allocate("session-a", kRegion, "capacity-nonce", "capacity-key");
+            tx.setResponse({std::byte{0x5a}});
+            return result;
+        });
+    EXPECT_TRUE(std::holds_alternative<StateResult>(retry));
 }
 
 TEST(session_state_idempotency_key_includes_release_binding) {
@@ -246,6 +671,154 @@ TEST(session_state_generations_counters_and_expiry_are_bounded) {
         return tx.allocate("session-c", "region-a", "nonce-c", "key-c");
     });
     EXPECT_TRUE(std::holds_alternative<BackendError>(expired));
+}
+
+TEST(session_state_window_chain_is_contiguous_idempotent_and_fail_closed) {
+    SessionState sessions;
+    auto initial = facts();
+    RelayAuthenticator issuer("test-relay-credential-that-is-long-enough", 10000);
+    auto initialGrant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", initial, 1000));
+    openTestSession(sessions, initial, initialGrant);
+
+    const auto transactWindow = [&](RequestFacts request, WindowAdvanceInput input,
+                                    std::uint64_t now = 1000,
+                                    bool *expensive = nullptr) {
+        auto grant = std::get<AnonymousGrant>(issuer.authenticate(
+            "test-relay-credential-that-is-long-enough", request, 1000));
+        return sessions.transact(request, grant, now,
+            [input = std::move(input), expensive](SessionState::Transaction &tx) mutable {
+                WindowPreflightInput preflight;
+                preflight.session_id = input.session_id;
+                preflight.region_id = input.region_id;
+                preflight.generation = input.generation;
+                preflight.window_id = input.window_id;
+                preflight.previous_state = input.previous_state;
+                preflight.expires_at_ms = input.expires_at_ms;
+                tx.preflightWindow(std::move(preflight));
+                if (expensive) *expensive = true;
+                return tx.finalizeWindow(WindowFinalizeInput{
+                    std::move(input.next_state), std::move(input.encoded_response)});
+            });
+    };
+    const auto input = [](std::uint64_t window, std::string previous, std::string next,
+                          std::string response = "response") {
+        WindowAdvanceInput value;
+        value.session_id = "session-a";
+        value.region_id = kRegion;
+        value.generation = 7;
+        value.window_id = window;
+        value.previous_state = std::move(previous);
+        value.next_state = std::move(next);
+        value.expires_at_ms = 1700;
+        value.encoded_response.assign(
+            reinterpret_cast<const std::byte *>(response.data()),
+            reinterpret_cast<const std::byte *>(response.data() + response.size()));
+        return value;
+    };
+    const auto request = [](char id, char digest) {
+        auto value = facts();
+        value.request_id = std::string(64, id);
+        value.request_digest = std::string(64, digest);
+        return value;
+    };
+
+    auto firstRequest = request('c', 'd');
+    auto first = transactWindow(firstRequest, input(1, "genesis-state", "state-one", "exact-one"));
+    EXPECT_TRUE(std::holds_alternative<StateResult>(first));
+    bool retryCalled = false;
+    auto firstGrant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", firstRequest, 1000));
+    auto retry = sessions.transact(firstRequest, firstGrant, 1000,
+        [&](SessionState::Transaction &) {
+            retryCalled = true;
+            return StateResult{};
+        });
+    EXPECT_FALSE(retryCalled);
+    EXPECT_TRUE(std::holds_alternative<StateResult>(retry));
+    if (std::holds_alternative<StateResult>(first) && std::holds_alternative<StateResult>(retry))
+        EXPECT_TRUE(std::get<StateResult>(first).response == std::get<StateResult>(retry).response);
+
+    bool expiredRetryCalled = false;
+    auto expiredRetry = sessions.transact(firstRequest, firstGrant, 1700,
+        [&](SessionState::Transaction &) {
+            expiredRetryCalled = true;
+            return StateResult{};
+        });
+    EXPECT_FALSE(expiredRetryCalled);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(expiredRetry));
+
+    auto conflictRequest = firstRequest;
+    conflictRequest.request_digest = std::string(64, 'e');
+    auto conflictGrant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", conflictRequest, 1000));
+    auto conflict = sessions.transact(conflictRequest, conflictGrant, 1000,
+        [](SessionState::Transaction &) { return StateResult{}; });
+    EXPECT_TRUE(std::holds_alternative<BackendError>(conflict));
+    if (const auto *error = std::get_if<BackendError>(&conflict))
+        EXPECT_TRUE(error->code == "request_conflict");
+
+    bool expensive = false;
+    auto duplicate = transactWindow(
+        request('f', '1'), input(1, "genesis-state", "duplicate"), 1000, &expensive);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(duplicate));
+    EXPECT_FALSE(expensive);
+    auto skipped = transactWindow(
+        request('g', '2'), input(3, "state-one", "skipped"), 1000, &expensive);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(skipped));
+    EXPECT_FALSE(expensive);
+    auto rollback = transactWindow(request('h', '3'), input(0, "state-one", "rollback"));
+    EXPECT_TRUE(std::holds_alternative<BackendError>(rollback));
+
+    auto wrongGenerationInput = input(2, "state-one", "wrong-generation");
+    wrongGenerationInput.generation = 6;
+    auto wrongGeneration = transactWindow(
+        request('i', '4'), std::move(wrongGenerationInput), 1000, &expensive);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(wrongGeneration));
+    EXPECT_FALSE(expensive);
+    auto wrongState = transactWindow(
+        request('j', '5'), input(2, "wrong-state", "wrong-next"), 1000, &expensive);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(wrongState));
+    EXPECT_FALSE(expensive);
+    auto wrongIdentityInput = input(2, "state-one", "wrong-identity");
+    wrongIdentityInput.region_id = std::string(64, '9');
+    auto wrongIdentity = transactWindow(
+        request('k', '6'), std::move(wrongIdentityInput), 1000, &expensive);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(wrongIdentity));
+    EXPECT_FALSE(expensive);
+    auto expiredInput = input(2, "state-one", "expired");
+    expiredInput.expires_at_ms = 1000;
+    auto expired = transactWindow(request('l', '7'), std::move(expiredInput));
+    EXPECT_TRUE(std::holds_alternative<BackendError>(expired));
+
+    auto abandonedRequest = request('n', '9');
+    auto abandonedGrant = std::get<AnonymousGrant>(issuer.authenticate(
+        "test-relay-credential-that-is-long-enough", abandonedRequest, 1000));
+    auto abandonedInput = input(2, "state-one", "never-finalized");
+    auto abandoned = sessions.transact(abandonedRequest, abandonedGrant, 1000,
+        [abandonedInput](SessionState::Transaction &tx) mutable {
+            WindowPreflightInput preflight;
+            preflight.session_id = abandonedInput.session_id;
+            preflight.region_id = abandonedInput.region_id;
+            preflight.generation = abandonedInput.generation;
+            preflight.window_id = abandonedInput.window_id;
+            preflight.previous_state = abandonedInput.previous_state;
+            preflight.expires_at_ms = abandonedInput.expires_at_ms;
+            tx.preflightWindow(std::move(preflight));
+            return StateResult{};
+        });
+    EXPECT_TRUE(hasError(abandoned, "window_invalid"));
+    bool abandonedRetryCalled = false;
+    auto abandonedRetry = sessions.transact(abandonedRequest, abandonedGrant, 1000,
+        [&](SessionState::Transaction &tx) {
+            abandonedRetryCalled = true;
+            return tx.advanceWindow(input(2, "state-one", "state-two", "exact-two"));
+        });
+    EXPECT_TRUE(abandonedRetryCalled);
+    EXPECT_TRUE(std::holds_alternative<StateResult>(abandonedRetry));
+
+    auto second = transactWindow(request('m', '8'), input(3, "state-two", "state-three", "exact-three"));
+    EXPECT_TRUE(std::holds_alternative<StateResult>(second));
 }
 
 TEST(session_state_does_not_cache_failed_commit) {
@@ -649,13 +1222,31 @@ int main() {
         anonymous_policy_denies_unregistered_revoked_mismatched_and_expired_builds);
     run("anonymous_policy_authorizes_session_control_without_material_scope_fields",
         anonymous_policy_authorizes_session_control_without_material_scope_fields);
+    run("anonymous_policy_idempotently_accounts_canonical_requests",
+        anonymous_policy_idempotently_accounts_canonical_requests);
+    run("anonymous_policy_serializes_concurrent_exact_retries",
+        anonymous_policy_serializes_concurrent_exact_retries);
+    run("anonymous_policy_cache_is_bounded_and_rule_replacement_resets_it",
+        anonymous_policy_cache_is_bounded_and_rule_replacement_resets_it);
+    run("anonymous_policy_reservation_rolls_back_and_survives_policy_replacement",
+        anonymous_policy_reservation_rolls_back_and_survives_policy_replacement);
     run("relay_authentication_rejects_wrong_credential", relay_authentication_rejects_wrong_credential);
+    run("raw_session_registration_is_fresh_only_and_anchors_genesis",
+        raw_session_registration_is_fresh_only_and_anchors_genesis);
+    run("raw_session_registration_rejects_invalid_metadata_and_collisions",
+        raw_session_registration_rejects_invalid_metadata_and_collisions);
     run("session_state_is_idempotent_and_rejects_replay_and_reuse",
         session_state_is_idempotent_and_rejects_replay_and_reuse);
+    run("session_state_cached_replies_require_live_matching_session_identity",
+        session_state_cached_replies_require_live_matching_session_identity);
+    run("session_state_capacity_counts_exact_response_bytes_atomically",
+        session_state_capacity_counts_exact_response_bytes_atomically);
     run("session_state_idempotency_key_includes_release_binding",
         session_state_idempotency_key_includes_release_binding);
     run("session_state_generations_counters_and_expiry_are_bounded",
         session_state_generations_counters_and_expiry_are_bounded);
+    run("session_state_window_chain_is_contiguous_idempotent_and_fail_closed",
+        session_state_window_chain_is_contiguous_idempotent_and_fail_closed);
     run("session_state_does_not_cache_failed_commit", session_state_does_not_cache_failed_commit);
     run("session_state_closes_sessions_and_rejects_expired_or_replayed_server_values",
         session_state_closes_sessions_and_rejects_expired_or_replayed_server_values);
@@ -673,6 +1264,6 @@ int main() {
         protocol_service_control_request_requires_trusted_control_authority);
     run("protocol_service_byte_handler_seals_a_valid_material_request",
         protocol_service_byte_handler_seals_a_valid_material_request);
-    std::fprintf(stdout, "14 tests, %u assertions, %u failures\n", state.assertions, state.failures);
+    std::fprintf(stdout, "25 tests, %u assertions, %u failures\n", state.assertions, state.failures);
     return state.failures == 0 ? 0 : 1;
 }

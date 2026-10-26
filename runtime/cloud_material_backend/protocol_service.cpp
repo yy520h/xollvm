@@ -131,14 +131,17 @@ std::variant<Bytes, BackendError> ProtocolService::handle(
     if (const auto *error = std::get_if<BackendError>(&relayGrant)) return *error;
     auto snapshot = providers_.snapshots->acquire();
     if (!snapshot || !providers_.snapshots->ready()) return BackendError{"authority_unavailable"};
-    auto grantResult = providers_.anonymous_policy->authorize(*snapshot, facts, now, 1);
-    if (const auto *error = std::get_if<BackendError>(&grantResult)) return *error;
-    const auto &grant = std::get<AnonymousGrant>(grantResult);
+    auto reservationResult = providers_.anonymous_policy->reserve(*snapshot, facts, now, 1);
+    if (const auto *error = std::get_if<BackendError>(&reservationResult)) return *error;
+    auto reservation = std::get<AnonymousPolicy::Reservation>(std::move(reservationResult));
+    const auto &grant = reservation.grant();
     auto issue = providers_.issue;
-    if (!providers_.build_payload && facts.type == "material.issue")
-         return handle(request, grant, *providers_.snapshots,
-                       *providers_.state, now, issue, snapshot);
-    return handle(request, grant, *providers_.snapshots, *providers_.state, now,
+    std::variant<Bytes, BackendError> result;
+    if (!providers_.build_payload && facts.type == "material.issue") {
+        result = handle(request, grant, *providers_.snapshots,
+                        *providers_.state, now, issue, snapshot);
+    } else {
+        result = handle(request, grant, *providers_.snapshots, *providers_.state, now,
                    [this, &facts, &grant, snapshot, now](const Request &request, const AnonymousGrant &,
                                   SessionState::Transaction &tx) -> std::variant<Bytes, BackendError> {
         try {
@@ -321,6 +324,10 @@ std::variant<Bytes, BackendError> ProtocolService::handle(
             return BackendError{"key_unavailable"};
         }
                    }, snapshot);
+    }
+    if (std::holds_alternative<BackendError>(result)) return result;
+    if (!reservation.commit()) return BackendError{"build_unavailable"};
+    return result;
 }
 
 std::variant<std::monostate, BackendError> ProtocolService::authorizeMode(

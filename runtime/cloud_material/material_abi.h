@@ -11,7 +11,7 @@ extern "C" {
 enum { XOVM_MATERIAL_ABI_VERSION = 1, XOVM_MATERIAL_RECORD_VERSION = 1,
        XOVM_MATERIAL_RECORD_SIZE = 120, XOVM_MATERIAL_HEADER_SIZE = 16,
        XOVM_MODE_SESSION = 1, XOVM_MODE_LEASE = 2, XOVM_MODE_OPERATION = 3,
-       XOVM_INVALID_OPCODE = 65535 };
+       XOVM_INVALID_OPCODE = 65535, XOVM_DYNAMIC_VM_FORMAT_VERSION = 2 };
 
 typedef struct XovmMaterialHandle XovmMaterialHandle;
 typedef struct {
@@ -23,6 +23,18 @@ typedef struct {
     uint32_t reserved;
     uint64_t generation;
 } XovmMaterialView;
+
+// 动态 VM 只暴露当前窗口的认证密文和状态，不暴露旧版 decode_map。
+typedef struct {
+    uint32_t abi_version;
+    uint32_t format_version;
+    const uint8_t *encrypted_window;
+    uint32_t encrypted_window_size;
+    uint64_t generation;
+    uint64_t window_id;
+    uint8_t previous_state_hash[32];
+    uint8_t next_state_hash[32];
+} XovmWindowMaterialView;
 
 typedef struct {
     uint32_t abi_version;

@@ -16,6 +16,7 @@ struct BackendConfig {
     std::string state_dir;
     std::string bind_address = "127.0.0.1";
     std::uint16_t port = 8080;
+    std::uint16_t raw_port = 0;
     std::uint64_t request_timeout_ms = 10000;
     std::uint32_t max_concurrent_requests = 128;
     std::string relay_token;

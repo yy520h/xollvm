@@ -219,6 +219,7 @@ TEST(runtime_provider_factory_requires_all_provider_capabilities) {
 
 TEST(runtime_provider_factory_merges_all_registered_capabilities) {
     RuntimeProviderFactory::clearForTest();
+    bool provide_window_material_builder = false;
     RuntimeProviderFactory::registerProvider("clock.test",
         [](ProviderRole role, const BackendConfig &) -> std::variant<RuntimeProviderBundle, BackendError> {
             if (role != ProviderRole::trusted_time) return BackendError{"provider_role_invalid"};
@@ -244,7 +245,8 @@ TEST(runtime_provider_factory_merges_all_registered_capabilities) {
             return bundle;
         });
     RuntimeProviderFactory::registerProvider("policy.test",
-        [](ProviderRole role, const BackendConfig &) -> std::variant<RuntimeProviderBundle, BackendError> {
+        [&provide_window_material_builder](ProviderRole role, const BackendConfig &)
+            -> std::variant<RuntimeProviderBundle, BackendError> {
             if (role != ProviderRole::anonymous_policy) return BackendError{"provider_role_invalid"};
             RuntimeProviderBundle bundle;
             bundle.validate_pair = [](const ImportRecord &, std::string &) { return true; };
@@ -263,6 +265,15 @@ TEST(runtime_provider_factory_merges_all_registered_capabilities) {
                               SessionState::Transaction &) -> std::variant<Bytes, BackendError> {
                 return BackendError{"not_configured"};
             };
+            if (provide_window_material_builder) {
+                bundle.build_window_material = [](
+                    const xovm::material::WindowAcquireRequest &)
+                    -> std::variant<xovm::material::WindowMaterial, BackendError> {
+                    xovm::material::WindowMaterial material{};
+                    material.window[0] = 1;
+                    return material;
+                };
+            }
             return bundle;
         });
     RuntimeProviderFactory::registerProvider("trust.test",
@@ -281,15 +292,45 @@ TEST(runtime_provider_factory_merges_all_registered_capabilities) {
             };
             return bundle;
         });
-    const auto result = RuntimeProviderFactory::resolve(providerConfig());
-    EXPECT_TRUE(std::holds_alternative<RuntimeProviderBundle>(result));
-    if (std::holds_alternative<RuntimeProviderBundle>(result)) {
-        const auto &bundle = std::get<RuntimeProviderBundle>(result);
+    const auto disabledResult = RuntimeProviderFactory::resolve(providerConfig());
+    EXPECT_TRUE(std::holds_alternative<RuntimeProviderBundle>(disabledResult));
+    if (std::holds_alternative<RuntimeProviderBundle>(disabledResult)) {
+        const auto &bundle = std::get<RuntimeProviderBundle>(disabledResult);
         EXPECT_TRUE(static_cast<bool>(bundle.trusted_now));
         EXPECT_TRUE(static_cast<bool>(bundle.random_bytes));
         EXPECT_TRUE(static_cast<bool>(bundle.sign));
         EXPECT_TRUE(static_cast<bool>(bundle.validate_pair));
         EXPECT_TRUE(static_cast<bool>(bundle.validate_final_artifact));
+        EXPECT_FALSE(static_cast<bool>(bundle.build_window_material));
+    }
+
+    auto rawConfig = providerConfig();
+    rawConfig.raw_port = 8443;
+    const auto missingBuilder = RuntimeProviderFactory::resolve(rawConfig);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(missingBuilder));
+    if (std::holds_alternative<BackendError>(missingBuilder))
+        EXPECT_TRUE(std::get<BackendError>(missingBuilder).code == "provider_unavailable");
+
+    provide_window_material_builder = true;
+    auto enabledResult = RuntimeProviderFactory::resolve(rawConfig);
+    EXPECT_TRUE(std::holds_alternative<RuntimeProviderBundle>(enabledResult));
+    if (std::holds_alternative<RuntimeProviderBundle>(enabledResult)) {
+        auto &bundle = std::get<RuntimeProviderBundle>(enabledResult);
+        EXPECT_TRUE(static_cast<bool>(bundle.build_window_material));
+        static_assert(sizeof(xovm::material::WindowMaterial) == 192);
+        static_assert(xovm::material::kWindowMaterialSize == 192);
+        xovm::material::WindowAcquireRequest request{};
+        request.request_id[0] = 1;
+        request.build_id[0] = 2;
+        request.region_id[0] = 3;
+        request.generation = 4;
+        request.window_id = 5;
+        request.previous_state_hash[0] = 6;
+        const auto material = bundle.build_window_material(request);
+        EXPECT_TRUE(std::holds_alternative<xovm::material::WindowMaterial>(material));
+        if (std::holds_alternative<xovm::material::WindowMaterial>(material))
+            EXPECT_TRUE(sizeof(std::get<xovm::material::WindowMaterial>(material)) ==
+                        xovm::material::kWindowMaterialSize);
     }
     RuntimeProviderFactory::clearForTest();
 }

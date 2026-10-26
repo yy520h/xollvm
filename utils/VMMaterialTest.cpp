@@ -187,6 +187,208 @@ TEST(VMMaterial, ExportsEmitterRecordsAfterConstPrologue) {
 	EXPECT_FALSE(Bytes->empty());
 }
 
+TEST(VMMaterial, DynamicArtifactExportSealsExecutionMaterial) {
+	auto Fixture = makeFixture();
+	auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+	const json::Object& Public = Export->PublicManifest;
+	const json::Object& Private = Export->PrivateRegistration;
+	ASSERT_EQ(Public.getInteger("format_version"), 2);
+	ASSERT_EQ(Public.getString("material_source"), "dynamic_vm");
+	EXPECT_TRUE(Public.getString("artifact_hash").has_value());
+	EXPECT_TRUE(Public.getString("encrypted_artifact_b64").has_value());
+	EXPECT_EQ(Public.getString("artifact_key_b64"), std::nullopt);
+	EXPECT_FALSE(Public.getString("canonical_bc").has_value());
+	EXPECT_EQ(Public.getArray("decode_map"), nullptr);
+	EXPECT_TRUE(Private.getString("artifact_key_b64").has_value());
+	EXPECT_FALSE(Private.getString("canonical_bc").has_value());
+	EXPECT_EQ(Private.getArray("decode_map"), nullptr);
+	EXPECT_NE(*Public.getString("encrypted_artifact_b64"),
+		encodeBase64(Fixture.Emitter.BC));
+	EXPECT_EQ(Public.getString("encrypted_artifact_b64")->find("XOVM-DYNAMIC"),
+		StringRef::npos);
+}
+
+TEST(VMMaterial, DynamicArtifactUsesCanonicalRegionIdentity) {
+	auto Fixture = makeFixture();
+	auto Canonical = exportCanonicalRegion(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(Canonical)) << toString(Canonical.takeError());
+	auto Dynamic = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(Dynamic)) << toString(Dynamic.takeError());
+	EXPECT_EQ(Dynamic->PublicManifest.getString("region_id"),
+		Canonical->getString("region_id"));
+}
+
+TEST(VMMaterial, DynamicArtifactCommitPublishesSeparatePublicAndPrivateFiles) {
+	std::string Root = temporaryRoot();
+	auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+	auto Fixture = makeFixture();
+	auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+	SmallVector<DynamicArtifactExport, 1> Artifacts;
+	Artifacts.push_back(std::move(*Export));
+	auto First = commitDynamicArtifacts(Root, "test.app", Artifacts,
+		MaterialCommitToken::forExportOnlyTest());
+	ASSERT_TRUE(static_cast<bool>(First)) << toString(First.takeError());
+	EXPECT_TRUE(StringRef(First->Path).ends_with(".dynamic"));
+	EXPECT_TRUE(sys::fs::exists(First->Path + "/public-manifest.json"));
+	EXPECT_TRUE(sys::fs::exists(First->Path + "/registration.private.json"));
+	auto Again = commitDynamicArtifacts(Root, "test.app", Artifacts,
+		MaterialCommitToken::forExportOnlyTest());
+	ASSERT_TRUE(static_cast<bool>(Again)) << toString(Again.takeError());
+	EXPECT_EQ(Again->Path, First->Path);
+}
+
+TEST(VMMaterial, DynamicArtifactCommitAggregatesMultipleRegions) {
+	std::string Root = temporaryRoot();
+	auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+	SmallVector<DynamicArtifactExport, 2> Artifacts;
+	for (StringRef Region : {"auth/payment", "auth/profile"}) {
+		auto Fixture = makeFixture(Region);
+		auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+		ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+		Artifacts.push_back(std::move(*Export));
+	}
+	auto Result = commitDynamicArtifacts(Root, "test.app", Artifacts,
+		MaterialCommitToken::forExportOnlyTest());
+	ASSERT_TRUE(static_cast<bool>(Result)) << toString(Result.takeError());
+	EXPECT_TRUE(sys::fs::exists(Result->Path + "/public-manifest.json"));
+	EXPECT_TRUE(sys::fs::exists(Result->Path + "/registration.private.json"));
+}
+
+TEST(VMMaterial, FailedDynamicCommitNeverPublishesBundle) {
+	for (MaterialExportFault Fault : {MaterialExportFault::Create,
+		MaterialExportFault::Write, MaterialExportFault::FileSync,
+		MaterialExportFault::Close, MaterialExportFault::DirectorySync,
+		MaterialExportFault::Rename}) {
+		std::string Root = temporaryRoot();
+		auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+		auto Fixture = makeFixture();
+		auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+		ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+		SmallVector<DynamicArtifactExport, 1> Artifacts;
+		Artifacts.push_back(std::move(*Export));
+		auto Result = commitDynamicArtifacts(Root, "test.app", Artifacts,
+			MaterialCommitToken::forExportOnlyTest(Fault));
+		ASSERT_FALSE(static_cast<bool>(Result));
+		consumeError(Result.takeError());
+		std::error_code EC;
+		sys::fs::directory_iterator It(Root, EC), End;
+		ASSERT_FALSE(EC);
+		if (It != End) {
+			EXPECT_TRUE(StringRef(It->path()).ends_with(".xovm-publish.lock"));
+			It.increment(EC);
+		}
+		EXPECT_EQ(It, End);
+	}
+}
+
+TEST(VMMaterial, DynamicParentSyncFailureReportsUnknownDurability) {
+	std::string Root = temporaryRoot();
+	auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+	auto Fixture = makeFixture();
+	auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+	SmallVector<DynamicArtifactExport, 1> Artifacts;
+	Artifacts.push_back(std::move(*Export));
+	auto Result = commitDynamicArtifacts(Root, "test.app", Artifacts,
+		MaterialCommitToken::forExportOnlyTest(MaterialExportFault::RootSync));
+	ASSERT_TRUE(static_cast<bool>(Result)) << toString(Result.takeError());
+	EXPECT_EQ(Result->Durability, MaterialCommitDurability::Unknown);
+	struct stat St {};
+	EXPECT_EQ(::stat(Result->Path.c_str(), &St), 0);
+}
+
+TEST(VMMaterial, DynamicCommitRejectsMismatchedOrMalformedRegistration) {
+	for (unsigned Case : {0u, 1u, 2u}) {
+		std::string Root = temporaryRoot();
+		auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+		auto Fixture = makeFixture();
+		auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+		ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+		if (Case == 0)
+			Export->PrivateRegistration["artifact_hash"] = std::string(64, '0');
+		else if (Case == 1)
+			Export->PublicManifest["artifact_size"] = 1;
+		else
+			Export->PublicManifest.erase("encrypted_artifact_b64");
+		SmallVector<DynamicArtifactExport, 1> Artifacts;
+		Artifacts.push_back(std::move(*Export));
+		auto Result = commitDynamicArtifacts(Root, "test.app", Artifacts,
+			MaterialCommitToken::forExportOnlyTest());
+		ASSERT_FALSE(static_cast<bool>(Result)) << Case;
+		consumeError(Result.takeError());
+	}
+}
+
+TEST(VMMaterial, DynamicCommitRejectsDuplicateRegionIdentity) {
+	std::string Root = temporaryRoot();
+	auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+	auto Fixture = makeFixture();
+	auto First = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(First)) << toString(First.takeError());
+	auto Second = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(Second)) << toString(Second.takeError());
+	SmallVector<DynamicArtifactExport, 2> Artifacts;
+	Artifacts.push_back(std::move(*First));
+	Artifacts.push_back(std::move(*Second));
+	auto Result = commitDynamicArtifacts(Root, "test.app", Artifacts,
+		MaterialCommitToken::forExportOnlyTest());
+	ASSERT_FALSE(static_cast<bool>(Result));
+	consumeError(Result.takeError());
+}
+
+TEST(VMMaterial, DynamicCommitRejectsCrossBundleRegionConflict) {
+	std::string Root = temporaryRoot();
+	auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+	auto FirstFixture = makeFixture("auth/payment", 7);
+	auto FirstExport = exportDynamicArtifact(FirstFixture.Emitter, FirstFixture.Config,
+		FirstFixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(FirstExport)) << toString(FirstExport.takeError());
+	SmallVector<DynamicArtifactExport, 1> FirstArtifacts;
+	FirstArtifacts.push_back(std::move(*FirstExport));
+	ASSERT_TRUE(static_cast<bool>(commitDynamicArtifacts(Root, "test.app", FirstArtifacts,
+		MaterialCommitToken::forExportOnlyTest())));
+	auto SecondFixture = makeFixture("auth/payment", 9);
+	auto SecondExport = exportDynamicArtifact(SecondFixture.Emitter, SecondFixture.Config,
+		SecondFixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(SecondExport)) << toString(SecondExport.takeError());
+	SmallVector<DynamicArtifactExport, 1> SecondArtifacts;
+	SecondArtifacts.push_back(std::move(*SecondExport));
+	auto Result = commitDynamicArtifacts(Root, "test.app", SecondArtifacts,
+		MaterialCommitToken::forExportOnlyTest());
+	ASSERT_FALSE(static_cast<bool>(Result));
+	consumeError(Result.takeError());
+}
+
+TEST(VMMaterial, DynamicCommitRejectsUndecryptableArtifact) {
+	for (unsigned Case : {0u, 1u, 2u}) {
+		std::string Root = temporaryRoot();
+		auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+		auto Fixture = makeFixture();
+		auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+		ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+		if (Case == 0) {
+			std::vector<char> Encoded;
+			ASSERT_FALSE(decodeBase64(*Export->PublicManifest.getString("encrypted_artifact_b64"), Encoded));
+			Encoded.back() ^= 1;
+			Export->PublicManifest["encrypted_artifact_b64"] = encodeBase64(Encoded);
+		} else if (Case == 1) {
+			Export->PublicManifest["artifact_hash"] = std::string(64, '0');
+			Export->PrivateRegistration["artifact_hash"] = std::string(64, '0');
+		} else {
+			Export->PrivateRegistration["artifact_key_b64"] = encodeBase64(
+				ArrayRef<uint8_t>(std::array<uint8_t, 32>{}));
+		}
+		SmallVector<DynamicArtifactExport, 1> Artifacts;
+		Artifacts.push_back(std::move(*Export));
+		auto Result = commitDynamicArtifacts(Root, "test.app", Artifacts,
+			MaterialCommitToken::forExportOnlyTest());
+		ASSERT_FALSE(static_cast<bool>(Result)) << Case;
+		consumeError(Result.takeError());
+	}
+}
+
 TEST(VMMaterial, FailedPrivateCommitNeverPromotesInvocation) {
 	for (MaterialExportFault Fault : {MaterialExportFault::Create,
 		MaterialExportFault::Write,

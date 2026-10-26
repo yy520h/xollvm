@@ -38,6 +38,8 @@ if(NOT DEFINED LLVM_MAIN_SRC_DIR)
   add_definitions(${LLVM_DEFINITIONS})
 endif()
 
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+
 
 # ---------------------------------------------------------------------------
 # AES stub prerequisites (both modes)
@@ -127,6 +129,9 @@ set(OBF_SOURCES
   VMPass_Nested.cpp
   VMPass_Wrapper.cpp
   VMPass_Decoys.cpp
+  runtime/cloud_material/dynamic_vm_schema.cpp
+  runtime/cloud_material/dynamic_vm_artifact.cpp
+  runtime/cloud_material/dynamic_vm_shard.cpp
   AntiDebug.cpp
   EHUtils.cpp
   TargetCompat.cpp
@@ -196,6 +201,12 @@ add_llvm_pass_plugin(Obfuscator
   ${_OBF_DEPENDS}
   ${_OBF_LINK_COMPONENTS}
 )
+target_compile_features(Obfuscator PRIVATE cxx_std_20)
+target_link_libraries(Obfuscator PRIVATE OpenSSL::Crypto)
+if(TARGET obj.Obfuscator)
+  target_compile_features(obj.Obfuscator PRIVATE cxx_std_20)
+  target_link_libraries(obj.Obfuscator PRIVATE OpenSSL::Crypto)
+endif()
 
 # The AES stub .inc must be generated before any obfuscator source that
 # includes it is compiled. Under LINK_INTO_TOOLS add_llvm_pass_plugin compiles
@@ -266,6 +277,7 @@ if(LLVM_INCLUDE_TESTS AND DEFINED LLVM_MAIN_SRC_DIR)
     VMWhiteBoxAES.cpp
     VMPass_WhiteBox.cpp
   )
+  target_link_libraries(VMRequirementsTests PRIVATE OpenSSL::Crypto)
   add_dependencies(VMRequirementsTests xollvm-cloud-material-fs-helper)
   target_compile_definitions(VMRequirementsTests PRIVATE OBF_TEST_VM_IMPL=1)
   if(XOLLVM_ENABLE_MATERIAL_PACKAGE_TEST_BRIDGE)

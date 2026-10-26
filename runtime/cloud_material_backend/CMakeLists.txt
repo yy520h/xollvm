@@ -51,6 +51,29 @@ add_library(xovm-cloud-material-backend
     runtime_admin.cpp
     protocol_service.cpp
     response_crypto.cpp
+     ../cloud_material/raw_protocol.cpp
+     ../cloud_material/raw_frame.cpp
+     ../cloud_material/raw_client_session.cpp
+     ../cloud_material/raw_client_transport.cpp
+     ../cloud_material/raw_socket_syscall_aarch64.cpp
+    ../cloud_material/raw_socket_transport.cpp
+     raw_server.cpp
+     raw_session.cpp
+     raw_window_acquisition_service.cpp
+     raw_api_dispatch.cpp
+     cloud_api.cpp
+    ../cloud_material/dynamic_vm_schema.cpp
+    ../cloud_material/dynamic_vm_crypto.cpp
+     ../cloud_material/dynamic_vm_artifact.cpp
+     ../cloud_material/dynamic_vm_shard.cpp
+     ../cloud_material/dynamic_vm_window_provider.cpp
+     ../cloud_material/dynamic_vm_runtime.cpp
+    ../cloud_material/guardian_channel.cpp
+    ../cloud_material/launcher.cpp
+    ../cloud_material/jit_handler_buffer.cpp
+    ../cloud_material/chaff_scheduler.cpp
+     ../cloud_material/continuation_executor.cpp
+     ../cloud_material/integrity_state.cpp
     ../cloud_material/material_package.cpp
     ../cloud_material/material_protocol.cpp)
 target_include_directories(xovm-cloud-material-backend PUBLIC
@@ -72,6 +95,11 @@ add_executable(xovm-cloud-material-backend-fixture-server
 target_link_libraries(xovm-cloud-material-backend-fixture-server PRIVATE
     xovm-cloud-material-backend)
 
+add_executable(xovm-cloud-material-raw-client-acceptance
+    ../../utils/CloudMaterialRawClientAcceptanceTest.cpp)
+target_link_libraries(xovm-cloud-material-raw-client-acceptance PRIVATE
+    xovm-cloud-material-backend)
+
 include(CTest)
 if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -80,11 +108,18 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/../../utils/test_cloud_material_backend_startup.py
             $<TARGET_FILE:xovm-cloud-material-backend-server>)
+    set_tests_properties(xovm-cloud-material-backend-process-startup
+        PROPERTIES ENVIRONMENT
+            "XOLLVM_CLOUD_MATERIAL_SOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
     add_test(NAME xovm-cloud-material-backend-provider-fixture
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/../../utils/test_cloud_material_backend_provider_fixture.py
-            $<TARGET_FILE:xovm-cloud-material-backend-fixture-server>)
+            $<TARGET_FILE:xovm-cloud-material-backend-fixture-server>
+            $<TARGET_FILE:xovm-cloud-material-raw-client-acceptance>)
+    set_tests_properties(xovm-cloud-material-backend-provider-fixture
+        PROPERTIES ENVIRONMENT
+            "XOLLVM_CLOUD_MATERIAL_SOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
     add_test(NAME xovm-cloud-material-backend-tls-proxy
         COMMAND ${Python3_EXECUTABLE}
@@ -110,6 +145,13 @@ if(BUILD_TESTING)
         xovm-cloud-material-backend)
     add_test(NAME xovm-cloud-material-service-tests
         COMMAND xovm-cloud-material-service-tests)
+
+    add_executable(xovm-cloud-material-raw-window-acquisition-tests
+        ../../utils/RawWindowAcquisitionServiceTest.cpp)
+    target_link_libraries(xovm-cloud-material-raw-window-acquisition-tests PRIVATE
+        xovm-cloud-material-backend)
+    add_test(NAME xovm-cloud-material-raw-window-acquisition-tests
+        COMMAND xovm-cloud-material-raw-window-acquisition-tests)
 
     add_executable(xovm-cloud-material-wal-tests
         ../../utils/CloudMaterialWalTest.cpp)

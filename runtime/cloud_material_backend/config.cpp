@@ -64,6 +64,12 @@ std::variant<BackendConfig, BackendError> BackendConfig::fromEnvironment(const L
             return BackendError{"config_invalid_port"};
         config.port = static_cast<std::uint16_t>(number);
     }
+    auto rawPort = lookup("XOVM_RAW_PORT");
+    if (!rawPort.empty()) {
+        if (!parseUnsigned(rawPort, number) || number > 65535)
+            return BackendError{"config_invalid_raw_port"};
+        config.raw_port = static_cast<std::uint16_t>(number);
+    }
     auto timeout = lookup("REQUEST_TIMEOUT_MS");
     if (!timeout.empty()) {
         if (!parseUnsigned(timeout, number) || number < 100 || number > 120000)

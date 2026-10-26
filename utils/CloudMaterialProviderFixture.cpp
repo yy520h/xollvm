@@ -22,6 +22,39 @@ std::string hex(std::span<const std::uint8_t> bytes) {
     return result;
 }
 
+std::variant<xovm::material::WindowMaterial, BackendError> buildWindowMaterial(
+    const xovm::material::WindowAcquireRequest &request) {
+    const auto encoded = xovm::material::encodeWindowAcquireRequest(request);
+    if (encoded.empty()) return BackendError{"window_material_unavailable"};
+
+    auto derive = [&encoded](std::uint8_t domain)
+        -> std::variant<std::array<std::uint8_t, 32>, BackendError> {
+        constexpr std::string_view label = "XOVM2/fixture-window-material";
+        std::vector<std::uint8_t> input(label.begin(), label.end());
+        input.push_back(0);
+        input.push_back(domain);
+        input.insert(input.end(), encoded.begin(), encoded.end());
+        std::array<std::uint8_t, 32> digest{};
+        unsigned digestSize = 0;
+        if (EVP_Digest(input.data(), input.size(), digest.data(), &digestSize,
+                       EVP_sha256(), nullptr) != 1 ||
+            digestSize != digest.size())
+            return BackendError{"window_material_unavailable"};
+        return digest;
+    };
+
+    xovm::material::WindowMaterial material{};
+    std::array<std::array<std::uint8_t, 32> *, 6> fields = {
+        &material.window, &material.permutation, &material.decode,
+        &material.chaff, &material.integrity, &material.jit};
+    for (std::uint8_t domain = 0; domain < fields.size(); ++domain) {
+        auto value = derive(domain);
+        if (const auto *error = std::get_if<BackendError>(&value)) return *error;
+        *fields[domain] = std::get<std::array<std::uint8_t, 32>>(std::move(value));
+    }
+    return material;
+}
+
 std::string packageHash(nlohmann::json package) {
     package.at("binding").erase("package_hash");
     const auto text = package.dump();
@@ -173,7 +206,52 @@ RuntimeProviderBundle provider(ProviderRole role) {
         result.authorize_admin = [](std::string_view, std::string_view, std::string_view,
                                    const std::string &) {
             return std::variant<AdminPrincipal, BackendError>(
-                AdminPrincipal{"fixture.software", {"build.publish", "build.revoke"}});
+                 AdminPrincipal{"fixture.software", {"build.publish", "build.revoke"}});
+        };
+        result.raw_api.announcement = [] {
+            AnnouncementResponse response;
+            response.announcement_id = "fixture-announcement";
+            response.version = 1;
+            response.priority = 1;
+            response.issued_at_ms = 1000;
+            response.expires_at_ms = 900000;
+            response.content = "fixture";
+            response.signature = {0x01};
+            return std::variant<AnnouncementResponse, CloudApiError>(std::move(response));
+        };
+        result.raw_api.update = [](std::string_view version) {
+            UpdateResponse response;
+            response.version = std::string(version);
+            response.artifact_hash.fill(0x22);
+            response.size = 4;
+            response.chunk_count = 1;
+            response.signature = {0x02};
+            return std::variant<UpdateResponse, CloudApiError>(std::move(response));
+        };
+        result.build_window_material = buildWindowMaterial;
+        result.raw_api.variables = [](std::string_view) {
+            RemoteVariablesResponse response;
+            response.version = 1;
+            response.expires_at_ms = 900000;
+            response.canonical_variables = {'f', 'i', 'x', 't', 'u', 'r', 'e'};
+            response.signature = {0x03};
+            return std::variant<RemoteVariablesResponse, CloudApiError>(std::move(response));
+        };
+        result.raw_api.account_login = [](std::string_view, std::span<const uint8_t>) {
+            LoginResponse response;
+            response.session_id.fill(0x44);
+            response.expires_at_ms = 900000;
+            response.generation = 1;
+            response.allowed_regions = {std::string(64, '2')};
+            return std::variant<LoginResponse, CloudApiError>(std::move(response));
+        };
+        result.raw_api.card_login = [](std::span<const uint8_t>, std::span<const uint8_t>) {
+            LoginResponse response;
+            response.session_id.fill(0x55);
+            response.expires_at_ms = 900000;
+            response.generation = 1;
+            response.allowed_regions = {std::string(64, '2')};
+            return std::variant<LoginResponse, CloudApiError>(std::move(response));
         };
         result.build_payload = [](const Request &request, const RequestFacts &facts,
                                   const BuildSnapshot &snapshot, SessionState::Transaction &tx) {

@@ -7,6 +7,8 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <nlohmann/json.hpp>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace {
@@ -35,6 +37,10 @@ bool expect(bool condition, const char *expression, int line) {
 std::filesystem::path pathFor(const char *name) {
     return std::filesystem::temp_directory_path() /
         (std::string("xovm-cloud-material-") + name + "-" + std::to_string(::getpid()) + ".wal");
+}
+
+std::filesystem::path quarantineFor(const std::filesystem::path &path) {
+    return path.parent_path() / (path.filename().string() + ".quarantine");
 }
 
 StateDelta delta(std::string_view value) {
@@ -125,7 +131,7 @@ TEST(wal_rejects_short_write_before_sync) {
     StateWal wal(path, std::move(hooks));
     auto result = wal.appendAndSync(1, delta("delta"), bytes("response"));
     EXPECT_TRUE(std::holds_alternative<BackendError>(result));
-    EXPECT_FALSE(synced);
+    EXPECT_TRUE(synced);
     std::filesystem::remove(path);
 }
 
@@ -137,6 +143,56 @@ TEST(wal_rejects_sync_failure) {
     StateWal wal(path, std::move(hooks));
     auto result = wal.appendAndSync(1, delta("delta"), bytes("response"));
     EXPECT_TRUE(std::holds_alternative<BackendError>(result));
+    std::filesystem::remove(path);
+}
+
+TEST(wal_sync_failure_with_unproven_rollback_quarantines_path) {
+    const auto path = pathFor("sync-rollback-failure");
+    std::filesystem::remove(path);
+    unsigned syncCalls = 0;
+    StateWal::IoHooks hooks;
+    hooks.sync = [&syncCalls](int) { return ++syncCalls <= 2 ? -1 : 0; };
+    StateWal wal(path, std::move(hooks));
+    auto failed = wal.appendAndSync(1, delta("delta"), bytes("response"));
+    EXPECT_TRUE(std::holds_alternative<BackendError>(failed));
+    if (const auto *error = std::get_if<BackendError>(&failed))
+        EXPECT_TRUE(error->code == "wal_rollback_failed");
+    EXPECT_TRUE(std::filesystem::exists(quarantineFor(path)));
+    StateWal restarted(path);
+    auto retry = restarted.appendAndSync(1, delta("delta"), bytes("response"));
+    EXPECT_TRUE(std::holds_alternative<BackendError>(retry));
+    if (const auto *error = std::get_if<BackendError>(&retry))
+        EXPECT_TRUE(error->code == "wal_quarantined");
+    const auto alias = path.parent_path() / "." / path.filename();
+    StateWal aliased(alias);
+    auto aliasRecovery = aliased.recover();
+    EXPECT_TRUE(std::holds_alternative<BackendError>(aliasRecovery));
+    if (const auto *error = std::get_if<BackendError>(&aliasRecovery))
+        EXPECT_TRUE(error->code == "wal_quarantined");
+    std::filesystem::remove(path);
+    std::filesystem::remove(quarantineFor(path));
+}
+
+TEST(wal_first_create_requires_parent_directory_sync) {
+    const auto path = pathFor("directory-sync-failure");
+    std::filesystem::remove(path);
+    unsigned syncCalls = 0;
+    bool secondSyncWasDirectory = false;
+    StateWal::IoHooks hooks;
+    hooks.sync = [&syncCalls, &secondSyncWasDirectory](int fd) {
+        ++syncCalls;
+        struct stat status{};
+        if (syncCalls == 2)
+            secondSyncWasDirectory = ::fstat(fd, &status) == 0 && S_ISDIR(status.st_mode);
+        return syncCalls == 2 ? -1 : 0;
+    };
+    StateWal wal(path, std::move(hooks));
+    auto failed = wal.appendAndSync(1, delta("delta"), bytes("response"));
+    EXPECT_TRUE(std::holds_alternative<BackendError>(failed));
+    EXPECT_TRUE(secondSyncWasDirectory);
+    EXPECT_TRUE(syncCalls == 4);
+    auto retry = wal.appendAndSync(1, delta("delta"), bytes("response"));
+    EXPECT_TRUE(std::holds_alternative<std::uint64_t>(retry));
     std::filesystem::remove(path);
 }
 
@@ -191,6 +247,36 @@ TEST(wal_truncates_partial_final_header) {
         EXPECT_TRUE(std::get<RecoveredState>(recovered).last_sequence == 1);
     EXPECT_TRUE(std::filesystem::file_size(path) == completeSize);
     std::filesystem::remove(path);
+}
+
+TEST(wal_partial_tail_repair_sync_failure_quarantines_path) {
+    const auto path = pathFor("partial-repair-sync-failure");
+    std::filesystem::remove(path);
+    {
+        StateWal wal(path);
+        EXPECT_TRUE(std::holds_alternative<std::uint64_t>(
+            wal.appendAndSync(1, delta("delta"), bytes("response"))));
+    }
+    {
+        std::ofstream file(path, std::ios::binary | std::ios::app);
+        const std::array<char, 3> partial{'X', 'W', 'A'};
+        file.write(partial.data(), partial.size());
+    }
+    StateWal::IoHooks hooks;
+    hooks.sync = [](int) { return -1; };
+    StateWal wal(path, std::move(hooks));
+    auto failed = wal.recover();
+    EXPECT_TRUE(std::holds_alternative<BackendError>(failed));
+    if (const auto *error = std::get_if<BackendError>(&failed))
+        EXPECT_TRUE(error->code == "wal_repair_failed");
+    EXPECT_TRUE(std::filesystem::exists(quarantineFor(path)));
+    StateWal restarted(path);
+    auto retry = restarted.recover();
+    EXPECT_TRUE(std::holds_alternative<BackendError>(retry));
+    if (const auto *error = std::get_if<BackendError>(&retry))
+        EXPECT_TRUE(error->code == "wal_quarantined");
+    std::filesystem::remove(path);
+    std::filesystem::remove(quarantineFor(path));
 }
 
 TEST(wal_truncates_partial_final_body) {
@@ -530,6 +616,235 @@ TEST(session_state_recovers_exact_cached_response_from_wal) {
     std::filesystem::remove(path);
 }
 
+TEST(session_state_restore_is_atomic_after_late_scalar_failure) {
+    const auto path = pathFor("session-atomic-restore");
+    std::filesystem::remove(path);
+    StateWal wal(path);
+    SessionState source(&wal);
+    RelayAuthenticator authenticator("wal-relay-credential-long-enough", 100000);
+    RequestFacts sourceFacts;
+    sourceFacts.request_id = std::string(64, '1');
+    sourceFacts.request_digest = std::string(64, '2');
+    sourceFacts.software_id = "source.software";
+    sourceFacts.build_id = std::string(64, '3');
+    sourceFacts.final_artifact_hash = std::string(64, '4');
+    sourceFacts.type = "session.open";
+    auto sourceGrant = std::get<AnonymousGrant>(authenticator.authenticate(
+        "wal-relay-credential-long-enough", sourceFacts, 1000));
+    EXPECT_TRUE(std::holds_alternative<StateResult>(source.transact(
+        sourceFacts, sourceGrant, 1000, [](SessionState::Transaction &tx) {
+            return tx.openSession("source-session", "source-epoch", 50000,
+                "source-server", "source-server-key", "source-client", "source-client-key");
+        })));
+    auto recovered = wal.recover();
+    EXPECT_TRUE(std::holds_alternative<RecoveredState>(recovered));
+    if (!std::holds_alternative<RecoveredState>(recovered)) {
+        std::filesystem::remove(path);
+        return;
+    }
+    auto corrupt = std::get<RecoveredState>(recovered);
+    const auto &originalBytes = corrupt.records.back().delta.bytes;
+    auto snapshot = nlohmann::json::parse(
+        reinterpret_cast<const char *>(originalBytes.data()),
+        reinterpret_cast<const char *>(originalBytes.data() + originalBytes.size()));
+    snapshot["next_counter"] = "not-an-unsigned-counter";
+    corrupt.records.back().delta = delta(snapshot.dump());
+
+    const auto rejectsSnapshot = [&](nlohmann::json forgedSnapshot) {
+        auto forged = std::get<RecoveredState>(recovered);
+        forged.records.back().delta = delta(forgedSnapshot.dump());
+        SessionState target;
+        return std::holds_alternative<BackendError>(target.restore(forged));
+    };
+    auto staleCounter = snapshot;
+    staleCounter["next_counter"] = 1;
+    EXPECT_TRUE(rejectsSnapshot(staleCounter));
+    auto exhaustedCounter = snapshot;
+    exhaustedCounter["next_counter"] = UINT64_MAX;
+    EXPECT_TRUE(rejectsSnapshot(exhaustedCounter));
+    auto exhaustedGeneration = snapshot;
+    exhaustedGeneration["next_counter"] = 2;
+    exhaustedGeneration["generations"]["scope"] = UINT64_MAX;
+    EXPECT_TRUE(rejectsSnapshot(exhaustedGeneration));
+
+    SessionState destination;
+    auto destinationFacts = sourceFacts;
+    destinationFacts.software_id = "destination.software";
+    destinationFacts.request_id = std::string(64, '5');
+    destinationFacts.request_digest = std::string(64, '6');
+    auto destinationGrant = std::get<AnonymousGrant>(authenticator.authenticate(
+        "wal-relay-credential-long-enough", destinationFacts, 1000));
+    EXPECT_TRUE(std::holds_alternative<StateResult>(destination.transact(
+        destinationFacts, destinationGrant, 1000, [](SessionState::Transaction &tx) {
+            return tx.openSession("destination-session", "destination-epoch", 50000,
+                "destination-server", "destination-server-key",
+                "destination-client", "destination-client-key");
+        })));
+    auto restored = destination.restore(corrupt);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(restored));
+
+    auto issueFacts = destinationFacts;
+    issueFacts.type = "material.issue";
+    issueFacts.region_id = std::string(64, '7');
+    issueFacts.mode = "lease";
+    issueFacts.request_id = std::string(64, '8');
+    issueFacts.request_digest = std::string(64, '9');
+    auto issueGrant = std::get<AnonymousGrant>(authenticator.authenticate(
+        "wal-relay-credential-long-enough", issueFacts, 1000));
+    auto issued = destination.transact(issueFacts, issueGrant, 1000,
+        [&](SessionState::Transaction &tx) {
+            return tx.allocate("destination-session", issueFacts.region_id,
+                               "destination-nonce", "destination-key");
+        });
+    EXPECT_TRUE(std::holds_alternative<StateResult>(issued));
+    std::filesystem::remove(path);
+}
+
+TEST(session_state_restore_recomputes_retained_bytes) {
+    const auto path = pathFor("session-retained-recompute");
+    std::filesystem::remove(path);
+    StateWal wal(path);
+    SessionState source(&wal);
+    RelayAuthenticator authenticator("wal-relay-credential-long-enough", 100000);
+    RequestFacts openFacts;
+    openFacts.request_id = std::string(64, '1');
+    openFacts.request_digest = std::string(64, '2');
+    openFacts.software_id = "test.software";
+    openFacts.build_id = std::string(64, '3');
+    openFacts.final_artifact_hash = std::string(64, '4');
+    openFacts.type = "session.open";
+    auto grant = std::get<AnonymousGrant>(authenticator.authenticate(
+        "wal-relay-credential-long-enough", openFacts, 1000));
+    EXPECT_TRUE(std::holds_alternative<StateResult>(source.transact(
+        openFacts, grant, 1000, [](SessionState::Transaction &tx) {
+            return tx.openSession("session-id", "epoch-id", 50000,
+                "server-nonce", "server-key", "client-nonce", "client-key");
+        })));
+    auto recovered = wal.recover();
+    EXPECT_TRUE(std::holds_alternative<RecoveredState>(recovered));
+    if (!std::holds_alternative<RecoveredState>(recovered)) {
+        std::filesystem::remove(path);
+        return;
+    }
+    auto forged = std::get<RecoveredState>(recovered);
+    const auto &originalBytes = forged.records.back().delta.bytes;
+    auto snapshot = nlohmann::json::parse(
+        reinterpret_cast<const char *>(originalBytes.data()),
+        reinterpret_cast<const char *>(originalBytes.data() + originalBytes.size()));
+    snapshot["retained_bytes"] = 0;
+    snapshot["claims"] = nlohmann::json::object();
+    for (unsigned index = 0; index < 2051; ++index) {
+        const auto prefix = std::to_string(index) + ":";
+        snapshot["claims"][prefix + std::string(4096 - prefix.size(), 'k')] = "v";
+    }
+    forged.records.back().delta = delta(snapshot.dump());
+    SessionState destination;
+    auto restored = destination.restore(forged);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(restored));
+    if (const auto *error = std::get_if<BackendError>(&restored))
+        EXPECT_TRUE(error->code == "state_capacity");
+    std::filesystem::remove(path);
+}
+
+TEST(session_window_chain_survives_wal_failure_and_recovery) {
+    const auto path = pathFor("window-chain-recovery");
+    std::filesystem::remove(path);
+    unsigned syncCalls = 0;
+    StateWal::IoHooks hooks;
+    // The first append syncs both the new file and its parent directory. Fail
+    // the following window append's file sync, then allow its rollback sync.
+    hooks.sync = [&syncCalls](int) { return ++syncCalls == 3 ? -1 : 0; };
+    StateWal wal(path, std::move(hooks));
+    SessionState sessions(&wal);
+    RelayAuthenticator authenticator("wal-relay-credential-long-enough", 100000);
+    RequestFacts openFacts;
+    openFacts.request_id = std::string(64, '1');
+    openFacts.request_digest = std::string(64, '2');
+    openFacts.software_id = "test.software";
+    openFacts.build_id = std::string(64, '3');
+    openFacts.final_artifact_hash = std::string(64, '4');
+    openFacts.type = "session.open";
+    auto openGrant = std::get<AnonymousGrant>(authenticator.authenticate(
+        "wal-relay-credential-long-enough", openFacts, 1000));
+    auto opened = sessions.transact(openFacts, openGrant, 1000,
+        [](SessionState::Transaction &tx) {
+            return tx.openSession("window-session", "window-epoch", 50000,
+                                  "server-window", "server-window-key",
+                                  "client-window", "client-window-key");
+        });
+    EXPECT_TRUE(std::holds_alternative<StateResult>(opened));
+
+    auto issueFacts = openFacts;
+    issueFacts.type = "material.issue";
+    issueFacts.region_id = std::string(64, '5');
+    issueFacts.mode = "lease";
+    const auto advance = [&](SessionState &state, RequestFacts request, std::uint64_t window,
+                             std::string previous, std::string next, std::string response) {
+        auto grant = std::get<AnonymousGrant>(authenticator.authenticate(
+            "wal-relay-credential-long-enough", request, 1000));
+        return state.transact(request, grant, 1000,
+            [&, window, previous = std::move(previous), next = std::move(next),
+             response = std::move(response)](SessionState::Transaction &tx) mutable {
+                WindowAdvanceInput input;
+                input.session_id = "window-session";
+                input.region_id = issueFacts.region_id;
+                input.generation = 9;
+                input.window_id = window;
+                input.previous_state = std::move(previous);
+                input.next_state = std::move(next);
+                input.expires_at_ms = 40000;
+                input.encoded_response = bytes(response);
+                WindowPreflightInput preflight;
+                preflight.session_id = input.session_id;
+                preflight.region_id = input.region_id;
+                preflight.generation = input.generation;
+                preflight.window_id = input.window_id;
+                preflight.previous_state = input.previous_state;
+                preflight.expires_at_ms = input.expires_at_ms;
+                tx.preflightWindow(std::move(preflight));
+                return tx.finalizeWindow(WindowFinalizeInput{
+                    std::move(input.next_state), std::move(input.encoded_response)});
+            });
+    };
+
+    issueFacts.request_id = std::string(64, '6');
+    issueFacts.request_digest = std::string(64, '7');
+    auto failed = advance(sessions, issueFacts, 1, "genesis", "state-one", "failed-response");
+    EXPECT_TRUE(std::holds_alternative<BackendError>(failed));
+
+    auto committedFacts = issueFacts;
+    committedFacts.request_id = std::string(64, '8');
+    committedFacts.request_digest = std::string(64, '9');
+    auto committed = advance(sessions, committedFacts, 1, "genesis", "state-one", "exact-window-one");
+    EXPECT_TRUE(std::holds_alternative<StateResult>(committed));
+
+    auto recovered = wal.recover();
+    EXPECT_TRUE(std::holds_alternative<RecoveredState>(recovered));
+    SessionState restarted(&wal);
+    if (std::holds_alternative<RecoveredState>(recovered))
+        EXPECT_TRUE(std::holds_alternative<std::monostate>(
+            restarted.restore(std::get<RecoveredState>(recovered))));
+    bool retryCalled = false;
+    auto committedGrant = std::get<AnonymousGrant>(authenticator.authenticate(
+        "wal-relay-credential-long-enough", committedFacts, 1000));
+    auto retry = restarted.transact(committedFacts, committedGrant, 1000,
+        [&](SessionState::Transaction &) {
+            retryCalled = true;
+            return StateResult{};
+        });
+    EXPECT_FALSE(retryCalled);
+    EXPECT_TRUE(std::holds_alternative<StateResult>(retry));
+    if (std::holds_alternative<StateResult>(retry))
+        EXPECT_TRUE(std::get<StateResult>(retry).response == bytes("exact-window-one"));
+
+    auto secondFacts = issueFacts;
+    secondFacts.request_id = std::string(64, 'a');
+    secondFacts.request_digest = std::string(64, 'b');
+    auto second = advance(restarted, secondFacts, 2, "state-one", "state-two", "exact-window-two");
+    EXPECT_TRUE(std::holds_alternative<StateResult>(second));
+    std::filesystem::remove(path);
+}
+
 TEST(session_state_does_not_publish_when_wal_sync_fails) {
     const auto path = pathFor("session-sync-failure");
     std::filesystem::remove(path);
@@ -564,6 +879,158 @@ TEST(session_state_does_not_publish_when_wal_sync_fails) {
     std::filesystem::remove(path);
 }
 
+TEST(raw_session_registration_wal_failure_does_not_publish) {
+    const auto path = pathFor("raw-registration-sync-failure");
+    std::filesystem::remove(path);
+    StateWal::IoHooks hooks;
+    hooks.sync = [](int) { return -1; };
+    StateWal wal(path, std::move(hooks));
+    SessionState sessions(&wal);
+    RequestFacts facts;
+    facts.request_id = std::string(32, '1');
+    facts.request_digest = std::string(64, '2');
+    facts.software_id = "test.software";
+    facts.build_id = std::string(64, '3');
+    facts.final_artifact_hash = std::string(64, '4');
+    facts.type = "session.open";
+    RelayAuthenticator authenticator("wal-relay-credential-long-enough", 100000);
+    const auto grant = std::get<AnonymousGrant>(authenticator.authenticate(
+        "wal-relay-credential-long-enough", facts, 1000));
+    const RawSessionRegistrationInput input{std::string(64, '5'), std::string(64, '6')};
+    unsigned callbacks = 0;
+    const auto build = [&](std::uint64_t counter)
+        -> std::variant<RawSessionMetadata, BackendError> {
+        ++callbacks;
+        EXPECT_TRUE(counter == 1);
+        return RawSessionMetadata{std::string(32, '7'), std::string(64, '8'),
+            std::string(64, '9'), std::string(64, 'a'), 1, 50000};
+    };
+    auto failed = sessions.registerRawSession(facts, grant, 1000, input, build);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(failed));
+    auto retry = sessions.registerRawSession(facts, grant, 1000, input, build);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(retry));
+    EXPECT_TRUE(callbacks == 2);
+    std::filesystem::remove(path);
+}
+
+TEST(session_state_restore_rejects_invalid_sequence_metadata) {
+    SessionState state;
+    RecoveredState emptyWithBase;
+    emptyWithBase.last_sequence = 1;
+    EXPECT_TRUE(std::holds_alternative<BackendError>(state.restore(emptyWithBase)));
+
+    RecoveredState mismatched;
+    mismatched.last_sequence = 2;
+    mismatched.records.push_back(WalRecord{1, delta("{}"), {}});
+    EXPECT_TRUE(std::holds_alternative<BackendError>(state.restore(mismatched)));
+
+    RecoveredState exhausted;
+    exhausted.last_sequence = UINT64_MAX;
+    exhausted.records.push_back(WalRecord{UINT64_MAX, delta("{}"), {}});
+    EXPECT_TRUE(std::holds_alternative<BackendError>(state.restore(exhausted)));
+
+    RecoveredState initial;
+    EXPECT_TRUE(std::holds_alternative<std::monostate>(state.restore(initial)));
+}
+
+TEST(raw_session_registration_recovers_fresh_replay_fence_without_secrets) {
+    const auto path = pathFor("raw-registration-recovery");
+    std::filesystem::remove(path);
+    StateWal wal(path);
+    SessionState sessions(&wal);
+    RequestFacts facts;
+    facts.request_id = std::string(32, '1');
+    facts.request_digest = std::string(64, '2');
+    facts.software_id = "test.software";
+    facts.build_id = std::string(64, '3');
+    facts.final_artifact_hash = std::string(64, '4');
+    facts.type = "session.open";
+    RelayAuthenticator authenticator("wal-relay-credential-long-enough", 100000);
+    const auto grant = std::get<AnonymousGrant>(authenticator.authenticate(
+        "wal-relay-credential-long-enough", facts, 1000));
+    const RawSessionRegistrationInput input{std::string(64, '5'), std::string(64, '6')};
+    constexpr std::string_view privateSentinel = "PRIVATE-KEY-MUST-NOT-BE-DURABLE";
+    auto registered = sessions.registerRawSession(
+        facts, grant, 1000, input, [&](std::uint64_t counter)
+            -> std::variant<RawSessionMetadata, BackendError> {
+            EXPECT_TRUE(counter == 1);
+            (void)privateSentinel;
+            return RawSessionMetadata{std::string(32, '7'), std::string(64, '8'),
+                std::string(64, '9'), std::string(64, 'a'), 1, 50000};
+        });
+    EXPECT_TRUE(std::holds_alternative<RawSessionRegistrationResult>(registered));
+
+    auto recovered = wal.recover();
+    EXPECT_TRUE(std::holds_alternative<RecoveredState>(recovered));
+    if (const auto *state = std::get_if<RecoveredState>(&recovered)) {
+        EXPECT_TRUE(state->records.size() == 1);
+        EXPECT_TRUE(state->records.back().response.empty());
+        const auto &payload = state->records.back().delta.bytes;
+        const std::string serialized(reinterpret_cast<const char *>(payload.data()), payload.size());
+        EXPECT_TRUE(serialized.find(privateSentinel) == std::string::npos);
+        EXPECT_TRUE(serialized.find("hello") == std::string::npos);
+
+        const auto snapshot = nlohmann::json::parse(serialized);
+        const auto rejectsSnapshot = [&](nlohmann::json forgedSnapshot) {
+            auto forged = *state;
+            forged.records.back().delta = delta(forgedSnapshot.dump());
+            SessionState target;
+            return std::holds_alternative<BackendError>(target.restore(forged));
+        };
+        const auto requestKey = facts.software_id + ":" + facts.build_id + ":" +
+            facts.final_artifact_hash + ":" + facts.request_id;
+        const auto clientNonceClaim = "client_nonce:" + facts.build_id + ":" + input.client_nonce;
+        const auto clientKeyClaim =
+            "client_key:" + facts.build_id + ":" + input.client_ephemeral_key;
+        const auto serverNonceClaim = "server_nonce:" + facts.build_id + ":" +
+            std::string(64, '8');
+        const auto serverKeyClaim = "server_key:" + facts.build_id + ":" +
+            std::string(64, '9');
+
+        auto legacyBinding = snapshot;
+        legacyBinding["raw_registrations"][requestKey].erase("session_id");
+        EXPECT_TRUE(rejectsSnapshot(std::move(legacyBinding)));
+        auto missingSession = snapshot;
+        missingSession["raw_registrations"][requestKey]["session_id"] = std::string(32, 'b');
+        EXPECT_TRUE(rejectsSnapshot(std::move(missingSession)));
+        auto mismatchedIdentity = snapshot;
+        mismatchedIdentity["sessions"][std::string(32, '7')]["subject_id"] = "wrong-subject";
+        EXPECT_TRUE(rejectsSnapshot(std::move(mismatchedIdentity)));
+        auto orphanedRawSession = snapshot;
+        orphanedRawSession["raw_registrations"].erase(requestKey);
+        EXPECT_TRUE(rejectsSnapshot(std::move(orphanedRawSession)));
+        for (const auto &claimKey : {clientNonceClaim, clientKeyClaim,
+                                     serverNonceClaim, serverKeyClaim}) {
+            auto missingClaim = snapshot;
+            missingClaim["claims"].erase(claimKey);
+            EXPECT_TRUE(rejectsSnapshot(std::move(missingClaim)));
+            auto mismatchedClaim = snapshot;
+            mismatchedClaim["claims"][claimKey] = std::string(64, 'c');
+            EXPECT_TRUE(rejectsSnapshot(std::move(mismatchedClaim)));
+        }
+        auto staleCounter = snapshot;
+        staleCounter["next_counter"] = 1;
+        EXPECT_TRUE(rejectsSnapshot(std::move(staleCounter)));
+        auto exhaustedCounter = snapshot;
+        exhaustedCounter["next_counter"] = UINT64_MAX;
+        EXPECT_TRUE(rejectsSnapshot(std::move(exhaustedCounter)));
+
+        SessionState restarted(&wal);
+        EXPECT_TRUE(std::holds_alternative<std::monostate>(restarted.restore(*state)));
+        bool called = false;
+        auto replay = restarted.registerRawSession(
+            facts, grant, 1000, input, [&](std::uint64_t)
+                -> std::variant<RawSessionMetadata, BackendError> {
+                called = true;
+                return BackendError{"unexpected_callback"};
+            });
+        EXPECT_FALSE(called);
+        const auto *error = std::get_if<BackendError>(&replay);
+        EXPECT_TRUE(error && error->code == "replay_detected");
+    }
+    std::filesystem::remove(path);
+}
+
 template <typename Test>
 void run(const char *name, Test test) {
     const unsigned before = state.failures;
@@ -582,11 +1049,17 @@ int main() {
     run("wal_rejects_record_over_limit", wal_rejects_record_over_limit);
     run("wal_rejects_short_write_before_sync", wal_rejects_short_write_before_sync);
     run("wal_rejects_sync_failure", wal_rejects_sync_failure);
+    run("wal_sync_failure_with_unproven_rollback_quarantines_path",
+        wal_sync_failure_with_unproven_rollback_quarantines_path);
+    run("wal_first_create_requires_parent_directory_sync",
+        wal_first_create_requires_parent_directory_sync);
     run("wal_sync_failure_rolls_back_uncommitted_frame_for_retry",
         wal_sync_failure_rolls_back_uncommitted_frame_for_retry);
     run("wal_rejects_complete_checksum_corruption",
         wal_rejects_complete_checksum_corruption);
     run("wal_truncates_partial_final_header", wal_truncates_partial_final_header);
+    run("wal_partial_tail_repair_sync_failure_quarantines_path",
+        wal_partial_tail_repair_sync_failure_quarantines_path);
     run("wal_truncates_partial_final_body", wal_truncates_partial_final_body);
     run("wal_rejects_interior_corruption", wal_rejects_interior_corruption);
     run("checkpoint_round_trips_and_retires_covered_wal",
@@ -609,9 +1082,21 @@ int main() {
     run("wal_continues_after_checkpoint_sequence", wal_continues_after_checkpoint_sequence);
     run("session_state_recovers_exact_cached_response_from_wal",
         session_state_recovers_exact_cached_response_from_wal);
+    run("session_state_restore_is_atomic_after_late_scalar_failure",
+        session_state_restore_is_atomic_after_late_scalar_failure);
+    run("session_state_restore_recomputes_retained_bytes",
+        session_state_restore_recomputes_retained_bytes);
+    run("session_window_chain_survives_wal_failure_and_recovery",
+        session_window_chain_survives_wal_failure_and_recovery);
     run("session_state_does_not_publish_when_wal_sync_fails",
         session_state_does_not_publish_when_wal_sync_fails);
-    std::fprintf(stdout, "22 tests, %u assertions, %u failures\n",
+    run("raw_session_registration_wal_failure_does_not_publish",
+        raw_session_registration_wal_failure_does_not_publish);
+    run("session_state_restore_rejects_invalid_sequence_metadata",
+        session_state_restore_rejects_invalid_sequence_metadata);
+    run("raw_session_registration_recovers_fresh_replay_fence_without_secrets",
+        raw_session_registration_recovers_fresh_replay_fence_without_secrets);
+    std::fprintf(stdout, "31 tests, %u assertions, %u failures\n",
                  state.assertions, state.failures);
     return state.failures == 0 ? 0 : 1;
 }

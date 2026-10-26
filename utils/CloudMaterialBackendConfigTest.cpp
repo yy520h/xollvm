@@ -89,6 +89,7 @@ TEST(config_rejects_unsafe_bind_and_bounds) {
     auto badPort = parse(values);
     EXPECT_TRUE(std::holds_alternative<BackendError>(badPort));
     values["PORT"] = "8080";
+    values["XOVM_RAW_PORT"] = "18080";
     values["REQUEST_TIMEOUT_MS"] = "99";
     auto badTimeout = parse(values);
     EXPECT_TRUE(std::holds_alternative<BackendError>(badTimeout));
@@ -105,6 +106,7 @@ TEST(config_accepts_loopback_defaults) {
         const auto &config = std::get<BackendConfig>(result);
         EXPECT_TRUE(config.bind_address == "127.0.0.1");
         EXPECT_TRUE(config.port == 8080);
+        EXPECT_TRUE(config.raw_port == 0);
         EXPECT_TRUE(config.request_timeout_ms == 10000);
         EXPECT_TRUE(config.max_concurrent_requests == 128);
     }
