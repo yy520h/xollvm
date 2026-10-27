@@ -27,11 +27,17 @@ struct DecryptedVmArtifact {
 };
 
 std::optional<EncryptedVmArtifact> buildEncryptedVmArtifact(const ArtifactSource &source);
+DynamicHash computeEncryptedVmArtifactHash(const EncryptedVmArtifact &artifact);
+bool validateEncryptedVmArtifactMetadata(const EncryptedVmArtifact &artifact,
+                                         const DynamicHash &build_id,
+                                         const DynamicHash &region_id,
+                                         const DynamicHash &expected_artifact_hash);
 std::optional<DecryptedVmArtifact> decryptEncryptedVmArtifact(
     const EncryptedVmArtifact &artifact,
     std::span<const uint8_t, 32> artifact_key,
     const DynamicHash &build_id,
-    const DynamicHash &region_id);
+    const DynamicHash &region_id,
+    const DynamicHash &expected_artifact_hash);
 void secureClear(DecryptedVmArtifact &artifact);
 
 } // namespace xovm::material

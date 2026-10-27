@@ -207,19 +207,6 @@ StateResult SessionState::Transaction::finalizeWindow(WindowFinalizeInput input)
                        .valid_until_ms = preflight.expires_at_ms};
 }
 
-StateResult SessionState::Transaction::advanceWindow(WindowAdvanceInput input) {
-    WindowPreflightInput preflight;
-    preflight.session_id = std::move(input.session_id);
-    preflight.region_id = std::move(input.region_id);
-    preflight.generation = input.generation;
-    preflight.window_id = input.window_id;
-    preflight.previous_state = std::move(input.previous_state);
-    preflight.expires_at_ms = input.expires_at_ms;
-    preflightWindow(std::move(preflight));
-    return finalizeWindow(WindowFinalizeInput{
-        std::move(input.next_state), std::move(input.encoded_response)});
-}
-
 StateResult SessionState::Transaction::openSession(
     const std::string &sessionId, const std::string &counterEpoch,
     std::uint64_t validUntilMs, const std::string &serverNonce,

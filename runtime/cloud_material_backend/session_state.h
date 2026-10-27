@@ -41,10 +41,6 @@ struct WindowFinalizeInput {
     std::vector<std::byte> encoded_response;
 };
 
-// Temporary source compatibility for the acquisition service while it migrates
-// to explicit preflight/finalize calls.
-struct WindowAdvanceInput : WindowPreflightInput, WindowFinalizeInput {};
-
 // All values are canonical lowercase hex except software/build identity carried
 // by RequestFacts. Private keys, derived keys, and encoded hello bytes never
 // cross this state boundary.
@@ -105,7 +101,6 @@ public:
                                 const std::string &serverEphemeralKey);
         void preflightWindow(WindowPreflightInput input);
         StateResult finalizeWindow(WindowFinalizeInput input);
-        StateResult advanceWindow(WindowAdvanceInput input);
         void setResponse(std::vector<std::byte> response) { response_ = std::move(response); }
     private:
         friend class SessionState;

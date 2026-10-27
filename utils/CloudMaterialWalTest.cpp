@@ -785,25 +785,16 @@ TEST(session_window_chain_survives_wal_failure_and_recovery) {
         return state.transact(request, grant, 1000,
             [&, window, previous = std::move(previous), next = std::move(next),
              response = std::move(response)](SessionState::Transaction &tx) mutable {
-                WindowAdvanceInput input;
-                input.session_id = "window-session";
-                input.region_id = issueFacts.region_id;
-                input.generation = 9;
-                input.window_id = window;
-                input.previous_state = std::move(previous);
-                input.next_state = std::move(next);
-                input.expires_at_ms = 40000;
-                input.encoded_response = bytes(response);
                 WindowPreflightInput preflight;
-                preflight.session_id = input.session_id;
-                preflight.region_id = input.region_id;
-                preflight.generation = input.generation;
-                preflight.window_id = input.window_id;
-                preflight.previous_state = input.previous_state;
-                preflight.expires_at_ms = input.expires_at_ms;
+                preflight.session_id = "window-session";
+                preflight.region_id = issueFacts.region_id;
+                preflight.generation = 9;
+                preflight.window_id = window;
+                preflight.previous_state = std::move(previous);
+                preflight.expires_at_ms = 40000;
                 tx.preflightWindow(std::move(preflight));
                 return tx.finalizeWindow(WindowFinalizeInput{
-                    std::move(input.next_state), std::move(input.encoded_response)});
+                    std::move(next), bytes(response)});
             });
     };
 

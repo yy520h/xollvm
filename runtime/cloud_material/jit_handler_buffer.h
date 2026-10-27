@@ -21,8 +21,12 @@ public:
     bool sealExecutable();
     bool makeWritable();
     bool scrub();
+    // Returns the mapping to RW, scrubs it, and only then releases ownership.
+    // On a protection or unmap failure the mapping remains owned for retry.
+    bool close();
     bool isWritable() const { return writable_; }
     bool isExecutable() const { return executable_; }
+    bool isClosed() const { return address_ == nullptr; }
     void *address() const { return address_; }
 
 private:

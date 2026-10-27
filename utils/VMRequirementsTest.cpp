@@ -1299,7 +1299,7 @@ TEST(VMCloudMaterial, DirectEmissionIsGuardedBeforeLegacyGlobals) {
 TEST(VMCloudMaterial, CoordinatorPreparesAndPromotesDynamicArtifactWithoutLegacyEmission) {
 	LLVMContext C; SMDiagnostic D;
 	auto M = parseAssemblyString("target triple = \"aarch64-unknown-linux-android26\"\n"
-		"define i32 @f(i32 %x) { %r = add i32 %x,7\n ret i32 %r }", D, C);
+		"define i32 @f() { ret i32 7 }", D, C);
 	ASSERT_NE(M, nullptr) << D.getMessage().str();
 	auto Config = materialConfig("cloudMaterial=lease,materialRegion=auth");
 	obf::Rng R(42);

@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Version floors require confirmation against the deployment host package set.
 find_package(SQLite3 3.35 REQUIRED)
 find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+add_subdirectory("../cloud_material" "${CMAKE_CURRENT_BINARY_DIR}/dynamic_vm_runtime")
 set(XOLLVM_PROJECT_ROOT "$ENV{XOLLVM_PROJECT_ROOT}" CACHE PATH
     "Project root containing demo/jni/zone_runtime/Core/nlohmann/json.hpp")
 find_package(nlohmann_json 3.10 QUIET)
@@ -62,18 +63,10 @@ add_library(xovm-cloud-material-backend
      raw_window_acquisition_service.cpp
      raw_api_dispatch.cpp
      cloud_api.cpp
-    ../cloud_material/dynamic_vm_schema.cpp
     ../cloud_material/dynamic_vm_crypto.cpp
-     ../cloud_material/dynamic_vm_artifact.cpp
-     ../cloud_material/dynamic_vm_shard.cpp
-     ../cloud_material/dynamic_vm_window_provider.cpp
-     ../cloud_material/dynamic_vm_runtime.cpp
     ../cloud_material/guardian_channel.cpp
     ../cloud_material/launcher.cpp
-    ../cloud_material/jit_handler_buffer.cpp
     ../cloud_material/chaff_scheduler.cpp
-     ../cloud_material/continuation_executor.cpp
-     ../cloud_material/integrity_state.cpp
     ../cloud_material/material_package.cpp
     ../cloud_material/material_protocol.cpp)
 target_include_directories(xovm-cloud-material-backend PUBLIC
@@ -82,7 +75,8 @@ target_include_directories(xovm-cloud-material-backend PUBLIC
 target_link_libraries(xovm-cloud-material-backend PUBLIC
     SQLite3::SQLite3
     OpenSSL::Crypto
-    nlohmann_json::nlohmann_json)
+    nlohmann_json::nlohmann_json
+    xovm::dynamic-vm-runtime)
 
 add_executable(xovm-cloud-material-backend-server
     main.cpp)

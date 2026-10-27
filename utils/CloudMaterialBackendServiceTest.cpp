@@ -386,27 +386,18 @@ TEST(raw_session_registration_is_fresh_only_and_anchors_genesis) {
     issue.request_digest = std::string(64, 'e');
     const auto issueGrant = std::get<AnonymousGrant>(issuer.authenticate(
         "test-relay-credential-that-is-long-enough", issue, 1000));
-    WindowAdvanceInput wrong;
+    WindowPreflightInput wrong;
     wrong.session_id = std::string(32, '8');
     wrong.region_id = kRegion;
     wrong.generation = 7;
     wrong.window_id = 1;
     wrong.previous_state = std::string(64, 'c');
-    wrong.next_state = std::string(64, 'd');
     wrong.expires_at_ms = 1800;
-    wrong.encoded_response = {std::byte{1}};
+    WindowFinalizeInput wrongFinalize{std::string(64, 'd'), {std::byte{1}}};
     auto rejected = sessions.transact(issue, issueGrant, 1000,
-        [wrong](SessionState::Transaction &tx) mutable {
-            WindowPreflightInput preflight;
-            preflight.session_id = wrong.session_id;
-            preflight.region_id = wrong.region_id;
-            preflight.generation = wrong.generation;
-            preflight.window_id = wrong.window_id;
-            preflight.previous_state = wrong.previous_state;
-            preflight.expires_at_ms = wrong.expires_at_ms;
-            tx.preflightWindow(std::move(preflight));
-            return tx.finalizeWindow(WindowFinalizeInput{
-                std::move(wrong.next_state), std::move(wrong.encoded_response)});
+        [wrong, wrongFinalize](SessionState::Transaction &tx) mutable {
+            tx.preflightWindow(std::move(wrong));
+            return tx.finalizeWindow(std::move(wrongFinalize));
         });
     EXPECT_TRUE(hasError(rejected, "window_chain_mismatch"));
 
@@ -416,17 +407,9 @@ TEST(raw_session_registration_is_fresh_only_and_anchors_genesis) {
         "test-relay-credential-that-is-long-enough", issue, 1000));
     wrong.previous_state = std::string(64, 'b');
     auto anchored = sessions.transact(issue, anchoredGrant, 1000,
-        [wrong](SessionState::Transaction &tx) mutable {
-            WindowPreflightInput preflight;
-            preflight.session_id = wrong.session_id;
-            preflight.region_id = wrong.region_id;
-            preflight.generation = wrong.generation;
-            preflight.window_id = wrong.window_id;
-            preflight.previous_state = wrong.previous_state;
-            preflight.expires_at_ms = wrong.expires_at_ms;
-            tx.preflightWindow(std::move(preflight));
-            return tx.finalizeWindow(WindowFinalizeInput{
-                std::move(wrong.next_state), std::move(wrong.encoded_response)});
+        [wrong, wrongFinalize](SessionState::Transaction &tx) mutable {
+            tx.preflightWindow(std::move(wrong));
+            return tx.finalizeWindow(std::move(wrongFinalize));
         });
     EXPECT_TRUE(std::holds_alternative<StateResult>(anchored));
 }
@@ -681,40 +664,34 @@ TEST(session_state_window_chain_is_contiguous_idempotent_and_fail_closed) {
         "test-relay-credential-that-is-long-enough", initial, 1000));
     openTestSession(sessions, initial, initialGrant);
 
-    const auto transactWindow = [&](RequestFacts request, WindowAdvanceInput input,
+    using WindowInput = std::pair<WindowPreflightInput, WindowFinalizeInput>;
+    const auto transactWindow = [&](RequestFacts request, WindowInput input,
                                     std::uint64_t now = 1000,
                                     bool *expensive = nullptr) {
         auto grant = std::get<AnonymousGrant>(issuer.authenticate(
             "test-relay-credential-that-is-long-enough", request, 1000));
         return sessions.transact(request, grant, now,
             [input = std::move(input), expensive](SessionState::Transaction &tx) mutable {
-                WindowPreflightInput preflight;
-                preflight.session_id = input.session_id;
-                preflight.region_id = input.region_id;
-                preflight.generation = input.generation;
-                preflight.window_id = input.window_id;
-                preflight.previous_state = input.previous_state;
-                preflight.expires_at_ms = input.expires_at_ms;
-                tx.preflightWindow(std::move(preflight));
+                tx.preflightWindow(std::move(input.first));
                 if (expensive) *expensive = true;
-                return tx.finalizeWindow(WindowFinalizeInput{
-                    std::move(input.next_state), std::move(input.encoded_response)});
+                return tx.finalizeWindow(std::move(input.second));
             });
     };
     const auto input = [](std::uint64_t window, std::string previous, std::string next,
                           std::string response = "response") {
-        WindowAdvanceInput value;
-        value.session_id = "session-a";
-        value.region_id = kRegion;
-        value.generation = 7;
-        value.window_id = window;
-        value.previous_state = std::move(previous);
-        value.next_state = std::move(next);
-        value.expires_at_ms = 1700;
-        value.encoded_response.assign(
+        WindowPreflightInput preflight;
+        preflight.session_id = "session-a";
+        preflight.region_id = kRegion;
+        preflight.generation = 7;
+        preflight.window_id = window;
+        preflight.previous_state = std::move(previous);
+        preflight.expires_at_ms = 1700;
+        WindowFinalizeInput finalize;
+        finalize.next_state = std::move(next);
+        finalize.encoded_response.assign(
             reinterpret_cast<const std::byte *>(response.data()),
             reinterpret_cast<const std::byte *>(response.data() + response.size()));
-        return value;
+        return WindowInput{std::move(preflight), std::move(finalize)};
     };
     const auto request = [](char id, char digest) {
         auto value = facts();
@@ -771,7 +748,7 @@ TEST(session_state_window_chain_is_contiguous_idempotent_and_fail_closed) {
     EXPECT_TRUE(std::holds_alternative<BackendError>(rollback));
 
     auto wrongGenerationInput = input(2, "state-one", "wrong-generation");
-    wrongGenerationInput.generation = 6;
+    wrongGenerationInput.first.generation = 6;
     auto wrongGeneration = transactWindow(
         request('i', '4'), std::move(wrongGenerationInput), 1000, &expensive);
     EXPECT_TRUE(std::holds_alternative<BackendError>(wrongGeneration));
@@ -781,13 +758,13 @@ TEST(session_state_window_chain_is_contiguous_idempotent_and_fail_closed) {
     EXPECT_TRUE(std::holds_alternative<BackendError>(wrongState));
     EXPECT_FALSE(expensive);
     auto wrongIdentityInput = input(2, "state-one", "wrong-identity");
-    wrongIdentityInput.region_id = std::string(64, '9');
+    wrongIdentityInput.first.region_id = std::string(64, '9');
     auto wrongIdentity = transactWindow(
         request('k', '6'), std::move(wrongIdentityInput), 1000, &expensive);
     EXPECT_TRUE(std::holds_alternative<BackendError>(wrongIdentity));
     EXPECT_FALSE(expensive);
     auto expiredInput = input(2, "state-one", "expired");
-    expiredInput.expires_at_ms = 1000;
+    expiredInput.first.expires_at_ms = 1000;
     auto expired = transactWindow(request('l', '7'), std::move(expiredInput));
     EXPECT_TRUE(std::holds_alternative<BackendError>(expired));
 
@@ -797,14 +774,7 @@ TEST(session_state_window_chain_is_contiguous_idempotent_and_fail_closed) {
     auto abandonedInput = input(2, "state-one", "never-finalized");
     auto abandoned = sessions.transact(abandonedRequest, abandonedGrant, 1000,
         [abandonedInput](SessionState::Transaction &tx) mutable {
-            WindowPreflightInput preflight;
-            preflight.session_id = abandonedInput.session_id;
-            preflight.region_id = abandonedInput.region_id;
-            preflight.generation = abandonedInput.generation;
-            preflight.window_id = abandonedInput.window_id;
-            preflight.previous_state = abandonedInput.previous_state;
-            preflight.expires_at_ms = abandonedInput.expires_at_ms;
-            tx.preflightWindow(std::move(preflight));
+            tx.preflightWindow(std::move(abandonedInput.first));
             return StateResult{};
         });
     EXPECT_TRUE(hasError(abandoned, "window_invalid"));
@@ -812,7 +782,9 @@ TEST(session_state_window_chain_is_contiguous_idempotent_and_fail_closed) {
     auto abandonedRetry = sessions.transact(abandonedRequest, abandonedGrant, 1000,
         [&](SessionState::Transaction &tx) {
             abandonedRetryCalled = true;
-            return tx.advanceWindow(input(2, "state-one", "state-two", "exact-two"));
+            auto retryInput = input(2, "state-one", "state-two", "exact-two");
+            tx.preflightWindow(std::move(retryInput.first));
+            return tx.finalizeWindow(std::move(retryInput.second));
         });
     EXPECT_TRUE(abandonedRetryCalled);
     EXPECT_TRUE(std::holds_alternative<StateResult>(abandonedRetry));

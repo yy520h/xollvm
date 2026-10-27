@@ -20,7 +20,138 @@ inline constexpr size_t kEncryptedWindowMaterialSize = 220;
 inline constexpr size_t kDynamicVmMaxWindowMaterial = 256 * 1024;
 inline constexpr size_t kDynamicVmMaxDescriptor = 64 * 1024;
 
+// Version 2's first executable profile is deliberately small and closed.  These
+// bounds are part of the canonical wire contract, not implementation hints.
+inline constexpr uint16_t kDynamicVmExecutionSchemaVersionV2 = 1;
+inline constexpr size_t kDynamicVmExecutionAbiV2EncodedSize = 66;
+inline constexpr size_t kDynamicVmExecutionDescriptorV2EncodedSize = 120;
+inline constexpr size_t kDynamicVmContinuationNodeV2EncodedSize = 140;
+inline constexpr size_t kDynamicVmMaxContinuationNodesV2 = 2;
+inline constexpr size_t kDynamicVmMaxHandlerShardsV2 = 2;
+inline constexpr uint16_t kDynamicVmMaxI32RegistersV2 = 250;
+inline constexpr uint32_t kDynamicVmLoadI32InstructionSizeV2 = 6;
+inline constexpr uint32_t kDynamicVmReturnI32InstructionSizeV2 = 2;
+inline constexpr std::string_view kDynamicVmExecutionAbiHashDomainV2 =
+    "xovm.dynamic-vm.execution-abi.v2";
+inline constexpr std::string_view kDynamicVmBytecodeBlockHashDomainV2 =
+    "xovm.dynamic-vm.bytecode-block.v2";
+inline constexpr std::string_view kDynamicVmHandlerShardHashDomainV2 =
+    "xovm.dynamic-vm.handler-shard.v2";
+inline constexpr std::string_view kDynamicVmTransitionTailHashDomainV2 =
+    "xovm.dynamic-vm.transition-tail.v2";
+inline constexpr std::string_view kDynamicVmContinuationGraphHashDomainV2 =
+    "xovm.dynamic-vm.continuation-graph.v2";
+
 using DynamicHash = std::array<uint8_t, kDynamicVmHashSize>;
+
+enum class DynamicVmExecutionProfileV2 : uint16_t {
+    LoadI32ReturnI32 = 1,
+};
+
+enum class ContinuationNodeSemanticV2 : uint8_t {
+    LoadI32 = 1,
+    ReturnI32 = 2,
+};
+
+enum class ContinuationNodeStatusV2 : uint8_t {
+    Continue = 0,
+    Return = 1,
+};
+
+enum class DynamicVmSchemaStatusV2 : uint8_t {
+    Valid = 0,
+    UnsupportedVersion,
+    UnsupportedProfile,
+    InvalidIdentity,
+    InvalidRegisterCounts,
+    InvalidRelocation,
+    InvalidHashBinding,
+    InvalidCount,
+    InvalidIdOrder,
+    InvalidEntry,
+    InvalidSemantic,
+    InvalidStatus,
+    InvalidTopology,
+    InvalidRange,
+    InvalidInstructionBoundary,
+    UnreachableNode,
+    NonCanonicalEncoding,
+};
+
+// Canonical execution contract for the bounded v2 LOADI/RET_INT profile.
+// abi_id is an issuer-assigned, nonzero identity; its canonical hash is bound
+// by every execution descriptor.
+struct DynamicVmExecutionAbiV2 {
+    uint16_t format_version = kDynamicVmFormatVersion;
+    uint16_t schema_version = kDynamicVmExecutionSchemaVersionV2;
+    DynamicVmExecutionProfileV2 profile =
+        DynamicVmExecutionProfileV2::LoadI32ReturnI32;
+    uint16_t flags = 0;
+    uint32_t abi_id = 0;
+    uint16_t i32_register_count = 0;
+    uint16_t i64_register_count = 0;
+    uint16_t pointer_register_count = 0;
+    uint16_t f64_register_count = 0;
+    uint16_t relocation_count = 0;
+    uint16_t loadi32_instruction_size = kDynamicVmLoadI32InstructionSizeV2;
+    uint16_t return_i32_instruction_size = kDynamicVmReturnI32InstructionSizeV2;
+    uint8_t loadi32_opcode = 0;
+    uint8_t return_i32_opcode = 0;
+    uint8_t loadi32_destination_offset = 1;
+    uint8_t loadi32_immediate_offset = 2;
+    uint8_t return_i32_source_offset = 1;
+    uint8_t reserved8 = 0;
+    uint8_t decode_salt = 0;
+    std::array<uint8_t, 31> reserved_decode_salt{};
+    uint16_t reserved = 0;
+
+    bool operator==(const DynamicVmExecutionAbiV2 &) const = default;
+};
+
+struct DynamicVmExecutionDescriptorV2 {
+    uint16_t format_version = kDynamicVmFormatVersion;
+    uint16_t schema_version = kDynamicVmExecutionSchemaVersionV2;
+    uint32_t abi_id = 0;
+    DynamicHash abi_hash{};
+    DynamicHash bytecode_hash{};
+    uint32_t bytecode_size = 0;
+    uint32_t handler_shards_size = 0;
+    uint32_t entry_node_id = 0;
+    uint16_t node_count = 0;
+    uint16_t relocation_count = 0;
+    DynamicHash graph_commitment{};
+
+    bool operator==(const DynamicVmExecutionDescriptorV2 &) const = default;
+};
+
+struct ContinuationNodeV2 {
+    uint32_t node_id = 0;
+    uint32_t shard_id = 0;
+    uint32_t bytecode_offset = 0;
+    uint32_t bytecode_size = 0;
+    uint32_t shard_offset = 0;
+    uint32_t shard_size = 0;
+    uint32_t next_node_id = 0;
+    uint16_t register_index = 0;
+    ContinuationNodeSemanticV2 semantic = ContinuationNodeSemanticV2::LoadI32;
+    ContinuationNodeStatusV2 status = ContinuationNodeStatusV2::Continue;
+    uint32_t variant_id = 0;
+    DynamicHash bytecode_block_commitment{};
+    DynamicHash handler_shard_commitment{};
+    DynamicHash transition_tail_commitment{};
+    uint32_t relocation_offset = 0;
+    uint16_t relocation_count = 0;
+    uint16_t reserved = 0;
+
+    bool operator==(const ContinuationNodeV2 &) const = default;
+};
+
+struct ContinuationGraphV2 {
+    DynamicVmExecutionDescriptorV2 descriptor;
+    std::vector<ContinuationNodeV2> nodes;
+
+    bool operator==(const ContinuationGraphV2 &) const = default;
+};
 
 struct EncryptedVmArtifact {
     uint16_t format_version = kDynamicVmFormatVersion;
@@ -110,6 +241,40 @@ struct WindowMaterial {
 };
 
 static_assert(sizeof(WindowMaterial) == kWindowMaterialSize);
+
+DynamicVmSchemaStatusV2 validateDynamicVmExecutionAbiV2(
+    const DynamicVmExecutionAbiV2 &abi);
+std::vector<uint8_t> encodeDynamicVmExecutionAbiV2(
+    const DynamicVmExecutionAbiV2 &abi);
+std::optional<DynamicVmExecutionAbiV2> decodeDynamicVmExecutionAbiV2(
+    std::span<const uint8_t> encoded);
+std::optional<DynamicHash> hashDynamicVmExecutionAbiV2(
+    const DynamicVmExecutionAbiV2 &abi);
+DynamicHash hashDynamicVmBytecodeBlockV2(std::span<const uint8_t> bytes);
+DynamicHash hashDynamicVmHandlerShardV2(std::span<const uint8_t> bytes);
+std::optional<DynamicHash> hashDynamicVmTransitionTailV2(
+    const ContinuationNodeV2 &node);
+std::optional<DynamicHash> hashDynamicVmContinuationGraphV2(
+    const ContinuationGraphV2 &graph);
+
+std::vector<uint8_t> encodeDynamicVmExecutionDescriptorV2(
+    const DynamicVmExecutionDescriptorV2 &descriptor);
+std::optional<DynamicVmExecutionDescriptorV2>
+decodeDynamicVmExecutionDescriptorV2(std::span<const uint8_t> encoded);
+std::vector<uint8_t> encodeContinuationNodeV2(const ContinuationNodeV2 &node);
+std::optional<ContinuationNodeV2> decodeContinuationNodeV2(
+    std::span<const uint8_t> encoded);
+std::vector<uint8_t> encodeContinuationGraphV2(const ContinuationGraphV2 &graph);
+std::optional<ContinuationGraphV2> decodeContinuationGraphV2(
+    std::span<const uint8_t> encoded);
+DynamicVmSchemaStatusV2 validateContinuationGraphV2(
+    const DynamicVmExecutionAbiV2 &abi,
+    const ContinuationGraphV2 &graph);
+DynamicVmSchemaStatusV2 validateContinuationGraphV2(
+    const DynamicVmExecutionAbiV2 &abi,
+    const ContinuationGraphV2 &graph,
+    std::span<const uint8_t> bytecode,
+    std::span<const uint8_t> handler_shards);
 
 std::vector<uint8_t> encodeEncryptedVmArtifact(const EncryptedVmArtifact &artifact);
 std::optional<EncryptedVmArtifact> decodeEncryptedVmArtifact(std::span<const uint8_t> encoded);

@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <openssl/crypto.h>
 #include <cstdint>
 #include <dirent.h>
 #include <fcntl.h>
@@ -227,6 +228,208 @@ std::optional<xovm::material::DynamicHash> parseDynamicHash(StringRef Text) {
 		Result[I] = static_cast<uint8_t>((High << 4) | Low);
 	}
 	return Result;
+}
+
+xovm::material::DynamicHash sha256(ArrayRef<uint8_t> Bytes) {
+	auto Digest = SHA256::hash(Bytes);
+	xovm::material::DynamicHash Result{};
+	std::copy(Digest.begin(), Digest.end(), Result.begin());
+	return Result;
+}
+
+struct DynamicExecutionMaterial {
+	xovm::material::DynamicVmExecutionAbiV2 Abi;
+	xovm::material::ContinuationGraphV2 Graph;
+	std::vector<uint8_t> HandlerCode;
+};
+
+Expected<DynamicExecutionMaterial> buildDynamicExecutionMaterial(
+	const BytecodeEmitter& Emitter, const VMOpcodeMap& Opcodes) {
+	using namespace xovm::material;
+	const auto Records = Emitter.getInstructionRecords();
+	if (Emitter.hasKeyedDispatch())
+		return materialError("dynamic artifact keyed dispatch is unsupported");
+	if (Records.size() != 2 || Records[0].first != 0 || Records[0].second != OP_LOADI ||
+		Records[1].first != kDynamicVmLoadI32InstructionSizeV2 ||
+		Records[1].second != OP_RET_INT ||
+		Emitter.BC.size() != kDynamicVmLoadI32InstructionSizeV2 +
+			kDynamicVmReturnI32InstructionSizeV2)
+		return materialError("dynamic artifact supports exactly compiler-emitted LOADI to RET_INT");
+	if (!Emitter.getLayout().validate())
+		return materialError("dynamic artifact layout invalid");
+	const uint8_t LoadOpcode = Opcodes.encode(OP_LOADI);
+	const uint8_t ReturnOpcode = Opcodes.encode(OP_RET_INT);
+	if (LoadOpcode == ReturnOpcode || Emitter.BC[Records[0].first] != LoadOpcode ||
+		Emitter.BC[Records[1].first] != ReturnOpcode)
+		return materialError("dynamic artifact physical opcode mismatch");
+	if (Emitter.NVR == 0 || Emitter.NVR > kDynamicVmMaxI32RegistersV2 ||
+		Emitter.NVR64 != 0 || Emitter.NPR != 0 || Emitter.NFR != 0)
+		return materialError("dynamic artifact register classes unsupported");
+
+	const auto& Layout = Emitter.getLayout();
+	const unsigned LoadDestinationOffset = Layout.offset(OP_LOADI, VMFieldRole::Dst);
+	const unsigned LoadImmediateOffset = Layout.offset(OP_LOADI, VMFieldRole::Immediate);
+	const unsigned ReturnSourceOffset = Layout.offset(OP_RET_INT, VMFieldRole::SrcA);
+	if (Layout.size(OP_LOADI) != kDynamicVmLoadI32InstructionSizeV2 ||
+		Layout.size(OP_RET_INT) != kDynamicVmReturnI32InstructionSizeV2 ||
+		LoadDestinationOffset != 1 || LoadImmediateOffset != 2 ||
+		ReturnSourceOffset != 1)
+		return materialError("dynamic artifact operand layout unsupported");
+
+	const uint8_t DecodeSalt = Emitter.getDecodeSalt();
+	const uint8_t PhysicalDestination = Emitter.BC[Records[0].first + LoadDestinationOffset];
+	const uint8_t PhysicalSource = Emitter.BC[Records[1].first + ReturnSourceOffset];
+	const uint8_t Destination = PhysicalDestination ^ DecodeSalt;
+	const uint8_t Source = PhysicalSource ^ DecodeSalt;
+	if (Destination != Source || Destination >= Emitter.NVR)
+		return materialError("dynamic artifact decoded register mismatch");
+
+	const size_t ImmediateAt = Records[0].first + LoadImmediateOffset;
+	uint32_t Immediate = static_cast<uint32_t>(Emitter.BC[ImmediateAt]) |
+		(static_cast<uint32_t>(Emitter.BC[ImmediateAt + 1]) << 8) |
+		(static_cast<uint32_t>(Emitter.BC[ImmediateAt + 2]) << 16) |
+		(static_cast<uint32_t>(Emitter.BC[ImmediateAt + 3]) << 24);
+	auto LoadShard = buildAarch64LoadImmediateShard(Destination, Immediate,
+		Records[1].first);
+	auto ReturnShard = buildAarch64ReturnIntShard(Source, Emitter.BC.size());
+	if (!LoadShard || !ReturnShard)
+		return materialError("dynamic AArch64 handler shard unavailable");
+	if (LoadShard->size() > UINT32_MAX || ReturnShard->size() > UINT32_MAX ||
+		LoadShard->size() + ReturnShard->size() > UINT32_MAX)
+		return materialError("dynamic artifact handler shard bounds invalid");
+
+	DynamicExecutionMaterial Result;
+	Result.HandlerCode.reserve(LoadShard->size() + ReturnShard->size());
+	Result.HandlerCode.insert(Result.HandlerCode.end(), LoadShard->begin(), LoadShard->end());
+	Result.HandlerCode.insert(Result.HandlerCode.end(), ReturnShard->begin(), ReturnShard->end());
+
+	Result.Abi.abi_id = 1;
+	Result.Abi.i32_register_count = Emitter.NVR;
+	Result.Abi.i64_register_count = Emitter.NVR64;
+	Result.Abi.pointer_register_count = Emitter.NPR;
+	Result.Abi.f64_register_count = Emitter.NFR;
+	Result.Abi.loadi32_instruction_size = Layout.size(OP_LOADI);
+	Result.Abi.return_i32_instruction_size = Layout.size(OP_RET_INT);
+	Result.Abi.loadi32_opcode = LoadOpcode;
+	Result.Abi.return_i32_opcode = ReturnOpcode;
+	Result.Abi.loadi32_destination_offset = LoadDestinationOffset;
+	Result.Abi.loadi32_immediate_offset = LoadImmediateOffset;
+	Result.Abi.return_i32_source_offset = ReturnSourceOffset;
+	Result.Abi.decode_salt = DecodeSalt;
+	if (validateDynamicVmExecutionAbiV2(Result.Abi) != DynamicVmSchemaStatusV2::Valid)
+		return materialError("dynamic artifact execution ABI unsupported");
+	auto AbiHash = hashDynamicVmExecutionAbiV2(Result.Abi);
+	if (!AbiHash) return materialError("dynamic artifact execution ABI hash failed");
+
+	Result.Graph.descriptor.abi_id = Result.Abi.abi_id;
+	Result.Graph.descriptor.abi_hash = *AbiHash;
+	Result.Graph.descriptor.bytecode_hash = sha256(Emitter.BC);
+	Result.Graph.descriptor.bytecode_size = Emitter.BC.size();
+	Result.Graph.descriptor.handler_shards_size = Result.HandlerCode.size();
+	Result.Graph.descriptor.entry_node_id = 1;
+	Result.Graph.descriptor.node_count = 2;
+
+	xovm::material::ContinuationNodeV2 LoadNode;
+	LoadNode.node_id = 1;
+	LoadNode.shard_id = 1;
+	LoadNode.bytecode_offset = Records[0].first;
+	LoadNode.bytecode_size = Records[1].first - Records[0].first;
+	LoadNode.shard_offset = 0;
+	LoadNode.shard_size = LoadShard->size();
+	LoadNode.next_node_id = 2;
+	LoadNode.register_index = Destination;
+	LoadNode.semantic = ContinuationNodeSemanticV2::LoadI32;
+	LoadNode.status = ContinuationNodeStatusV2::Continue;
+	LoadNode.variant_id = 1;
+	LoadNode.bytecode_block_commitment = hashDynamicVmBytecodeBlockV2(
+		ArrayRef<uint8_t>(Emitter.BC).slice(LoadNode.bytecode_offset, LoadNode.bytecode_size));
+	LoadNode.handler_shard_commitment = hashDynamicVmHandlerShardV2(*LoadShard);
+	auto LoadTail = hashDynamicVmTransitionTailV2(LoadNode);
+	if (!LoadTail) return materialError("dynamic artifact LOADI transition hash failed");
+	LoadNode.transition_tail_commitment = *LoadTail;
+
+	xovm::material::ContinuationNodeV2 ReturnNode;
+	ReturnNode.node_id = 2;
+	ReturnNode.shard_id = 2;
+	ReturnNode.bytecode_offset = Records[1].first;
+	ReturnNode.bytecode_size = Emitter.BC.size() - Records[1].first;
+	ReturnNode.shard_offset = LoadShard->size();
+	ReturnNode.shard_size = ReturnShard->size();
+	ReturnNode.register_index = Source;
+	ReturnNode.semantic = ContinuationNodeSemanticV2::ReturnI32;
+	ReturnNode.status = ContinuationNodeStatusV2::Return;
+	ReturnNode.variant_id = 1;
+	ReturnNode.bytecode_block_commitment = hashDynamicVmBytecodeBlockV2(
+		ArrayRef<uint8_t>(Emitter.BC).slice(ReturnNode.bytecode_offset,
+			ReturnNode.bytecode_size));
+	ReturnNode.handler_shard_commitment = hashDynamicVmHandlerShardV2(*ReturnShard);
+	auto ReturnTail = hashDynamicVmTransitionTailV2(ReturnNode);
+	if (!ReturnTail) return materialError("dynamic artifact RET_INT transition hash failed");
+	ReturnNode.transition_tail_commitment = *ReturnTail;
+
+	Result.Graph.nodes = {LoadNode, ReturnNode};
+	auto GraphHash = hashDynamicVmContinuationGraphV2(Result.Graph);
+	if (!GraphHash) return materialError("dynamic artifact graph hash failed");
+	Result.Graph.descriptor.graph_commitment = *GraphHash;
+	if (validateContinuationGraphV2(Result.Abi, Result.Graph, Emitter.BC,
+		Result.HandlerCode) != DynamicVmSchemaStatusV2::Valid)
+		return materialError("dynamic artifact graph validation failed");
+	return Result;
+}
+
+std::vector<uint8_t> encodeDynamicExecutionDescriptor(
+	const DynamicExecutionMaterial& Material) {
+	auto Abi = xovm::material::encodeDynamicVmExecutionAbiV2(Material.Abi);
+	auto Graph = xovm::material::encodeContinuationGraphV2(Material.Graph);
+	if (Abi.empty() || Graph.empty()) return {};
+	Abi.insert(Abi.end(), Graph.begin(), Graph.end());
+	return Abi;
+}
+
+Error validateDynamicExecutionDescriptor(
+	const xovm::material::DecryptedVmArtifact& Artifact) {
+	using namespace xovm::material;
+	if (!Artifact.relocation_descriptors.empty() ||
+		Artifact.continuation_descriptors.size() <= kDynamicVmExecutionAbiV2EncodedSize)
+		return materialError("dynamic artifact v2 descriptor missing");
+	auto Descriptor = ArrayRef<uint8_t>(Artifact.continuation_descriptors);
+	auto Abi = decodeDynamicVmExecutionAbiV2(
+		Descriptor.take_front(kDynamicVmExecutionAbiV2EncodedSize));
+	auto Graph = decodeContinuationGraphV2(
+		Descriptor.drop_front(kDynamicVmExecutionAbiV2EncodedSize));
+	auto HandlerPayload = decodeHandlerShardPayload(Artifact.handler_shards);
+	if (!Abi || !Graph || !HandlerPayload || Graph->nodes.size() != 2 ||
+		HandlerPayload->descriptor.shard_id != Graph->nodes.front().shard_id ||
+		HandlerPayload->descriptor.code_size != HandlerPayload->code.size() ||
+		validateContinuationGraphV2(*Abi, *Graph, Artifact.bytecode,
+			HandlerPayload->code) != DynamicVmSchemaStatusV2::Valid) {
+		if (HandlerPayload) secureClear(HandlerPayload->code);
+		return materialError("dynamic artifact v2 descriptor invalid");
+	}
+	const auto& LoadNode = Graph->nodes[0];
+	const auto& ReturnNode = Graph->nodes[1];
+	std::span<const uint8_t> Bytecode(Artifact.bytecode);
+	std::span<const uint8_t> HandlerCode(HandlerPayload->code);
+	const auto LoadBlock = Bytecode.subspan(LoadNode.bytecode_offset,
+		LoadNode.bytecode_size);
+	const auto LoadShard = HandlerCode.subspan(LoadNode.shard_offset,
+		LoadNode.shard_size);
+	const auto ReturnShard = HandlerCode.subspan(ReturnNode.shard_offset,
+		ReturnNode.shard_size);
+	const size_t ImmediateOffset = Abi->loadi32_immediate_offset;
+	const uint32_t Immediate = static_cast<uint32_t>(LoadBlock[ImmediateOffset]) |
+		(static_cast<uint32_t>(LoadBlock[ImmediateOffset + 1]) << 8) |
+		(static_cast<uint32_t>(LoadBlock[ImmediateOffset + 2]) << 16) |
+		(static_cast<uint32_t>(LoadBlock[ImmediateOffset + 3]) << 24);
+	if (!validateAarch64LoadImmediateShard(LoadShard, LoadNode.register_index,
+			Immediate, ReturnNode.bytecode_offset) ||
+		!validateAarch64ReturnIntShard(ReturnShard, ReturnNode.register_index,
+			Artifact.bytecode.size())) {
+		secureClear(HandlerPayload->code);
+		return materialError("dynamic artifact handler semantics invalid");
+	}
+	secureClear(HandlerPayload->code);
+	return Error::success();
 }
 
 std::string stableType(Type* Ty) {
@@ -721,6 +924,9 @@ Error validateDynamicArtifactExport(const DynamicArtifactExport& Export) {
 		consumeError(std::move(E));
 		return materialError("dynamic artifact key encoding invalid");
 	}
+	auto ClearDecodedKey = make_scope_exit([&] {
+		if (!DecodedKey.empty()) OPENSSL_cleanse(DecodedKey.data(), DecodedKey.size());
+	});
 	if (DecodedKey.size() != 32 || encodeBase64(DecodedKey) != *Key)
 		return materialError("dynamic artifact key size mismatch");
 	auto BuildId = parseDynamicHash(*PublicBuild);
@@ -735,9 +941,17 @@ Error validateDynamicArtifactExport(const DynamicArtifactExport& Export) {
 		return materialError("dynamic artifact identity commitment mismatch");
 	std::array<uint8_t, 32> ArtifactKey{};
 	std::copy(DecodedKey.begin(), DecodedKey.end(), ArtifactKey.begin());
-	if (!xovm::material::decryptEncryptedVmArtifact(*Artifact, ArtifactKey,
-		*BuildId, *RegionId))
-		return materialError("dynamic artifact decryption failed");
+	auto ClearArtifactKey = make_scope_exit([&] {
+		OPENSSL_cleanse(ArtifactKey.data(), ArtifactKey.size());
+	});
+	auto Decrypted = xovm::material::decryptEncryptedVmArtifact(*Artifact, ArtifactKey,
+		*BuildId, *RegionId, *ArtifactHash);
+	if (!Decrypted) return materialError("dynamic artifact decryption failed");
+	if (Error E = validateDynamicExecutionDescriptor(*Decrypted)) {
+		xovm::material::secureClear(*Decrypted);
+		return E;
+	}
+	xovm::material::secureClear(*Decrypted);
 	return Error::success();
 }
 
@@ -1099,32 +1313,20 @@ Expected<DynamicArtifactExport> llvm::exportDynamicArtifact(
 		Source.artifact_key.size()))
 		return materialError("dynamic artifact key generation failed");
 	Source.bytecode.assign(Emitter.BC.begin(), Emitter.BC.end());
+	auto ExecutionMaterial = buildDynamicExecutionMaterial(Emitter, Opcodes);
+	if (!ExecutionMaterial) return ExecutionMaterial.takeError();
 	xovm::material::HandlerShardDescriptor HandlerDescriptor;
 	HandlerDescriptor.shard_id = 1;
-	std::optional<std::vector<uint8_t>> ShardCode;
-	bool NativeProgramSupported = false;
-	if (Emitter.BC.size() == 8 &&
-		Emitter.BC[0] == Opcodes.encode(OP_LOADI) &&
-		Emitter.BC[6] == Opcodes.encode(OP_RET_INT)) {
-		uint32_t Immediate = static_cast<uint32_t>(Emitter.BC[2]) |
-			(static_cast<uint32_t>(Emitter.BC[3]) << 8) |
-			(static_cast<uint32_t>(Emitter.BC[4]) << 16) |
-			(static_cast<uint32_t>(Emitter.BC[5]) << 24);
-		ShardCode = xovm::material::buildAarch64LoadAndReturnIntShard(
-			Emitter.BC[1], Immediate, Emitter.BC[7], 8);
-		NativeProgramSupported = static_cast<bool>(ShardCode);
-	}
-	if (!ShardCode) ShardCode = xovm::material::buildAarch64BridgeShard();
-	if (!ShardCode) return materialError("dynamic AArch64 handler shard unavailable");
-	HandlerDescriptor.code_size = static_cast<uint32_t>(ShardCode->size());
+	HandlerDescriptor.code_size = static_cast<uint32_t>(ExecutionMaterial->HandlerCode.size());
 	HandlerDescriptor.relocation_count = 0;
-	HandlerDescriptor.commitment = xovm::material::hashAarch64ShardCode(*ShardCode);
-	Source.handler_shards = xovm::material::encodeHandlerShardPayload(HandlerDescriptor, *ShardCode);
-	xovm::material::DynamicVmShardContext::ProgramDescriptor Program;
-	Program.load_opcode = Opcodes.encode(OP_LOADI);
-	Program.ret_opcode = Opcodes.encode(OP_RET_INT);
-	Program.supported = NativeProgramSupported;
-	Source.continuation_descriptors = xovm::material::encodeProgramDescriptor(Program);
+	HandlerDescriptor.commitment =
+		xovm::material::hashAarch64ShardCode(ExecutionMaterial->HandlerCode);
+	Source.handler_shards = xovm::material::encodeHandlerShardPayload(
+		HandlerDescriptor, ExecutionMaterial->HandlerCode);
+	Source.continuation_descriptors =
+		encodeDynamicExecutionDescriptor(*ExecutionMaterial);
+	if (Source.handler_shards.empty() || Source.continuation_descriptors.empty())
+		return materialError("dynamic artifact v2 material encoding failed");
 
 	auto Artifact = xovm::material::buildEncryptedVmArtifact(Source);
 	if (!Artifact) return materialError("dynamic artifact encryption failed");
