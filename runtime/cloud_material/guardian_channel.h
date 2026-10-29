@@ -5,52 +5,133 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <optional>
+
+#include <sys/types.h>
 
 namespace xovm::material {
 
+class Launcher;
+struct GuardianChannelState;
+
+struct GuardianGeneration {
+    GuardianGeneration() = default;
+    ~GuardianGeneration();
+    GuardianGeneration(GuardianGeneration &&other) noexcept;
+    GuardianGeneration &operator=(GuardianGeneration &&other) noexcept;
+    GuardianGeneration(const GuardianGeneration &) = delete;
+    GuardianGeneration &operator=(const GuardianGeneration &) = delete;
+
+    std::array<uint8_t, 16> request_id{};
+    uint64_t sent_at_ns = 0;
+    DynamicHash artifact_hash{};
+    WindowGrant grant;
+    std::array<uint8_t, 32> grant_key{};
+};
+
 class GuardianChannel {
 public:
-    GuardianChannel(std::array<uint8_t, 32> boot_nonce, uint64_t process_identity)
-        : boot_nonce_(boot_nonce), process_identity_(process_identity) {}
+    enum class Role : uint8_t { Guardian = 1, Worker = 2 };
 
-    bool handshake(const GuardianChannelHello &hello);
+    GuardianChannel() = default;
+    ~GuardianChannel();
+    GuardianChannel(GuardianChannel &&other) noexcept;
+    GuardianChannel &operator=(GuardianChannel &&other) noexcept;
+    GuardianChannel(const GuardianChannel &) = delete;
+    GuardianChannel &operator=(const GuardianChannel &) = delete;
+
     bool challenge(uint64_t challenge_counter, uint64_t generation);
-    bool established() const { return established_; }
-    uint64_t processIdentity() const { return process_identity_; }
+    bool serveChallenge();
+    bool installGeneration(GuardianGeneration generation);
+    std::optional<GuardianGeneration> receiveGeneration();
+    bool shutdown();
+    bool receiveShutdown();
+    bool established() const;
+    bool poisoned() const;
+    Role role() const;
+    pid_t peerPid() const;
+    uint64_t processIdentity() const;
+    void close();
 
 private:
-    std::array<uint8_t, 32> boot_nonce_{};
-    uint64_t process_identity_ = 0;
-    uint64_t last_challenge_ = 0;
-    uint64_t generation_ = 0;
-    bool established_ = false;
-    bool launcher_authorized_ = false;
+    explicit GuardianChannel(std::shared_ptr<GuardianChannelState> state);
+    static std::optional<GuardianChannel> adopt(
+        int fd, Role role, const std::array<uint8_t, 32> &boot_nonce,
+        const std::array<uint8_t, 16> &session_id, pid_t peer_pid);
 
-    void authorizeFromLauncher() { launcher_authorized_ = true; }
+    bool guardianHandshake(const GuardianChannelHello &hello,
+                           uint64_t current_window_id);
+    bool workerHandshake(const GuardianChannelHello &hello,
+                         uint64_t current_window_id);
+    std::shared_ptr<GuardianChannelState> livenessState() const;
+
+    std::shared_ptr<GuardianChannelState> state_;
+
     friend class Launcher;
+    friend class LeaseState;
+};
+
+class LeasePin {
+public:
+    LeasePin() = default;
+    LeasePin(LeasePin &&) noexcept = default;
+    LeasePin &operator=(LeasePin &&) noexcept = default;
+    LeasePin(const LeasePin &) = delete;
+    LeasePin &operator=(const LeasePin &) = delete;
+
+    uint64_t generation() const;
+    uint64_t deadlineNs() const;
+    explicit operator bool() const;
+
+private:
+    struct Generation {
+        const uint64_t number;
+        const uint64_t deadline_ns;
+    };
+
+    explicit LeasePin(std::shared_ptr<const Generation> generation,
+                      pid_t owner_pid)
+        : generation_(std::move(generation)), owner_pid_(owner_pid) {}
+
+    std::shared_ptr<const Generation> generation_;
+    pid_t owner_pid_ = -1;
+    friend class LeaseState;
 };
 
 class LeaseState {
 public:
-    explicit LeaseState(uint64_t lease_ns) : lease_ns_(lease_ns) {}
+#ifdef XOVM_GUARDIAN_TESTING
+    explicit LeaseState(uint64_t lease_ns);
+    LeaseState(uint64_t lease_ns, const GuardianChannel &channel);
+#else
+    explicit LeaseState(const GuardianChannel &channel);
+#endif
 
-    bool acquire(uint64_t sent_ns, uint64_t generation);
+    std::optional<LeasePin> acquire(uint64_t sent_ns, uint64_t generation,
+                                    uint64_t now_ns,
+                                    uint64_t grant_expires_at_ns);
     bool renewIfDue(uint64_t now_ns);
-    bool pin(uint64_t now_ns) const;
-    void release() { pinned_ = false; }
-    uint64_t deadlineNs() const { return deadline_ns_; }
-    uint64_t renewAtNs() const { return renew_at_ns_; }
-    bool needsRenewal() const { return renewal_due_; }
+    void markRenewalFailed();
+    std::optional<LeasePin> pin(uint64_t now_ns) const;
+    uint64_t deadlineNs() const;
+    uint64_t renewAtNs() const;
+    bool needsRenewal() const;
 
 private:
-    uint64_t lease_ns_ = 0;
-    uint64_t generation_ = 0;
+    bool channelAlive() const;
+
+    const uint64_t lease_ns_;
+    const pid_t owner_pid_;
+    mutable std::mutex mutex_;
     uint64_t highest_generation_ = 0;
-    uint64_t deadline_ns_ = 0;
     uint64_t renew_at_ns_ = 0;
-    bool pinned_ = false;
     bool renewal_due_ = false;
+    bool renewal_failed_ = false;
+    std::shared_ptr<const LeasePin::Generation> current_;
+    std::weak_ptr<GuardianChannelState> channel_;
+    bool channel_bound_ = false;
 };
 
 } // namespace xovm::material

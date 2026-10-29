@@ -113,8 +113,8 @@ std::variant<DynamicHash, BackendError> nextState(
 }
 
 BackendError normalizeStateError(const BackendError &error) {
-    static constexpr std::array<std::string_view, 10> allowed{
-        "request_conflict", "session_closed", "unauthorized",
+    static constexpr std::array<std::string_view, 11> allowed{
+        "request_conflict", "request_retired", "session_closed", "unauthorized",
         "window_chain_mismatch", "window_invalid", "state_capacity",
         "counter_exhausted", "commit_failed", "build_unavailable",
         "authority_unavailable"};
@@ -158,11 +158,6 @@ RawWindowAcquisitionService::acquire(
         if (const auto *error = std::get_if<BackendError>(&nowResult))
             return normalizeBuilderError(*error);
         const auto now = std::get<std::uint64_t>(nowResult);
-        if (context.expiresAtMs() <= now)
-            return BackendError{"session_closed"};
-        if (now > std::numeric_limits<std::uint64_t>::max() -
-                      providers_.window_ttl_ms)
-            return BackendError{"authority_unavailable"};
 
         const auto buildId = hex(request.build_id);
         const auto regionId = hex(request.region_id);
@@ -171,13 +166,36 @@ RawWindowAcquisitionService::acquire(
         if (context.buildId() != buildId || context.softwareId().empty() ||
             allZero(context.sessionId()))
             return BackendError{"unauthorized"};
-        if (request.window_id == 1 &&
-            request.previous_state_hash != context.initialStateCommitment())
-            return BackendError{"window_chain_mismatch"};
-
         auto digestResult = sha256(kRequestDigestDomain, canonicalRequest);
         if (const auto *error = std::get_if<BackendError>(&digestResult)) return *error;
         const auto requestDigest = std::get<DynamicHash>(digestResult);
+
+        RequestFacts facts;
+        facts.request_id = requestId;
+        facts.request_digest = hex(requestDigest);
+        facts.software_id = context.softwareId();
+        facts.build_id = buildId;
+        facts.region_id = regionId;
+        facts.mode = "lease";
+        facts.type = "material.issue";
+
+        if (auto cached = providers_.sessions->lookupRawWindowRequest(
+                sessionId, facts.software_id, facts.build_id, facts.region_id,
+                facts.request_id, facts.request_digest, now)) {
+            if (const auto *error = std::get_if<BackendError>(&*cached))
+                return normalizeStateError(*error);
+            const auto &response = std::get<StateResult>(*cached).response;
+            std::vector<std::uint8_t> exact;
+            exact.reserve(response.size());
+            for (const auto byte : response)
+                exact.push_back(std::to_integer<std::uint8_t>(byte));
+            return exact;
+        }
+        if (context.expiresAtMs() <= now)
+            return BackendError{"session_closed"};
+        if (now > std::numeric_limits<std::uint64_t>::max() -
+                      providers_.window_ttl_ms)
+            return BackendError{"authority_unavailable"};
 
         auto snapshot = providers_.snapshots->acquire();
         if (!snapshot || !providers_.snapshots->ready())
@@ -188,16 +206,7 @@ RawWindowAcquisitionService::acquire(
             build->registration.verifier_sidecars.find(regionId) ==
                 build->registration.verifier_sidecars.end())
             return BackendError{"build_unavailable"};
-
-        RequestFacts facts;
-        facts.request_id = requestId;
-        facts.request_digest = hex(requestDigest);
-        facts.software_id = context.softwareId();
-        facts.build_id = buildId;
         facts.final_artifact_hash = build->final_artifact_hash;
-        facts.region_id = regionId;
-        facts.mode = "lease";
-        facts.type = "material.issue";
 
         auto reservationResult = providers_.anonymous_policy->reserve(
             *snapshot, facts, now, providers_.rate_budget);
@@ -238,7 +247,13 @@ RawWindowAcquisitionService::acquire(
                 preflight.window_id = request.window_id;
                 preflight.previous_state = hex(request.previous_state_hash);
                 preflight.expires_at_ms = expiresAt;
-                transaction.preflightWindow(std::move(preflight));
+                const auto grantExpiry =
+                    transaction.preflightWindow(std::move(preflight));
+                if (transactNow >= grantExpiry) {
+                    callbackError = BackendError{"window_chain_mismatch"};
+                    callbackFailed = true;
+                    throw std::runtime_error("raw_window_callback_failed");
+                }
 
                 auto materialResult = providers_.build_material(request);
                 if (const auto *error = std::get_if<BackendError>(&materialResult)) {
@@ -256,7 +271,7 @@ RawWindowAcquisitionService::acquire(
                     throw std::runtime_error("raw_window_callback_failed");
                 }
                 const auto commitNow = std::get<std::uint64_t>(commitNowResult);
-                if (commitNow < transactNow || commitNow >= expiresAt) {
+                if (commitNow < transactNow || commitNow >= grantExpiry) {
                     callbackError = BackendError{"authority_unavailable"};
                     callbackFailed = true;
                     throw std::runtime_error("raw_window_callback_failed");
@@ -296,7 +311,7 @@ RawWindowAcquisitionService::acquire(
                 input.value.previous_state_hash = request.previous_state_hash;
                 input.value.next_state_hash = next;
                 input.value.now_ms = commitNow;
-                input.value.expires_at_ms = expiresAt;
+                input.value.expires_at_ms = grantExpiry;
                 input.value.key_version = context.keyVersion();
                 static_assert(sizeof(material.value) == xovm::material::kWindowMaterialSize);
                 const auto materialBytes = std::span<const std::uint8_t>(

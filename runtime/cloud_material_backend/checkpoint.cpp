@@ -88,27 +88,30 @@ int defaultDirectorySync(const char *path) {
 }
 
 std::vector<std::byte> encode(const RecoveredState &state, std::uint64_t sequence) {
-    if (sequence == 0 || state.last_sequence != sequence || state.records.size() > 4096)
+    if (sequence == 0 || state.last_sequence != sequence || state.records.empty() ||
+        state.records.size() > 4096)
         throw BackendError{"checkpoint_invalid_state"};
     std::uint64_t previousSequence = 0;
-    std::vector<std::byte> result;
-    result.insert(result.end(), kMagic.begin(), kMagic.end());
-    put32(result, kVersion);
-    put64(result, sequence);
-    put64(result, state.records.size());
     for (const auto &record : state.records) {
         if (record.sequence == 0 || record.sequence <= previousSequence ||
             record.delta.bytes.size() > kMaxWalPayload ||
             record.response.size() > kMaxWalPayload)
             throw BackendError{"checkpoint_record_limit"};
         previousSequence = record.sequence;
-        put64(result, record.sequence);
-        put64(result, record.delta.bytes.size());
-        put64(result, record.response.size());
-        result.insert(result.end(), record.delta.bytes.begin(), record.delta.bytes.end());
-        result.insert(result.end(), record.response.begin(), record.response.end());
     }
     if (previousSequence != sequence) throw BackendError{"checkpoint_invalid_state"};
+
+    const auto &latest = state.records.back();
+    std::vector<std::byte> result;
+    result.insert(result.end(), kMagic.begin(), kMagic.end());
+    put32(result, kVersion);
+    put64(result, sequence);
+    put64(result, 1);
+    put64(result, latest.sequence);
+    put64(result, latest.delta.bytes.size());
+    put64(result, latest.response.size());
+    result.insert(result.end(), latest.delta.bytes.begin(), latest.delta.bytes.end());
+    result.insert(result.end(), latest.response.begin(), latest.response.end());
     const auto checksumValue = digest(result);
     result.insert(result.end(), checksumValue.begin(), checksumValue.end());
     return result;

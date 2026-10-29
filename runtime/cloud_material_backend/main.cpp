@@ -121,10 +121,13 @@ int run() {
         auto recovered = resources.checkpoint->recover();
         if (const auto *error = std::get_if<BackendError>(&recovered)) return *error;
         const auto &state = std::get<RecoveredState>(recovered);
+        SessionState validated;
+        auto restored = validated.restore(state);
+        if (const auto *error = std::get_if<BackendError>(&restored)) return *error;
         resources.wal = std::make_unique<StateWal>(stateDir / "state.wal", StateWal::IoHooks{},
                                                    state.last_sequence);
         resources.state = std::make_unique<SessionState>(resources.wal.get());
-        auto restored = resources.state->restore(state);
+        restored = resources.state->restore(state);
         if (const auto *error = std::get_if<BackendError>(&restored)) return *error;
         return std::variant<std::monostate, BackendError>{std::monostate{}};
     };

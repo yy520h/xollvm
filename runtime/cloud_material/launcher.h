@@ -3,40 +3,62 @@
 
 #include "guardian_channel.h"
 
+#include <cstdint>
 #include <optional>
+
+#ifdef XOVM_GUARDIAN_TESTING
 #include <functional>
+#endif
+
 #include <sys/types.h>
 
 namespace xovm::material {
 
 class Launcher {
 public:
-    struct Child {
-        pid_t pid = -1;
-        int guardian_fd = -1;
-        int wait() const;
-    };
-
     struct StartOptions {
-        std::function<int(int)> worker;
+        GuardianChannelHello hello;
+        uint64_t current_window_id = 0;
+#ifdef XOVM_GUARDIAN_TESTING
+        std::function<int(GuardianChannel &)> worker;
+#endif
     };
 
-    static std::optional<Child> start(std::array<uint8_t, 32> boot_nonce,
-                                      uint64_t process_identity,
-                                      const StartOptions &options);
+    class Child {
+    public:
+        Child() = default;
+        ~Child();
+        Child(Child &&other) noexcept;
+        Child &operator=(Child &&other) noexcept;
+        Child(const Child &) = delete;
+        Child &operator=(const Child &) = delete;
 
-    static std::optional<GuardianChannel> createWorkerChannel(
-        std::array<uint8_t, 32> boot_nonce, uint64_t process_identity,
-        const GuardianChannelHello &hello) {
-        GuardianChannel channel(boot_nonce, process_identity);
-        if (!channel.handshake(hello)) return std::nullopt;
-        channel.authorizeFromLauncher();
-        return channel;
-    }
+        pid_t pid() const { return pid_; }
+        GuardianChannel &channel() { return channel_; }
+        const GuardianChannel &channel() const { return channel_; }
+        bool challenge(uint64_t challenge_counter, uint64_t generation);
+        int wait();
+        void terminate();
 
-    static bool validateWorkerEntry(const GuardianChannel &channel) {
-        return channel.established() && channel.launcher_authorized_ && channel.processIdentity() != 0;
-    }
+    private:
+        Child(pid_t pid, int pidfd, GuardianChannel channel)
+            : pid_(pid), pidfd_(pidfd), channel_(std::move(channel)) {}
+
+        pid_t pid_ = -1;
+        int pidfd_ = -1;
+        GuardianChannel channel_;
+        bool waited_ = false;
+        friend class Launcher;
+    };
+
+    static std::optional<Child> start(const StartOptions &options);
+
+private:
+    static int runWorker(GuardianChannel &channel);
+#ifdef XOVM_GUARDIAN_TESTING
+    static int runTestWorker(const StartOptions &options,
+                             GuardianChannel &channel);
+#endif
 };
 
 } // namespace xovm::material

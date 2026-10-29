@@ -53,6 +53,15 @@ BackendConfigResult parse(std::map<std::string, std::string> values) {
     });
 }
 
+StateMaintenanceConfigResult parseMaintenance(
+    std::map<std::string, std::string> values) {
+    return StateMaintenanceConfig::fromEnvironment(
+        [values = std::move(values)](std::string_view name) {
+            const auto found = values.find(std::string(name));
+            return found == values.end() ? std::string{} : found->second;
+        });
+}
+
 std::filesystem::path lockDirectory(const char *name) {
     return std::filesystem::temp_directory_path() /
         (std::string("xovm-cloud-material-") + name + "-" + std::to_string(::getpid()));
@@ -124,12 +133,62 @@ TEST(config_reads_process_environment) {
     for (const auto &[name, value] : values) ::unsetenv(name.c_str());
 }
 
+TEST(maintenance_config_requires_only_state_and_time_provider) {
+    std::map<std::string, std::string> values{
+        {"XOVM_STATE_DIR", "/tmp/xovm-maintenance-state"},
+        {"XOVM_TRUSTED_TIME_PROVIDER", "trusted-time"},
+    };
+    auto accepted = parseMaintenance(values);
+    EXPECT_TRUE(std::holds_alternative<StateMaintenanceConfig>(accepted));
+    values.erase("XOVM_TRUSTED_TIME_PROVIDER");
+    auto rejected = parseMaintenance(std::move(values));
+    EXPECT_TRUE(std::holds_alternative<BackendError>(rejected));
+}
+
+TEST(process_lock_existing_private_rejects_missing_and_unsafe_directory) {
+    const auto missing = lockDirectory("maintenance-missing");
+    std::filesystem::remove_all(missing);
+    auto absent = ProcessLock::acquireExistingPrivate(missing);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(absent));
+    EXPECT_FALSE(std::filesystem::exists(missing));
+
+    std::filesystem::create_directories(missing);
+    std::filesystem::permissions(missing, std::filesystem::perms::owner_all |
+        std::filesystem::perms::group_read);
+    auto unsafe = ProcessLock::acquireExistingPrivate(missing);
+    EXPECT_TRUE(std::holds_alternative<BackendError>(unsafe));
+    std::filesystem::remove_all(missing);
+}
+
+TEST(process_lock_existing_private_excludes_competitors) {
+    const auto directory = lockDirectory("maintenance-private");
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
+    {
+        auto first = ProcessLock::acquireExistingPrivate(directory);
+        EXPECT_TRUE(std::holds_alternative<ProcessLock>(first));
+        auto second = ProcessLock::acquireExistingPrivate(directory);
+        EXPECT_TRUE(std::holds_alternative<BackendError>(second));
+    }
+    auto afterRelease = ProcessLock::acquireExistingPrivate(directory);
+    EXPECT_TRUE(std::holds_alternative<ProcessLock>(afterRelease));
+    const auto permissions = std::filesystem::status(directory / ".xovm.lock").permissions();
+    EXPECT_TRUE((permissions & std::filesystem::perms::all) ==
+                (std::filesystem::perms::owner_read |
+                 std::filesystem::perms::owner_write));
+    std::filesystem::remove_all(directory);
+}
+
 TEST(process_lock_rejects_second_owner_and_releases) {
     const auto directory = lockDirectory("owner");
     std::filesystem::remove_all(directory);
     {
         auto first = ProcessLock::acquire(directory);
         EXPECT_TRUE(std::holds_alternative<ProcessLock>(first));
+        const auto permissions = std::filesystem::status(directory).permissions();
+        EXPECT_TRUE((permissions & std::filesystem::perms::all) ==
+                    std::filesystem::perms::owner_all);
         auto second = ProcessLock::acquire(directory);
         EXPECT_TRUE(std::holds_alternative<BackendError>(second));
     }
@@ -200,13 +259,19 @@ int main() {
     run("config_rejects_unsafe_bind_and_bounds", config_rejects_unsafe_bind_and_bounds);
     run("config_accepts_loopback_defaults", config_accepts_loopback_defaults);
     run("config_reads_process_environment", config_reads_process_environment);
+    run("maintenance_config_requires_only_state_and_time_provider",
+        maintenance_config_requires_only_state_and_time_provider);
+    run("process_lock_existing_private_rejects_missing_and_unsafe_directory",
+        process_lock_existing_private_rejects_missing_and_unsafe_directory);
+    run("process_lock_existing_private_excludes_competitors",
+        process_lock_existing_private_excludes_competitors);
     run("process_lock_rejects_second_owner_and_releases",
         process_lock_rejects_second_owner_and_releases);
     run("process_lock_rejects_forked_child_owner", process_lock_rejects_forked_child_owner);
     run("process_lock_recovers_stale_lock_file", process_lock_recovers_stale_lock_file);
     run("process_lock_rejects_state_path_that_is_a_file",
         process_lock_rejects_state_path_that_is_a_file);
-    std::fprintf(stdout, "9 tests, %u assertions, %u failures\n",
+    std::fprintf(stdout, "12 tests, %u assertions, %u failures\n",
                  state.assertions, state.failures);
     return state.failures == 0 ? 0 : 1;
 }

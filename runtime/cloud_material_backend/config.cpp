@@ -85,4 +85,25 @@ std::variant<BackendConfig, BackendError> BackendConfig::fromEnvironment(const L
     return config;
 }
 
+std::variant<StateMaintenanceConfig, BackendError>
+StateMaintenanceConfig::fromEnvironment() {
+    return fromEnvironment([](std::string_view name) {
+        const std::string key(name);
+        const char *value = std::getenv(key.c_str());
+        return value == nullptr ? std::string{} : std::string(value);
+    });
+}
+
+std::variant<StateMaintenanceConfig, BackendError>
+StateMaintenanceConfig::fromEnvironment(const Lookup &lookup) {
+    if (!lookup) return BackendError{"config_lookup_unavailable"};
+    StateMaintenanceConfig config;
+    BackendError error;
+    config.state_dir = required(lookup, "XOVM_STATE_DIR", error);
+    config.trusted_time_provider = required(
+        lookup, "XOVM_TRUSTED_TIME_PROVIDER", error);
+    if (!error.code.empty()) return error;
+    return config;
+}
+
 } // namespace xovm::cloud_material

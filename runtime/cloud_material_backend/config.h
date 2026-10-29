@@ -33,6 +33,19 @@ struct BackendConfig {
 
 using BackendConfigResult = std::variant<BackendConfig, BackendError>;
 
+struct StateMaintenanceConfig {
+    std::string state_dir;
+    std::string trusted_time_provider;
+
+    using Lookup = BackendConfig::Lookup;
+    static std::variant<StateMaintenanceConfig, BackendError> fromEnvironment();
+    static std::variant<StateMaintenanceConfig, BackendError> fromEnvironment(
+        const Lookup &lookup);
+};
+
+using StateMaintenanceConfigResult =
+    std::variant<StateMaintenanceConfig, BackendError>;
+
 } // namespace xovm::cloud_material
 
 #endif

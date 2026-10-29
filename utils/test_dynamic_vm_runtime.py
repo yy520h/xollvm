@@ -184,7 +184,36 @@ int main() {
     assert(next_consumed && next_consumed->generation() == 9);
     assert(next_consumed->windowId() == 2);
 
-    WindowGrant wrong_generation = *next;
+    request.generation = 10;
+    request.window_id = 1;
+    request.previous_state_hash = request.next_state_hash;
+    request.next_state_hash = {};
+    request.next_state_hash[0] = 35;
+    auto replacement = issueWindowGrant(request);
+    assert(replacement);
+    assert(!moved_consumer.consume(
+        *replacement, request.session_secret, 150));
+    auto skipped_replacement = *replacement;
+    skipped_replacement.generation = 11;
+    assert(!moved_consumer.installReplacement(
+        skipped_replacement, request.session_secret, 150));
+    auto wrong_replacement_window = *replacement;
+    wrong_replacement_window.window_id = 2;
+    assert(!moved_consumer.installReplacement(
+        wrong_replacement_window, request.session_secret, 150));
+    auto wrong_replacement_state = *replacement;
+    wrong_replacement_state.previous_state_hash[0] ^= 1;
+    assert(!moved_consumer.installReplacement(
+        wrong_replacement_state, request.session_secret, 150));
+    assert(moved_consumer.generation() == 9 && moved_consumer.windowId() == 2);
+    auto replacement_consumed = moved_consumer.installReplacement(
+        *replacement, request.session_secret, 150);
+    assert(replacement_consumed && replacement_consumed->generation() == 10);
+    assert(replacement_consumed->windowId() == 1);
+    assert(!moved_consumer.installReplacement(
+        *replacement, request.session_secret, 150));
+
+    WindowGrant wrong_generation = *replacement;
     wrong_generation.generation = 10;
     wrong_generation.window_id = 3;
     wrong_generation.previous_state_hash = request.next_state_hash;

@@ -4,6 +4,7 @@
 #include "runtime_providers.h"
 #include "state_wal.h"
 #include "session_state.h"
+#include "checkpoint.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -57,7 +58,8 @@ TEST(startup_runs_readiness_stages_in_order) {
     auto result = coordinator.start();
     EXPECT_TRUE(std::holds_alternative<std::monostate>(result));
     const std::vector<std::string> expected = {
-        "config", "lock", "database", "recovery", "snapshot", "providers", "listener"};
+        "config", "lock", "database", "recovery", "snapshot", "providers",
+        "listener"};
     EXPECT_TRUE(events == expected);
     EXPECT_TRUE(coordinator.ready());
 }

@@ -389,7 +389,7 @@ TEST(raw_session_registration_is_fresh_only_and_anchors_genesis) {
     WindowPreflightInput wrong;
     wrong.session_id = std::string(32, '8');
     wrong.region_id = kRegion;
-    wrong.generation = 7;
+    wrong.generation = 1;
     wrong.window_id = 1;
     wrong.previous_state = std::string(64, 'c');
     wrong.expires_at_ms = 1800;

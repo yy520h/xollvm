@@ -19,6 +19,8 @@ public:
 
     static std::variant<ProcessLock, BackendError> acquire(
         const std::filesystem::path &stateDir);
+    static std::variant<ProcessLock, BackendError> acquireExistingPrivate(
+        const std::filesystem::path &stateDir);
     const std::filesystem::path &path() const { return path_; }
 
 private:

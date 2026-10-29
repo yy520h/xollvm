@@ -81,6 +81,10 @@ public:
         const WindowGrant &grant,
         std::span<const uint8_t, 32> session_secret,
         uint64_t now_ms, uint64_t continuation = 0);
+    std::optional<ConsumedDynamicVmWindow> installReplacement(
+        const WindowGrant &grant,
+        std::span<const uint8_t, 32> session_secret,
+        uint64_t now_ms, uint64_t continuation = 0);
 
     const DynamicHash &stateHash() const { return state_hash_; }
     uint64_t generation() const { return generation_; }
@@ -88,6 +92,11 @@ public:
     const DynamicHash &integrityCommitment() const { return integrity_commitment_; }
 
 private:
+    std::optional<ConsumedDynamicVmWindow> consumeValidated(
+        const WindowGrant &grant,
+        std::span<const uint8_t, 32> session_secret,
+        uint64_t now_ms, uint64_t continuation,
+        bool replacement);
     void invalidate();
     DynamicVmWindowConsumer(DynamicHash build_id, DynamicHash region_id,
                             DynamicHash artifact_hash,

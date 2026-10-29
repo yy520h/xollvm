@@ -312,11 +312,32 @@ std::optional<ConsumedDynamicVmWindow> DynamicVmWindowConsumer::consume(
     const WindowGrant &grant,
     std::span<const uint8_t, 32> session_secret,
     uint64_t now_ms, uint64_t continuation) {
+    return consumeValidated(grant, session_secret, now_ms, continuation, false);
+}
+
+std::optional<ConsumedDynamicVmWindow>
+DynamicVmWindowConsumer::installReplacement(
+    const WindowGrant &grant,
+    std::span<const uint8_t, 32> session_secret,
+    uint64_t now_ms, uint64_t continuation) {
+    return consumeValidated(grant, session_secret, now_ms, continuation, true);
+}
+
+std::optional<ConsumedDynamicVmWindow>
+DynamicVmWindowConsumer::consumeValidated(
+    const WindowGrant &grant,
+    std::span<const uint8_t, 32> session_secret,
+    uint64_t now_ms, uint64_t continuation, bool replacement) {
+    const bool generation_valid = replacement
+        ? generation_ != UINT64_MAX && grant.generation == generation_ + 1 &&
+              grant.window_id == 1
+        : grant.generation == generation_ && window_id_ != UINT64_MAX &&
+              grant.window_id == window_id_ + 1;
     if (grant.format_version != kDynamicVmFormatVersion || grant.build_id != build_id_ ||
         grant.region_id != region_id_ || grant.session_id != session_id_ ||
-        grant.generation != generation_ || grant.window_id != window_id_ + 1 ||
-        grant.previous_state_hash != state_hash_ || grant.issued_at_ms > now_ms ||
-        now_ms >= grant.expires_at_ms || zeroHash(grant.next_state_hash))
+        !generation_valid || grant.previous_state_hash != state_hash_ ||
+        grant.issued_at_ms > now_ms || now_ms >= grant.expires_at_ms ||
+        zeroHash(grant.next_state_hash))
         return std::nullopt;
     auto material = decryptWindowMaterial(grant, session_secret);
     if (!material) return std::nullopt;

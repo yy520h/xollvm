@@ -16,6 +16,12 @@ namespace xovm::cloud_material {
 
 inline constexpr std::size_t kMaxWalPayload = 8 * 1024 * 1024;
 inline constexpr std::size_t kMaxWalFrame = kMaxWalPayload + 40 + 32;
+inline constexpr std::uint64_t kMaxWalSize = 128ULL * 1024 * 1024;
+
+enum class WalAppendMode {
+    runtime,
+    maintenance,
+};
 
 struct StateDelta {
     std::vector<std::byte> bytes;
@@ -43,7 +49,8 @@ public:
     };
 
     explicit StateWal(std::filesystem::path path, IoHooks hooks = {},
-                      std::uint64_t baseSequence = 0);
+                      std::uint64_t baseSequence = 0,
+                      WalAppendMode appendMode = WalAppendMode::runtime);
     WalCommitResult appendAndSync(std::uint64_t sequence, const StateDelta &delta,
                                   std::span<const std::byte> exactResponse);
     WalRecoveryResult recover();
@@ -52,6 +59,7 @@ private:
     std::filesystem::path path_;
     IoHooks hooks_;
     std::uint64_t base_sequence_ = 0;
+    WalAppendMode append_mode_ = WalAppendMode::runtime;
 };
 
 } // namespace xovm::cloud_material

@@ -13,6 +13,7 @@ namespace xovm::cloud_material {
 
 struct StateResult {
     std::uint64_t generation = 0;
+    std::uint64_t window_id = 0;
     std::uint64_t counter = 0;
     std::vector<std::byte> response;
     std::string session_id;
@@ -34,6 +35,10 @@ struct WindowPreflightInput {
     std::uint64_t window_id = 0;
     std::string previous_state;
     std::uint64_t expires_at_ms = 0;
+    // Set by preflight. Callers supply only expires_at_ms, which is the current
+    // policy/session/window bound. Raw generation timing is independently fixed
+    // to the server epoch plus 120 seconds and never slides.
+    std::uint64_t generation_deadline_ms = 0;
 };
 
 struct WindowFinalizeInput {
@@ -70,6 +75,15 @@ using RawSessionRegistrationOutcome =
 using BuildRawSessionMetadata = std::function<
     std::variant<RawSessionMetadata, BackendError>(std::uint64_t counter)>;
 
+struct ReclamationResult {
+    std::size_t records_retired = 0;
+    std::size_t response_bytes_reclaimed = 0;
+    bool more_work = false;
+    bool operator==(const ReclamationResult &) const = default;
+};
+
+using ReclamationOutcome = std::variant<ReclamationResult, BackendError>;
+
 class SessionState {
 public:
     explicit SessionState(StateWal *wal = nullptr);
@@ -99,7 +113,7 @@ public:
                                    const std::string &clientEphemeralKey);
         StateResult claimServer(const std::string &serverNonce,
                                 const std::string &serverEphemeralKey);
-        void preflightWindow(WindowPreflightInput input);
+        std::uint64_t preflightWindow(WindowPreflightInput input);
         StateResult finalizeWindow(WindowFinalizeInput input);
         void setResponse(std::vector<std::byte> response) { response_ = std::move(response); }
     private:
@@ -112,6 +126,7 @@ public:
         std::uint64_t now_;
         bool changed_ = false;
         std::optional<WindowPreflightInput> window_preflight_;
+        std::optional<StateResult> committed_result_;
         std::vector<std::byte> response_;
     };
 
@@ -122,6 +137,12 @@ public:
         const RequestFacts &facts, const AnonymousGrant &grant,
         std::uint64_t trustedNow, const RawSessionRegistrationInput &input,
         const BuildRawSessionMetadata &buildMetadata);
+    std::optional<StateOutcome> lookupRawWindowRequest(
+        const std::string &sessionId, const std::string &softwareId,
+        const std::string &buildId, const std::string &regionId,
+        const std::string &requestId, const std::string &requestDigest,
+        std::uint64_t trustedNow);
+    ReclamationOutcome reclaimExpiredResponses(std::uint64_t trustedNow);
     std::variant<std::monostate, BackendError> restore(const RecoveredState &recovered);
 
 private:
@@ -132,12 +153,16 @@ private:
 
     struct ReplyRecord {
         StateResult result;
+        std::string request_digest;
         std::string subject_id;
         std::string build_id;
         std::string software_id;
         std::string artifact_hash;
         std::string region_id;
         std::string request_type;
+        std::uint64_t retire_at_ms = 0;
+        bool retired = false;
+        bool legacy_window_identity = false;
     };
     std::mutex mutex_;
     std::unordered_map<std::string, ReplyRecord> replies_;
@@ -172,6 +197,7 @@ private:
         std::uint32_t key_version = 0;
         std::uint64_t valid_until_ms = 0;
         bool closed = false;
+        bool raw_chain_started = false;
     };
     std::unordered_map<std::string, SessionRecord> sessions_;
     struct WindowRecord {
@@ -179,7 +205,9 @@ private:
         std::uint64_t generation = 0;
         std::uint64_t window_id = 0;
         std::string state;
-        std::uint64_t expires_at_ms = 0;
+        std::uint64_t epoch_at_ms = 0;
+        std::uint64_t deadline_ms = 0;
+        bool legacy_timing = false;
     };
     std::unordered_map<std::string, WindowRecord> windows_;
     std::uint64_t next_counter_ = 1;

@@ -56,6 +56,9 @@ public:
     static void registerLinkedProviders();
     static std::variant<RuntimeProviderBundle, BackendError> resolve(
         const BackendConfig &config);
+    static std::variant<std::function<std::variant<std::uint64_t, BackendError>()>,
+                        BackendError>
+    resolveTrustedTime(const StateMaintenanceConfig &config);
     static void clearForTest();
 };
 

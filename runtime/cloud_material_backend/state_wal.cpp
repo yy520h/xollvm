@@ -178,8 +178,10 @@ bool clearQuarantine(const std::filesystem::path &path) {
 
 } // namespace
 
-StateWal::StateWal(std::filesystem::path path, IoHooks hooks, std::uint64_t baseSequence)
-    : path_(std::move(path)), hooks_(std::move(hooks)), base_sequence_(baseSequence) {
+StateWal::StateWal(std::filesystem::path path, IoHooks hooks,
+                   std::uint64_t baseSequence, WalAppendMode appendMode)
+    : path_(std::move(path)), hooks_(std::move(hooks)),
+      base_sequence_(baseSequence), append_mode_(appendMode) {
     if (!hooks_.write) hooks_.write = defaultWrite;
     if (!hooks_.sync) hooks_.sync = defaultSync;
 }
@@ -209,6 +211,14 @@ WalCommitResult StateWal::appendAndSync(std::uint64_t sequence, const StateDelta
         if (::fstat(fd, &before) != 0 || before.st_size < 0) {
             ::close(fd);
             return ioError("wal_stat_failed");
+        }
+        const auto currentSize = static_cast<std::uint64_t>(before.st_size);
+        const auto limit = append_mode_ == WalAppendMode::maintenance
+            ? kMaxWalSize : kMaxWalSize - kMaxWalFrame;
+        if (currentSize > limit || encoded.size() > limit - currentSize) {
+            ::close(fd);
+            return ioError(append_mode_ == WalAppendMode::maintenance
+                ? "wal_size_limit" : "wal_maintenance_required");
         }
         if (!beginQuarantine(path, sequence, before.st_size, before)) {
             ::close(fd);
@@ -269,7 +279,7 @@ WalRecoveryResult StateWal::recover() {
         OwnedFd fd(rawFd);
         struct stat status{};
         if (::fstat(fd.get(), &status) != 0 || status.st_size < 0 ||
-            static_cast<std::uint64_t>(status.st_size) > 128 * 1024 * 1024)
+            static_cast<std::uint64_t>(status.st_size) > kMaxWalSize)
             return ioError("wal_size_limit");
         std::vector<std::byte> data(static_cast<std::size_t>(status.st_size));
         std::size_t readTotal = 0;

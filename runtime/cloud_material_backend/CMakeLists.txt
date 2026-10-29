@@ -44,6 +44,7 @@ add_library(xovm-cloud-material-backend
     session_state.cpp
     state_wal.cpp
     checkpoint.cpp
+    state_maintenance.cpp
     config.cpp
     process_lock.cpp
     http_server.cpp
@@ -64,8 +65,6 @@ add_library(xovm-cloud-material-backend
      raw_api_dispatch.cpp
      cloud_api.cpp
     ../cloud_material/dynamic_vm_crypto.cpp
-    ../cloud_material/guardian_channel.cpp
-    ../cloud_material/launcher.cpp
     ../cloud_material/chaff_scheduler.cpp
     ../cloud_material/material_package.cpp
     ../cloud_material/material_protocol.cpp)
@@ -76,17 +75,29 @@ target_link_libraries(xovm-cloud-material-backend PUBLIC
     SQLite3::SQLite3
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
-    xovm::dynamic-vm-runtime)
+    xovm::dynamic-vm-runtime
+    xovm::dynamic-vm-control)
 
 add_executable(xovm-cloud-material-backend-server
     main.cpp)
 target_link_libraries(xovm-cloud-material-backend-server PRIVATE
     xovm-cloud-material-backend)
 
+add_executable(xovm-cloud-material-state-maintenance
+    state_maintenance_main.cpp)
+target_link_libraries(xovm-cloud-material-state-maintenance PRIVATE
+    xovm-cloud-material-backend)
+
 add_executable(xovm-cloud-material-backend-fixture-server
     main.cpp
     ../../utils/CloudMaterialProviderFixture.cpp)
 target_link_libraries(xovm-cloud-material-backend-fixture-server PRIVATE
+    xovm-cloud-material-backend)
+
+add_executable(xovm-cloud-material-state-maintenance-fixture
+    state_maintenance_main.cpp
+    ../../utils/CloudMaterialProviderFixture.cpp)
+target_link_libraries(xovm-cloud-material-state-maintenance-fixture PRIVATE
     xovm-cloud-material-backend)
 
 add_executable(xovm-cloud-material-raw-client-acceptance
@@ -118,6 +129,11 @@ if(BUILD_TESTING)
     add_test(NAME xovm-cloud-material-backend-tls-proxy
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/../../utils/test_cloud_material_backend_tls_proxy.py)
+
+    add_test(NAME xovm-cloud-material-state-maintenance-process
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../utils/test_cloud_material_state_maintenance.py
+            $<TARGET_FILE:xovm-cloud-material-state-maintenance-fixture>)
 
     add_executable(xovm-cloud-material-backend-tests
         ../../utils/CloudMaterialBackendProtocolTest.cpp)
@@ -153,6 +169,13 @@ if(BUILD_TESTING)
         xovm-cloud-material-backend)
     add_test(NAME xovm-cloud-material-wal-tests
         COMMAND xovm-cloud-material-wal-tests)
+
+    add_executable(xovm-cloud-material-state-maintenance-tests
+        ../../utils/CloudMaterialStateMaintenanceTest.cpp)
+    target_link_libraries(xovm-cloud-material-state-maintenance-tests PRIVATE
+        xovm-cloud-material-backend)
+    add_test(NAME xovm-cloud-material-state-maintenance-tests
+        COMMAND xovm-cloud-material-state-maintenance-tests)
 
     add_executable(xovm-cloud-material-config-tests
         ../../utils/CloudMaterialBackendConfigTest.cpp)

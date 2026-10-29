@@ -32,3 +32,21 @@ target_link_libraries(xovm-dynamic-vm-runtime PUBLIC OpenSSL::Crypto)
 set_target_properties(xovm-dynamic-vm-runtime PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
+
+add_library(xovm-dynamic-vm-control STATIC
+  guardian_channel.cpp
+  launcher.cpp
+)
+add_library(xovm::dynamic-vm-control ALIAS xovm-dynamic-vm-control)
+target_compile_features(xovm-dynamic-vm-control PUBLIC cxx_std_20)
+target_include_directories(xovm-dynamic-vm-control PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../..>"
+)
+target_link_libraries(xovm-dynamic-vm-control PUBLIC
+  OpenSSL::Crypto
+  xovm::dynamic-vm-runtime
+)
+set_target_properties(xovm-dynamic-vm-control PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+)
