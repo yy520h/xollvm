@@ -78,11 +78,60 @@ bool applyAarch64Relocation(std::span<uint8_t> code,
         }
         break;
     }
-    case Aarch64RelocationType::PCRelative:
-    case Aarch64RelocationType::AbsoluteAddrLoad:
-    case Aarch64RelocationType::PageOffset:
-        // These require context-aware calculation; currently fail-closed
-        return false;
+    case Aarch64RelocationType::PCRelative: {
+        // PC-relative: address - (current_pc + 4)
+        // Assuming relocation.target_value contains absolute address
+        // and offset is the PC location
+        int64_t relative = static_cast<int64_t>(relocation.target_value) -
+                          (static_cast<int64_t>(offset) + 4);
+
+        // For AArch64, PC-relative immediates are typically 19-bit or 26-bit
+        // Validate the relative offset fits in the required size
+        int64_t min_val = -(1LL << (relocation.width - 1));
+        int64_t max_val = (1LL << (relocation.width - 1)) - 1;
+
+        if (relative < min_val || relative > max_val)
+            return false;  // Out of range
+
+        // Encode relative offset
+        uint32_t encoded = static_cast<uint32_t>(relative) &
+                          ((1U << relocation.width) - 1);
+
+        if (relocation.shift > 0)
+            encoded >>= relocation.shift;
+
+        for (size_t i = 0; i < width_bytes && offset + i < code.size(); ++i) {
+            code[offset + i] = static_cast<uint8_t>(encoded & 0xff);
+            encoded >>= 8;
+        }
+        break;
+    }
+    case Aarch64RelocationType::AbsoluteAddrLoad: {
+        // Absolute address (64-bit only)
+        uint64_t addr = relocation.target_value;
+        for (size_t i = 0; i < width_bytes && offset + i < code.size(); ++i) {
+            code[offset + i] = static_cast<uint8_t>(addr & 0xff);
+            addr >>= 8;
+        }
+        break;
+    }
+    case Aarch64RelocationType::PageOffset: {
+        // Page + offset: split address into 12-bit page and offset
+        // Page bits [31:12] + offset bits [11:0]
+        uint32_t target = relocation.target_value;
+        uint32_t page = (target >> 12) & 0xfffff;  // 20-bit page
+        uint32_t offset_bits = target & 0xfff;      // 12-bit offset
+
+        // Write page part
+        uint32_t page_encoded = (page & 0xfffff) << relocation.shift;
+        for (size_t i = 0; i < width_bytes && offset + i < code.size(); ++i) {
+            code[offset + i] = static_cast<uint8_t>(page_encoded & 0xff);
+            page_encoded >>= 8;
+        }
+
+        // Note: offset is typically handled separately in a following MOVK instruction
+        break;
+    }
     }
     return true;
 }
