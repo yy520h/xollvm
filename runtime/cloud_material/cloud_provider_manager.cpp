@@ -84,7 +84,7 @@ std::optional<CloudProviderManager> CloudProviderManager::create(
     return std::nullopt;
   }
 
-  return manager;
+  return std::optional<CloudProviderManager>(std::in_place, registrations);
 }
 
 bool CloudProviderManager::registerProvider(
@@ -173,7 +173,7 @@ std::optional<std::vector<uint8_t>> CloudProviderManager::receiveMessage() {
   return message;
 }
 
-std::optional<ProviderStatus> CloudProviderManager::getProviderStatus(
+std::optional<CloudProviderManager::ProviderStatus> CloudProviderManager::getProviderStatus(
     uint32_t provider_id) const {
   auto it = provider_statuses_.find(provider_id);
   if (it == provider_statuses_.end()) {

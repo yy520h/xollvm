@@ -73,10 +73,12 @@ class CloudProviderManager {
   // Get provider count
   uint32_t getProviderCount() const { return providers_.size(); }
 
- private:
+  // Constructor (public for std::optional)
   CloudProviderManager(
       const std::vector<ProviderRegistration>& registrations)
       : active_provider_(std::nullopt), health_check_counter_(0) {}
+
+ private:
 
   std::map<uint32_t, RawSocketCloudProvider::ConnectionConfig> providers_;
   std::map<uint32_t, ProviderStatus> provider_statuses_;

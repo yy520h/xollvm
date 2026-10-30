@@ -29,7 +29,8 @@ public:
                                const DynamicHash &execution_hash) const;
 
     // Validate completion before returning to guardian
-    bool validateCompletion(const ContinuationCompletionV2 &completion) const;
+    bool validateCompletion(uint32_t node_id, ContinuationNodeStatusV2 status,
+                           const DynamicHash &commitment) const;
 
 private:
     explicit RuntimeGuardianBridge(IntegrityState integrity_state)

@@ -97,7 +97,7 @@ std::optional<RawSocketCloudProvider> RawSocketCloudProvider::create(
     return std::nullopt;
   }
 
-  return RawSocketCloudProvider(config, socket_fd);
+  return std::optional<RawSocketCloudProvider>(std::in_place, config, socket_fd);
 }
 
 bool RawSocketCloudProvider::sendMessage(

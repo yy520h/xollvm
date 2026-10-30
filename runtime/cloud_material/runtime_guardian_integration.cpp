@@ -63,22 +63,23 @@ bool RuntimeGuardianBridge::recordExecutionContext(
 }
 
 bool RuntimeGuardianBridge::validateCompletion(
-    const ContinuationCompletionV2 &completion) const {
+    uint32_t node_id, ContinuationNodeStatusV2 status,
+    const DynamicHash &commitment) const {
     // Validate completion before returning to guardian
-    
+
     // Node ID must be non-zero
-    if (completion.node_id == 0)
+    if (node_id == 0)
         return false;
-    
+
     // Transition tail commitment must be valid
-    if (completion.transition_tail_commitment == DynamicHash{})
+    if (commitment == DynamicHash{})
         return false;
-    
+
     // Status must be valid
-    if (completion.status != ContinuationNodeStatusV2::Continue &&
-        completion.status != ContinuationNodeStatusV2::Return)
+    if (status != ContinuationNodeStatusV2::Continue &&
+        status != ContinuationNodeStatusV2::Return)
         return false;
-    
+
     return true;
 }
 

@@ -56,7 +56,7 @@ std::optional<PerformanceMonitor> PerformanceMonitor::create(
     return std::nullopt;
   }
 
-  return PerformanceMonitor(config);
+  return std::optional<PerformanceMonitor>(std::in_place, config);
 }
 
 bool PerformanceMonitor::recordMetric(const MetricSample& sample) {

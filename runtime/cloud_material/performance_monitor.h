@@ -74,9 +74,11 @@ class PerformanceMonitor {
   // Get sample count for category
   uint64_t getCategorySampleCount(MetricCategory category) const;
 
- private:
+  // Constructor (public for std::optional)
   PerformanceMonitor(const MonitorConfig& config)
       : config_(config), total_samples_(0) {}
+
+ private:
 
   MonitorConfig config_;
   std::vector<MetricSample> samples_;

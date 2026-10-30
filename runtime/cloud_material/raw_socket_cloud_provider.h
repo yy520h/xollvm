@@ -52,10 +52,12 @@ class RawSocketCloudProvider {
   // Destructor
   ~RawSocketCloudProvider();
 
- private:
+  // Constructor (public for std::optional)
   RawSocketCloudProvider(const ConnectionConfig& config, int socket_fd)
       : config_(config), socket_fd_(socket_fd), connected_(true),
         message_counter_(0) {}
+
+ private:
 
   ConnectionConfig config_;
   int socket_fd_;
