@@ -80,4 +80,41 @@ bool ContinuationCursorV2::complete() const {
     return complete_;
 }
 
+bool ContinuationCursorV2::validateOperandBoundary(
+    const ContinuationTailOperand &operand) const {
+    // Operand index must be within bounds
+    if (operand.operand_id >= kDynamicVmMaxOperandsPerTail)
+        return false;
+
+    // Register index must be valid
+    if (operand.register_index >= kDynamicVmMaxI32RegistersV2)
+        return false;
+
+    // Operand size must be reasonable
+    if (operand.operand_size == 0 || operand.operand_size > 8)
+        return false;
+
+    // For immediate operands, value is always valid but size should be checked
+    if (operand.operand_type == 2 && operand.operand_size < 4)
+        return false;
+
+    return true;
+}
+
+bool ContinuationCursorV2::validateShardIdentity(
+    uint32_t shard_id, const DynamicHash &shard_commitment) const {
+    const auto *node = current();
+    if (!node) return false;
+
+    // Shard ID must match current node
+    if (shard_id != node->shard_id)
+        return false;
+
+    // Shard commitment must match current node
+    if (shard_commitment != node->handler_shard_commitment)
+        return false;
+
+    return true;
+}
+
 } // namespace xovm::material
