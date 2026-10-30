@@ -87,21 +87,71 @@ std::optional<std::vector<uint8_t>> emitReturnInt(uint32_t source, uint32_t next
     return code;
 }
 
-std::optional<std::vector<uint8_t>> emitLoadAndReturnInt(
-    uint32_t destination, uint32_t immediate, uint32_t source, uint32_t next_ip) {
+std::optional<std::vector<uint8_t>> emitMoveRegister(
+    uint32_t destination, uint32_t source, uint32_t next_ip) {
     if (!validRegister(destination) || !validRegister(source))
         return std::nullopt;
     std::vector<uint8_t> code;
     putInstruction(code, loadPointer(1, 0,
         offsetof(XovmDynamicVmExecutionContext, registers)));
-    putImmediate(code, 2, immediate);
+    putInstruction(code, loadRegister(2, 1, source * sizeof(uint32_t)));
     putInstruction(code, storeRegister(2, 1, destination * sizeof(uint32_t)));
-    putInstruction(code, loadPointer(2, 0,
-        offsetof(XovmDynamicVmExecutionContext, return_storage)));
-    putInstruction(code, loadRegister(3, 1, source * sizeof(uint32_t)));
-    putInstruction(code, storeRegister(3, 2, 0));
     putAdvance(code, next_ip);
-    putImmediate(code, 0, XOVM_SHARD_RETURN);
+    putImmediate(code, 0, XOVM_SHARD_CONTINUE);
+    putInstruction(code, kRet);
+    return code;
+}
+
+std::optional<std::vector<uint8_t>> emitAddImmediate(
+    uint32_t destination, uint32_t source, uint32_t immediate, uint32_t next_ip) {
+    if (!validRegister(destination) || !validRegister(source))
+        return std::nullopt;
+    std::vector<uint8_t> code;
+    putInstruction(code, loadPointer(1, 0,
+        offsetof(XovmDynamicVmExecutionContext, registers)));
+    putInstruction(code, loadRegister(2, 1, source * sizeof(uint32_t)));
+    // ADD w2, w2, immediate (or use multiple instructions for large immediates)
+    if (immediate <= 0xfff) {
+        putInstruction(code, 0x11000042u | ((immediate & 0xfff) << 10));
+    } else if (immediate <= 0xffffff) {
+        // Use multiple ADD instructions for larger immediates
+        putInstruction(code, 0x11000042u | ((immediate & 0xfff) << 10));
+        putInstruction(code, 0x11400042u | (((immediate >> 12) & 0xfff) << 10));
+    } else {
+        // Fall back to loading immediate into register
+        putImmediate(code, 3, immediate);
+        putInstruction(code, 0x0B020042u);  // ADD w2, w2, w3
+    }
+    putInstruction(code, storeRegister(2, 1, destination * sizeof(uint32_t)));
+    putAdvance(code, next_ip);
+    putImmediate(code, 0, XOVM_SHARD_CONTINUE);
+    putInstruction(code, kRet);
+    return code;
+}
+
+std::optional<std::vector<uint8_t>> emitSubtractImmediate(
+    uint32_t destination, uint32_t source, uint32_t immediate, uint32_t next_ip) {
+    if (!validRegister(destination) || !validRegister(source))
+        return std::nullopt;
+    std::vector<uint8_t> code;
+    putInstruction(code, loadPointer(1, 0,
+        offsetof(XovmDynamicVmExecutionContext, registers)));
+    putInstruction(code, loadRegister(2, 1, source * sizeof(uint32_t)));
+    // SUB w2, w2, immediate
+    if (immediate <= 0xfff) {
+        putInstruction(code, 0x51000042u | ((immediate & 0xfff) << 10));
+    } else if (immediate <= 0xffffff) {
+        // Use multiple SUB instructions for larger immediates
+        putInstruction(code, 0x51000042u | ((immediate & 0xfff) << 10));
+        putInstruction(code, 0x51400042u | (((immediate >> 12) & 0xfff) << 10));
+    } else {
+        // Fall back to loading immediate into register
+        putImmediate(code, 3, immediate);
+        putInstruction(code, 0x4B020042u);  // SUB w2, w2, w3
+    }
+    putInstruction(code, storeRegister(2, 1, destination * sizeof(uint32_t)));
+    putAdvance(code, next_ip);
+    putImmediate(code, 0, XOVM_SHARD_CONTINUE);
     putInstruction(code, kRet);
     return code;
 }
@@ -260,6 +310,44 @@ std::optional<std::vector<uint8_t>> buildAarch64LoadAndReturnIntShard(
 #endif
 }
 
+std::optional<std::vector<uint8_t>> buildAarch64MoveRegisterShard(
+    uint32_t destination, uint32_t source, uint32_t next_ip) {
+#if !defined(__aarch64__) || defined(XOVM_DYNAMIC_VM_TEST_NON_AARCH64)
+    (void)destination;
+    (void)source;
+    (void)next_ip;
+    return std::nullopt;
+#else
+    return emitMoveRegister(destination, source, next_ip);
+#endif
+}
+
+std::optional<std::vector<uint8_t>> buildAarch64AddImmediateShard(
+    uint32_t destination, uint32_t source, uint32_t immediate, uint32_t next_ip) {
+#if !defined(__aarch64__) || defined(XOVM_DYNAMIC_VM_TEST_NON_AARCH64)
+    (void)destination;
+    (void)source;
+    (void)immediate;
+    (void)next_ip;
+    return std::nullopt;
+#else
+    return emitAddImmediate(destination, source, immediate, next_ip);
+#endif
+}
+
+std::optional<std::vector<uint8_t>> buildAarch64SubtractImmediateShard(
+    uint32_t destination, uint32_t source, uint32_t immediate, uint32_t next_ip) {
+#if !defined(__aarch64__) || defined(XOVM_DYNAMIC_VM_TEST_NON_AARCH64)
+    (void)destination;
+    (void)source;
+    (void)immediate;
+    (void)next_ip;
+    return std::nullopt;
+#else
+    return emitSubtractImmediate(destination, source, immediate, next_ip);
+#endif
+}
+
 bool validateAarch64ShardTemplate(
     std::span<const uint8_t> code,
     Aarch64ShardTemplate expected_template,
@@ -274,6 +362,15 @@ bool validateAarch64ShardTemplate(
         return equalExpected(code, emitLoadAndReturnInt(
             parameters.destination, parameters.immediate,
             parameters.source, parameters.next_ip));
+    case Aarch64ShardTemplate::MoveRegister:
+        return equalExpected(code, emitMoveRegister(
+            parameters.destination, parameters.source, parameters.next_ip));
+    case Aarch64ShardTemplate::AddImmediate:
+        return equalExpected(code, emitAddImmediate(
+            parameters.destination, parameters.source, parameters.immediate, parameters.next_ip));
+    case Aarch64ShardTemplate::SubtractImmediate:
+        return equalExpected(code, emitSubtractImmediate(
+            parameters.destination, parameters.source, parameters.immediate, parameters.next_ip));
     }
     return false;
 }
@@ -297,6 +394,36 @@ bool validateAarch64LoadAndReturnIntShard(std::span<const uint8_t> code,
                                           uint32_t destination,
                                           uint32_t immediate,
                                           uint32_t source,
+                                          uint32_t next_ip) {
+    return validateAarch64ShardTemplate(code, Aarch64ShardTemplate::LoadAndReturnInt,
+        {destination, immediate, source, next_ip});
+}
+
+bool validateAarch64MoveRegisterShard(std::span<const uint8_t> code,
+                                      uint32_t destination,
+                                      uint32_t source,
+                                      uint32_t next_ip) {
+    return validateAarch64ShardTemplate(code, Aarch64ShardTemplate::MoveRegister,
+        {destination, 0, source, next_ip});
+}
+
+bool validateAarch64AddImmediateShard(std::span<const uint8_t> code,
+                                      uint32_t destination,
+                                      uint32_t source,
+                                      uint32_t immediate,
+                                      uint32_t next_ip) {
+    return validateAarch64ShardTemplate(code, Aarch64ShardTemplate::AddImmediate,
+        {destination, immediate, source, next_ip});
+}
+
+bool validateAarch64SubtractImmediateShard(std::span<const uint8_t> code,
+                                           uint32_t destination,
+                                           uint32_t source,
+                                           uint32_t immediate,
+                                           uint32_t next_ip) {
+    return validateAarch64ShardTemplate(code, Aarch64ShardTemplate::SubtractImmediate,
+        {destination, immediate, source, next_ip});
+}
                                           uint32_t next_ip) {
     return validateAarch64ShardTemplate(
         code, Aarch64ShardTemplate::LoadAndReturnInt,

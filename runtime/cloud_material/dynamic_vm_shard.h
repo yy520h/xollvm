@@ -24,10 +24,21 @@ std::optional<std::vector<uint8_t>> buildAarch64ReturnIntShard(
 std::optional<std::vector<uint8_t>> buildAarch64LoadAndReturnIntShard(
     uint32_t destination, uint32_t immediate, uint32_t source, uint32_t next_ip);
 
+// Extended shard builders for additional VM operations
+std::optional<std::vector<uint8_t>> buildAarch64MoveRegisterShard(
+    uint32_t destination, uint32_t source, uint32_t next_ip);
+std::optional<std::vector<uint8_t>> buildAarch64AddImmediateShard(
+    uint32_t destination, uint32_t source, uint32_t immediate, uint32_t next_ip);
+std::optional<std::vector<uint8_t>> buildAarch64SubtractImmediateShard(
+    uint32_t destination, uint32_t source, uint32_t immediate, uint32_t next_ip);
+
 enum class Aarch64ShardTemplate : uint8_t {
     LoadImmediate,
     ReturnInt,
     LoadAndReturnInt,
+    MoveRegister,        // MOV destination, source
+    AddImmediate,        // ADD destination, source, immediate
+    SubtractImmediate,   // SUB destination, source, immediate
 };
 
 struct Aarch64ShardTemplateParameters {
@@ -35,6 +46,16 @@ struct Aarch64ShardTemplateParameters {
     uint32_t immediate = 0;
     uint32_t source = 0;
     uint32_t next_ip = 0;
+};
+
+// Extended operand specification for multi-operation shards
+struct Aarch64OperandAbi {
+    uint8_t opcode;          // Operation type (LOADI, RET_INT, MOV, ADD, SUB, etc.)
+    uint32_t destination_register;
+    uint32_t source_register;
+    uint32_t immediate_value;
+    uint8_t operand_size;    // 1=byte, 2=word, 4=dword, 8=qword
+    uint8_t flags;           // Condition flags, shift amounts, etc.
 };
 
 // Exact expected-template validator. Only operands used by expected_template
@@ -59,6 +80,22 @@ bool validateAarch64LoadAndReturnIntShard(std::span<const uint8_t> code,
                                           uint32_t immediate,
                                           uint32_t source,
                                           uint32_t next_ip);
+
+// Extended validators for additional VM operations
+bool validateAarch64MoveRegisterShard(std::span<const uint8_t> code,
+                                      uint32_t destination,
+                                      uint32_t source,
+                                      uint32_t next_ip);
+bool validateAarch64AddImmediateShard(std::span<const uint8_t> code,
+                                      uint32_t destination,
+                                      uint32_t source,
+                                      uint32_t immediate,
+                                      uint32_t next_ip);
+bool validateAarch64SubtractImmediateShard(std::span<const uint8_t> code,
+                                           uint32_t destination,
+                                           uint32_t source,
+                                           uint32_t immediate,
+                                           uint32_t next_ip);
 
 // Compatibility recognizer for artifact readers that do not yet carry the
 // expected template parameters. It accepts one complete canonical shard or the
