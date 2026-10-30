@@ -78,7 +78,12 @@ int main() {
     
     std::cout << "✓ 管理器创建成功" << std::endl;
     std::cout << "  提供商数量: " << manager->getProviderCount() << std::endl;
-    std::cout << "  活跃提供商: " << manager->getActiveProvider().value() << std::endl;
+    auto active = manager->getActiveProvider();
+    if (active.has_value()) {
+        std::cout << "  活跃提供商: " << active.value() << std::endl;
+    } else {
+        std::cout << "  活跃提供商: 无" << std::endl;
+    }
     
     // 5. 测试PerformanceMonitor
     std::cout << "\n[测试5] PerformanceMonitor 测试" << std::endl;

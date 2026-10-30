@@ -77,11 +77,13 @@ RawSocketCloudProvider::parseHeader(const std::vector<uint8_t>& buffer) {
 std::optional<RawSocketCloudProvider> RawSocketCloudProvider::create(
     const ConnectionConfig& config) {
   if (!validateConfig(config)) {
+    // Debug: config validation failed
     return std::nullopt;
   }
 
   int socket_fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (socket_fd < 0) {
+    // Debug: socket creation failed
     return std::nullopt;
   }
 
@@ -89,7 +91,7 @@ std::optional<RawSocketCloudProvider> RawSocketCloudProvider::create(
   std::memset(&server_addr, 0, sizeof(server_addr));
   server_addr.sin_family = AF_INET;
   server_addr.sin_port = htons(config.remote_port);
-  server_addr.sin_addr.s_addr = config.remote_ip;
+  server_addr.sin_addr.s_addr = htonl(config.remote_ip);  // 修复：需要htonl转换
 
   if (::connect(socket_fd, (struct sockaddr*)&server_addr,
                 sizeof(server_addr)) < 0) {
