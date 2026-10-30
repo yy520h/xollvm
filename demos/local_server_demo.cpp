@@ -7,7 +7,7 @@
 #include <sys/socket.h>
 
 constexpr uint32_t kWireProtocolMagic = 0xDEADBEEF;
-constexpr uint16_t kServerPort = 8080;
+constexpr uint16_t kServerPort = 9999;  // 使用非特权端口
 
 struct MessageHeader {
     uint32_t magic;
@@ -51,7 +51,7 @@ int main() {
     server_addr.sin_port = htons(kServerPort);
     
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        std::cerr << "绑定失败" << std::endl;
+        std::cerr << "绑定失败: " << strerror(errno) << " (端口: " << kServerPort << ")" << std::endl;
         close(server_fd);
         return 1;
     }

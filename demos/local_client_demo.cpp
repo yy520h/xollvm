@@ -16,7 +16,7 @@ int main() {
     
     RawSocketCloudProvider::ConnectionConfig config;
     config.remote_ip = 0x7F000001;  // 127.0.0.1
-    config.remote_port = 8080;
+    config.remote_port = 9999;  // 使用非特权端口
     config.connection_timeout = 5000;
     config.max_retries = 3;
     config.buffer_size = 65536;
