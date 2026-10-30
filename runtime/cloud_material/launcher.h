@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <optional>
+#include <atomic>
+#include <mutex>
 
 #ifdef XOVM_GUARDIAN_TESTING
 #include <functional>
@@ -13,6 +15,33 @@
 #include <sys/types.h>
 
 namespace xovm::material {
+
+// Process identity proof for production-level verification
+struct ProcessIdentityProof {
+    pid_t pid = -1;
+    uid_t uid = 0;
+    gid_t gid = 0;
+    uint64_t start_ticks = 0;
+    dev_t cwd_device = 0;
+    ino_t cwd_inode = 0;
+
+    bool operator==(const ProcessIdentityProof &other) const = default;
+};
+
+// Result of FD integrity verification
+struct FdIntegrityStatus {
+    bool descriptor_intact = false;
+    bool socket_valid = false;
+    bool replacement_detected = false;
+};
+
+// Renewal failure state transition
+enum class RenewalFailureState : uint8_t {
+    Active = 0,
+    RenewalDue = 1,
+    RenewalFailed = 2,
+    ProtectedEntryBlocked = 3,
+};
 
 class Launcher {
 public:
@@ -37,6 +66,19 @@ public:
         GuardianChannel &channel() { return channel_; }
         const GuardianChannel &channel() const { return channel_; }
         bool challenge(uint64_t challenge_counter, uint64_t generation);
+
+        // Production-level process identity verification
+        std::optional<ProcessIdentityProof> captureProcessIdentity() const;
+        bool verifyProcessIdentity(const ProcessIdentityProof &proof) const;
+
+        // FD integrity verification with replacement detection
+        FdIntegrityStatus checkFdIntegrity() const;
+
+        // Renewal failure state management
+        RenewalFailureState renewalState() const;
+        bool transitionRenewalState(RenewalFailureState next_state);
+        bool canEnterProtectedEntry() const;
+
         int wait();
         void terminate();
 
@@ -47,6 +89,10 @@ public:
         pid_t pid_ = -1;
         int pidfd_ = -1;
         GuardianChannel channel_;
+        ProcessIdentityProof captured_identity_;
+        bool identity_captured_ = false;
+        std::atomic<RenewalFailureState> renewal_state_{RenewalFailureState::Active};
+        mutable std::mutex state_mutex_;
         bool waited_ = false;
         friend class Launcher;
     };

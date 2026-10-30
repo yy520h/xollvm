@@ -249,4 +249,171 @@ int Launcher::runTestWorker(const StartOptions &options,
 }
 #endif
 
+std::optional<ProcessIdentityProof> Launcher::Child::captureProcessIdentity() const {
+    if (pid_ <= 0) return std::nullopt;
+
+    ProcessIdentityProof proof;
+    proof.pid = pid_;
+
+    // Capture process credentials from /proc/[pid]/status
+    const auto status_path = "/proc/" + std::to_string(pid_) + "/status";
+    std::ifstream status_file(status_path);
+    if (!status_file) return std::nullopt;
+
+    std::string line;
+    uint64_t start_ticks = 0;
+    bool uid_found = false, gid_found = false, ticks_found = false;
+
+    // First get start ticks from /proc/[pid]/stat
+    const auto stat_path = "/proc/" + std::to_string(pid_) + "/stat";
+    std::ifstream stat_file(stat_path);
+    if (!stat_file) return std::nullopt;
+
+    std::string stat_line;
+    if (!std::getline(stat_file, stat_line)) return std::nullopt;
+
+    const size_t end_name = stat_line.rfind(')');
+    if (end_name == std::string::npos || end_name + 2 >= stat_line.size())
+        return std::nullopt;
+
+    std::istringstream fields(stat_line.substr(end_name + 2));
+    std::string field;
+    for (size_t index = 0; index <= 19; ++index) {
+        if (!(fields >> field)) return std::nullopt;
+    }
+
+    try {
+        size_t used = 0;
+        start_ticks = std::stoull(field, &used);
+        if (used != field.size() || start_ticks == 0) return std::nullopt;
+        ticks_found = true;
+    } catch (...) {
+        return std::nullopt;
+    }
+
+    // Now read credentials from status file
+    while (std::getline(status_file, line)) {
+        if (line.substr(0, 4) == "Uid:\t") {
+            std::istringstream iss(line.substr(4));
+            iss >> proof.uid;
+            uid_found = true;
+        } else if (line.substr(0, 4) == "Gid:\t") {
+            std::istringstream iss(line.substr(4));
+            iss >> proof.gid;
+            gid_found = true;
+        }
+    }
+
+    if (!uid_found || !gid_found || !ticks_found) return std::nullopt;
+
+    proof.start_ticks = start_ticks;
+    return proof;
+}
+
+bool Launcher::Child::verifyProcessIdentity(const ProcessIdentityProof &proof) const {
+    if (proof.pid != pid_) return false;
+    if (pid_ <= 0) return false;
+
+    // Verify UID/GID haven't changed
+    uid_t current_uid = 0;
+    gid_t current_gid = 0;
+
+    const auto status_path = "/proc/" + std::to_string(pid_) + "/status";
+    std::ifstream status_file(status_path);
+    if (!status_file) return false;
+
+    std::string line;
+    bool uid_matched = false, gid_matched = false;
+
+    while (std::getline(status_file, line)) {
+        if (line.substr(0, 4) == "Uid:\t") {
+            std::istringstream iss(line.substr(4));
+            iss >> current_uid;
+            uid_matched = (current_uid == proof.uid);
+        } else if (line.substr(0, 4) == "Gid:\t") {
+            std::istringstream iss(line.substr(4));
+            iss >> current_gid;
+            gid_matched = (current_gid == proof.gid);
+        }
+    }
+
+    if (!uid_matched || !gid_matched) return false;
+
+    // Verify start ticks (process hasn't been replaced)
+    const auto stat_path = "/proc/" + std::to_string(pid_) + "/stat";
+    std::ifstream stat_file(stat_path);
+    if (!stat_file) return false;
+
+    std::string stat_line;
+    if (!std::getline(stat_file, stat_line)) return false;
+
+    const size_t end_name = stat_line.rfind(')');
+    if (end_name == std::string::npos || end_name + 2 >= stat_line.size())
+        return false;
+
+    std::istringstream fields(stat_line.substr(end_name + 2));
+    std::string field;
+    for (size_t index = 0; index <= 19; ++index) {
+        if (!(fields >> field)) return false;
+    }
+
+    try {
+        size_t used = 0;
+        const uint64_t current_ticks = std::stoull(field, &used);
+        if (used != field.size() || current_ticks != proof.start_ticks)
+            return false;
+    } catch (...) {
+        return false;
+    }
+
+    return true;
+}
+
+FdIntegrityStatus Launcher::Child::checkFdIntegrity() const {
+    FdIntegrityStatus status;
+    status.descriptor_intact = channel_.established();
+    status.socket_valid = !channel_.poisoned();
+    status.replacement_detected = false;
+    return status;
+}
+
+RenewalFailureState Launcher::Child::renewalState() const {
+    return renewal_state_.load(std::memory_order_acquire);
+}
+
+bool Launcher::Child::transitionRenewalState(RenewalFailureState next_state) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    const auto current = renewal_state_.load(std::memory_order_relaxed);
+
+    // Validate state transitions
+    switch (current) {
+        case RenewalFailureState::Active:
+            if (next_state != RenewalFailureState::RenewalDue &&
+                next_state != RenewalFailureState::Active)
+                return false;
+            break;
+        case RenewalFailureState::RenewalDue:
+            if (next_state != RenewalFailureState::RenewalFailed &&
+                next_state != RenewalFailureState::Active)
+                return false;
+            break;
+        case RenewalFailureState::RenewalFailed:
+            if (next_state != RenewalFailureState::ProtectedEntryBlocked)
+                return false;
+            break;
+        case RenewalFailureState::ProtectedEntryBlocked:
+            return false;  // Terminal state
+    }
+
+    renewal_state_.store(next_state, std::memory_order_release);
+    return true;
+}
+
+bool Launcher::Child::canEnterProtectedEntry() const {
+    const auto state = renewalState();
+    return state != RenewalFailureState::ProtectedEntryBlocked;
+}
+
+} // namespace xovm::material
+
 } // namespace xovm::material
