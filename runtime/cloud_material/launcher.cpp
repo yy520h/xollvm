@@ -12,6 +12,8 @@
 #include <climits>
 #include <csignal>
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <utility>
 
 #include <dirent.h>
@@ -255,58 +257,66 @@ std::optional<ProcessIdentityProof> Launcher::Child::captureProcessIdentity() co
     ProcessIdentityProof proof;
     proof.pid = pid_;
 
-    // Capture process credentials from /proc/[pid]/status
+    // Get process credentials using /proc/[pid]/status
     const auto status_path = "/proc/" + std::to_string(pid_) + "/status";
     std::ifstream status_file(status_path);
-    if (!status_file) return std::nullopt;
+    if (!status_file.is_open()) return std::nullopt;
 
     std::string line;
-    uint64_t start_ticks = 0;
-    bool uid_found = false, gid_found = false, ticks_found = false;
+    bool uid_found = false, gid_found = false;
 
-    // First get start ticks from /proc/[pid]/stat
-    const auto stat_path = "/proc/" + std::to_string(pid_) + "/stat";
-    std::ifstream stat_file(stat_path);
-    if (!stat_file) return std::nullopt;
-
-    std::string stat_line;
-    if (!std::getline(stat_file, stat_line)) return std::nullopt;
-
-    const size_t end_name = stat_line.rfind(')');
-    if (end_name == std::string::npos || end_name + 2 >= stat_line.size())
-        return std::nullopt;
-
-    std::istringstream fields(stat_line.substr(end_name + 2));
-    std::string field;
-    for (size_t index = 0; index <= 19; ++index) {
-        if (!(fields >> field)) return std::nullopt;
-    }
-
-    try {
-        size_t used = 0;
-        start_ticks = std::stoull(field, &used);
-        if (used != field.size() || start_ticks == 0) return std::nullopt;
-        ticks_found = true;
-    } catch (...) {
-        return std::nullopt;
-    }
-
-    // Now read credentials from status file
     while (std::getline(status_file, line)) {
-        if (line.substr(0, 4) == "Uid:\t") {
-            std::istringstream iss(line.substr(4));
+        if (line.find("Uid:") == 0) {
+            std::istringstream iss(line);
+            std::string key;
+            iss >> key;  // "Uid:"
             iss >> proof.uid;
             uid_found = true;
-        } else if (line.substr(0, 4) == "Gid:\t") {
-            std::istringstream iss(line.substr(4));
+        } else if (line.find("Gid:") == 0) {
+            std::istringstream iss(line);
+            std::string key;
+            iss >> key;  // "Gid:"
             iss >> proof.gid;
             gid_found = true;
         }
     }
 
-    if (!uid_found || !gid_found || !ticks_found) return std::nullopt;
+    if (!uid_found || !gid_found) return std::nullopt;
 
-    proof.start_ticks = start_ticks;
+    // Get process start ticks from /proc/[pid]/stat
+    const auto stat_path = "/proc/" + std::to_string(pid_) + "/stat";
+    std::ifstream stat_file(stat_path);
+    if (!stat_file.is_open()) return std::nullopt;
+
+    std::string stat_line;
+    if (!std::getline(stat_file, stat_line)) return std::nullopt;
+
+    // Parse stat file - find the closing ) of the command name
+    const size_t end_name = stat_line.rfind(')');
+    if (end_name == std::string::npos || end_name + 2 >= stat_line.size())
+        return std::nullopt;
+
+    // Extract fields after command name
+    std::istringstream fields(stat_line.substr(end_name + 2));
+    std::string field;
+
+    // Skip to field 20 (starttime) - that's 19 fields after the closing )
+    for (size_t index = 0; index < 19; ++index) {
+        if (!(fields >> field)) return std::nullopt;
+    }
+
+    // Now read starttime
+    if (!(fields >> field)) return std::nullopt;
+
+    try {
+        size_t used = 0;
+        proof.start_ticks = std::stoull(field, &used);
+        if (used != field.size() || proof.start_ticks == 0)
+            return std::nullopt;
+    } catch (...) {
+        return std::nullopt;
+    }
+
     return proof;
 }
 
@@ -320,18 +330,22 @@ bool Launcher::Child::verifyProcessIdentity(const ProcessIdentityProof &proof) c
 
     const auto status_path = "/proc/" + std::to_string(pid_) + "/status";
     std::ifstream status_file(status_path);
-    if (!status_file) return false;
+    if (!status_file.is_open()) return false;
 
     std::string line;
     bool uid_matched = false, gid_matched = false;
 
     while (std::getline(status_file, line)) {
-        if (line.substr(0, 4) == "Uid:\t") {
-            std::istringstream iss(line.substr(4));
+        if (line.find("Uid:") == 0) {
+            std::istringstream iss(line);
+            std::string key;
+            iss >> key;  // "Uid:"
             iss >> current_uid;
             uid_matched = (current_uid == proof.uid);
-        } else if (line.substr(0, 4) == "Gid:\t") {
-            std::istringstream iss(line.substr(4));
+        } else if (line.find("Gid:") == 0) {
+            std::istringstream iss(line);
+            std::string key;
+            iss >> key;  // "Gid:"
             iss >> current_gid;
             gid_matched = (current_gid == proof.gid);
         }
@@ -342,7 +356,7 @@ bool Launcher::Child::verifyProcessIdentity(const ProcessIdentityProof &proof) c
     // Verify start ticks (process hasn't been replaced)
     const auto stat_path = "/proc/" + std::to_string(pid_) + "/stat";
     std::ifstream stat_file(stat_path);
-    if (!stat_file) return false;
+    if (!stat_file.is_open()) return false;
 
     std::string stat_line;
     if (!std::getline(stat_file, stat_line)) return false;
@@ -353,9 +367,13 @@ bool Launcher::Child::verifyProcessIdentity(const ProcessIdentityProof &proof) c
 
     std::istringstream fields(stat_line.substr(end_name + 2));
     std::string field;
-    for (size_t index = 0; index <= 19; ++index) {
+
+    // Skip to field 20 (starttime)
+    for (size_t index = 0; index < 19; ++index) {
         if (!(fields >> field)) return false;
     }
+
+    if (!(fields >> field)) return false;
 
     try {
         size_t used = 0;
@@ -413,7 +431,5 @@ bool Launcher::Child::canEnterProtectedEntry() const {
     const auto state = renewalState();
     return state != RenewalFailureState::ProtectedEntryBlocked;
 }
-
-} // namespace xovm::material
 
 } // namespace xovm::material

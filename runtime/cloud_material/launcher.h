@@ -90,7 +90,6 @@ public:
         int pidfd_ = -1;
         GuardianChannel channel_;
         ProcessIdentityProof captured_identity_;
-        bool identity_captured_ = false;
         std::atomic<RenewalFailureState> renewal_state_{RenewalFailureState::Active};
         mutable std::mutex state_mutex_;
         bool waited_ = false;
