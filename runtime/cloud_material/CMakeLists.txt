@@ -11,6 +11,15 @@ set(_XOVM_DYNAMIC_VM_RUNTIME_SOURCES
   continuation_executor.cpp
   integrity_state.cpp
   jit_handler_buffer.cpp
+  aarch64_relocation.cpp
+  exception_handler.cpp
+  multi_shard_coordinator.cpp
+  elf_audit_rules.cpp
+  runtime_guardian_integration.cpp
+  chaff_scheduler_optimized.cpp
+  raw_socket_cloud_provider.cpp
+  cloud_provider_manager.cpp
+  performance_monitor.cpp
 )
 
 if(DEFINED LLVM_MAIN_SRC_DIR)
