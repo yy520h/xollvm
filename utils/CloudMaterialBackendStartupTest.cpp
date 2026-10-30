@@ -269,11 +269,15 @@ TEST(runtime_provider_factory_merges_all_registered_capabilities) {
             };
             if (provide_window_material_builder) {
                 bundle.build_window_material = [](
-                    const xovm::material::WindowAcquireRequest &)
-                    -> std::variant<xovm::material::WindowMaterial, BackendError> {
-                    xovm::material::WindowMaterial material{};
-                    material.window[0] = 1;
-                    return material;
+                    const xovm::material::WindowAcquireRequest &request)
+                    -> std::variant<xovm::material::WindowMaterialProvisionV3,
+                                    BackendError> {
+                    xovm::material::WindowMaterialProvisionV3 provision{};
+                    provision.artifact_hash = request.artifact_hash;
+                    provision.selector = request.selector;
+                    provision.entry_selector = request.selector;
+                    provision.material.window[0] = 1;
+                    return provision;
                 };
             }
             return bundle;
@@ -329,10 +333,13 @@ TEST(runtime_provider_factory_merges_all_registered_capabilities) {
         request.window_id = 5;
         request.previous_state_hash[0] = 6;
         const auto material = bundle.build_window_material(request);
-        EXPECT_TRUE(std::holds_alternative<xovm::material::WindowMaterial>(material));
-        if (std::holds_alternative<xovm::material::WindowMaterial>(material))
-            EXPECT_TRUE(sizeof(std::get<xovm::material::WindowMaterial>(material)) ==
-                        xovm::material::kWindowMaterialSize);
+        EXPECT_TRUE(std::holds_alternative<
+                    xovm::material::WindowMaterialProvisionV3>(material));
+        if (std::holds_alternative<
+                xovm::material::WindowMaterialProvisionV3>(material))
+            EXPECT_TRUE(sizeof(std::get<
+                            xovm::material::WindowMaterialProvisionV3>(material)
+                            .material) == xovm::material::kWindowMaterialSize);
     }
     RuntimeProviderFactory::clearForTest();
 }

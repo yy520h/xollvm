@@ -3,6 +3,7 @@
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/kdf.h>
 #include <openssl/rand.h>
 
 #include <algorithm>
@@ -20,7 +21,7 @@ constexpr size_t kRecordContainerHeaderSize = 12;
 constexpr size_t kRecordMetadataSize = 128;
 constexpr size_t kLegacyHandlerDescriptorSize = 44;
 constexpr std::array<uint8_t, 8> kRecordContainerMagic = {
-    'X', 'O', 'V', 'M', 'R', 'E', 'C', '2'};
+    'X', 'O', 'V', 'M', 'R', 'E', 'C', '3'};
 
 enum class RecordRole : uint8_t {
     BytecodeBlock = 1,
@@ -186,6 +187,41 @@ bool nonzero(std::span<const uint8_t> bytes) {
                        [](uint8_t value) { return value != 0; });
 }
 
+std::array<uint8_t, 32> deriveRecordKeyV3(
+    std::span<const uint8_t, 32> capability, RecordRole role,
+    const DynamicHash &build_id, const DynamicHash &region_id,
+    const DynamicVmWindowSelectorV3 &selector) {
+    static constexpr std::string_view bytecode_domain =
+        "xovm.dynamic-vm.record-key.bytecode.v3";
+    static constexpr std::string_view handler_domain =
+        "xovm.dynamic-vm.record-key.handler.v3";
+    std::vector<uint8_t> salt_input;
+    appendFramed(salt_input, build_id);
+    appendFramed(salt_input, region_id);
+    const auto encoded_selector = encodeDynamicVmWindowSelectorV3(selector);
+    appendFramed(salt_input, encoded_selector);
+    DynamicHash salt = hash(salt_input);
+    std::array<uint8_t, 32> result{};
+    EVP_PKEY_CTX *context = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
+    size_t size = result.size();
+    const auto domain = role == RecordRole::BytecodeBlock
+        ? bytecode_domain : handler_domain;
+    const auto *info = reinterpret_cast<const uint8_t *>(domain.data());
+    const bool ok = !encoded_selector.empty() && nonzero(salt) && context &&
+        EVP_PKEY_derive_init(context) == 1 &&
+        EVP_PKEY_CTX_set_hkdf_md(context, EVP_sha256()) == 1 &&
+        EVP_PKEY_CTX_set1_hkdf_salt(context, salt.data(), salt.size()) == 1 &&
+        EVP_PKEY_CTX_set1_hkdf_key(context, capability.data(),
+                                  capability.size()) == 1 &&
+        EVP_PKEY_CTX_add1_hkdf_info(context, info, domain.size()) == 1 &&
+        EVP_PKEY_derive(context, result.data(), &size) == 1 &&
+        size == result.size();
+    EVP_PKEY_CTX_free(context);
+    OPENSSL_cleanse(salt.data(), salt.size());
+    if (!ok) result.fill(0);
+    return result;
+}
+
 std::optional<ParsedDescriptors> parseDescriptors(
     std::span<const uint8_t> encoded) {
     if (encoded.size() <= kDynamicVmExecutionAbiV2EncodedSize ||
@@ -218,20 +254,13 @@ uint32_t recordOffset(RecordRole role, const ContinuationNodeV2 &node) {
                                                 node.shard_offset;
 }
 
-const DynamicHash &recordCommitment(RecordRole role,
-                                    const ContinuationNodeV2 &node) {
-    return role == RecordRole::BytecodeBlock
-        ? node.bytecode_block_commitment
-        : node.handler_shard_commitment;
-}
-
 std::vector<uint8_t> recordAad(
     RecordRole role, const DynamicHash &build_id, const DynamicHash &region_id,
     std::span<const uint8_t> descriptors,
     const DynamicVmExecutionDescriptorV2 &graph_descriptor,
     const ContinuationNodeV2 &node, uint32_t plaintext_size) {
     static constexpr std::string_view domain =
-        "XOVM2/artifact-record-aad/v2";
+        "XOVM2/artifact-record-aad/v3";
     std::vector<uint8_t> aad(domain.begin(), domain.end());
     aad.push_back(0);
     const auto role_name = roleName(role);
@@ -296,15 +325,16 @@ bool metadataMatches(std::span<const uint8_t> metadata,
 
 std::vector<uint8_t> encodeRecordContainer(
     RecordRole role, std::span<const uint8_t> plaintext,
-    std::span<const uint8_t, 32> key, const DynamicHash &build_id,
-    const DynamicHash &region_id, std::span<const uint8_t> descriptors,
-    const ContinuationGraphV2 &graph) {
+    const std::vector<DynamicVmNodeCapabilityV3> &capabilities,
+    const DynamicHash &build_id, const DynamicHash &region_id,
+    std::span<const uint8_t> descriptors,
+    const DynamicVmExecutionAbiV2 &abi, const ContinuationGraphV2 &graph) {
     if (graph.nodes.empty() ||
         graph.nodes.size() > kDynamicVmMaxContinuationNodesV2)
         return {};
     std::vector<uint8_t> encoded(kRecordContainerMagic.begin(),
                                  kRecordContainerMagic.end());
-    append16(encoded, kDynamicVmFormatVersion);
+    append16(encoded, kDynamicVmSelectiveFormatVersionV3);
     encoded.push_back(static_cast<uint8_t>(role));
     encoded.push_back(static_cast<uint8_t>(graph.nodes.size()));
     for (const auto &node : graph.nodes) {
@@ -313,9 +343,25 @@ std::vector<uint8_t> encodeRecordContainer(
         if (size == 0 || offset > plaintext.size() ||
             size > plaintext.size() - offset)
             return {};
+        const auto capability = std::find_if(
+            capabilities.begin(), capabilities.end(), [&](const auto &value) {
+                return value.node_id == node.node_id;
+            });
+        const auto selector = dynamicVmWindowSelectorV3(
+            abi, graph.descriptor, node);
+        if (capability == capabilities.end() || !selector ||
+            !nonzero(capability->capability))
+            return {};
+        auto key = deriveRecordKeyV3(capability->capability, role, build_id,
+                                     region_id, *selector);
+        if (!nonzero(key)) {
+            OPENSSL_cleanse(key.data(), key.size());
+            return {};
+        }
         const auto aad = recordAad(role, build_id, region_id, descriptors,
                                    graph.descriptor, node, size);
         auto encrypted = encrypt(plaintext.subspan(offset, size), key, aad);
+        OPENSSL_cleanse(key.data(), key.size());
         if (encrypted.empty() || encrypted.size() > UINT32_MAX) {
             secureClear(encrypted);
             return {};
@@ -333,7 +379,7 @@ std::optional<std::vector<EncryptedRecordView>> parseRecordContainer(
     if (encoded.size() < kRecordContainerHeaderSize ||
         !std::equal(kRecordContainerMagic.begin(), kRecordContainerMagic.end(),
                     encoded.begin()) ||
-        read16(encoded, 8) != kDynamicVmFormatVersion ||
+        read16(encoded, 8) != kDynamicVmSelectiveFormatVersionV3 ||
         encoded[10] != static_cast<uint8_t>(role) ||
         encoded[11] != graph.nodes.size() || graph.nodes.empty() ||
         graph.nodes.size() > kDynamicVmMaxContinuationNodesV2)
@@ -400,46 +446,12 @@ bool validateNativeShards(const DynamicVmExecutionAbiV2 &abi,
     });
 }
 
-std::optional<std::vector<uint8_t>> decryptRecordContainer(
-    std::span<const uint8_t> encoded, RecordRole role,
-    std::span<const uint8_t, 32> key, const DynamicHash &build_id,
-    const DynamicHash &region_id, std::span<const uint8_t> descriptors,
-    const ContinuationGraphV2 &graph) {
-    auto records = parseRecordContainer(encoded, role, graph);
-    if (!records) return std::nullopt;
-    const uint32_t total_size = role == RecordRole::BytecodeBlock
-        ? graph.descriptor.bytecode_size
-        : graph.descriptor.handler_shards_size;
-    if (total_size == 0 || total_size > kDynamicVmMaxWindowMaterial)
-        return std::nullopt;
-    std::vector<uint8_t> plaintext(total_size);
-    VectorScrubber plaintext_scrubber(plaintext);
-    for (size_t index = 0; index < graph.nodes.size(); ++index) {
-        const auto &node = graph.nodes[index];
-        const uint32_t expected_size = recordPlaintextSize(role, node);
-        const auto aad = recordAad(role, build_id, region_id, descriptors,
-                                   graph.descriptor, node, expected_size);
-        auto record_plaintext = decrypt((*records)[index].encoded, key, aad);
-        VectorScrubber record_scrubber(record_plaintext);
-        if (record_plaintext.size() != expected_size ||
-            (role == RecordRole::BytecodeBlock
-                 ? hashDynamicVmBytecodeBlockV2(record_plaintext)
-                 : hashDynamicVmHandlerShardV2(record_plaintext)) !=
-                recordCommitment(role, node))
-            return std::nullopt;
-        const uint32_t offset = recordOffset(role, node);
-        std::copy(record_plaintext.begin(), record_plaintext.end(),
-                  plaintext.begin() + offset);
-    }
-    plaintext_scrubber.release();
-    return plaintext;
-}
 
 } // namespace
 
 DynamicHash computeEncryptedVmArtifactHash(const EncryptedVmArtifact &artifact) {
-    static constexpr std::string_view domain = "XOVM2/encrypted-artifact/v2";
-    if (artifact.format_version != kDynamicVmFormatVersion ||
+    static constexpr std::string_view domain = "XOVM2/encrypted-artifact/v3";
+    if (artifact.format_version != kDynamicVmSelectiveFormatVersionV3 ||
         !artifact.relocation_descriptors.empty())
         return {};
     std::vector<uint8_t> commitment(domain.begin(), domain.end());
@@ -458,7 +470,7 @@ bool validateEncryptedVmArtifactMetadata(
     const EncryptedVmArtifact &artifact, const DynamicHash &build_id,
     const DynamicHash &region_id, const DynamicHash &expected_artifact_hash) {
     if (expected_artifact_hash == DynamicHash{} || !nonzero(build_id) ||
-        !nonzero(region_id) || artifact.format_version != kDynamicVmFormatVersion ||
+        !nonzero(region_id) || artifact.format_version != kDynamicVmSelectiveFormatVersionV3 ||
         artifact.build_id != build_id || artifact.region_id != region_id ||
         artifact.artifact_hash != expected_artifact_hash ||
         artifact.encrypted_bytecode_blocks.empty() ||
@@ -476,8 +488,84 @@ bool validateEncryptedVmArtifactMetadata(
                              descriptors->graph).has_value();
 }
 
-std::optional<EncryptedVmArtifact> buildEncryptedVmArtifact(
-    const ArtifactSource &source) {
+DynamicVmPrivateRegistrationV3::DynamicVmPrivateRegistrationV3(
+    DynamicVmPrivateRegistrationV3 &&other) noexcept
+    : build_id_(other.build_id_), region_id_(other.region_id_),
+      artifact_hash_(other.artifact_hash_),
+      capabilities_(std::move(other.capabilities_)) {
+    other.clear();
+}
+
+DynamicVmPrivateRegistrationV3 &DynamicVmPrivateRegistrationV3::operator=(
+    DynamicVmPrivateRegistrationV3 &&other) noexcept {
+    if (this != &other) {
+        clear();
+        build_id_ = other.build_id_;
+        region_id_ = other.region_id_;
+        artifact_hash_ = other.artifact_hash_;
+        capabilities_ = std::move(other.capabilities_);
+        other.clear();
+    }
+    return *this;
+}
+
+DynamicVmPrivateRegistrationV3::~DynamicVmPrivateRegistrationV3() { clear(); }
+
+void DynamicVmPrivateRegistrationV3::clear() {
+    for (auto &entry : capabilities_)
+        OPENSSL_cleanse(entry.capability.data(), entry.capability.size());
+    capabilities_.clear();
+    capabilities_.shrink_to_fit();
+    build_id_.fill(0);
+    region_id_.fill(0);
+    artifact_hash_.fill(0);
+}
+
+std::optional<std::array<uint8_t, 32>>
+DynamicVmPrivateRegistrationV3::capabilityFor(
+    const DynamicVmWindowSelectorV3 &selector) const {
+    const auto found = std::find_if(
+        capabilities_.begin(), capabilities_.end(), [&](const auto &entry) {
+            return entry.selector == selector;
+        });
+    if (found == capabilities_.end()) return std::nullopt;
+    return found->capability;
+}
+
+DecryptedDynamicVmNodeV3::DecryptedDynamicVmNodeV3(
+    DecryptedDynamicVmNodeV3 &&other) noexcept
+    : abi_(other.abi_), descriptor_(other.descriptor_), node_(other.node_),
+      bytecode_block_(std::move(other.bytecode_block_)),
+      handler_shard_(std::move(other.handler_shard_)) {
+    other.clear();
+}
+
+DecryptedDynamicVmNodeV3 &DecryptedDynamicVmNodeV3::operator=(
+    DecryptedDynamicVmNodeV3 &&other) noexcept {
+    if (this != &other) {
+        clear();
+        abi_ = other.abi_;
+        descriptor_ = other.descriptor_;
+        node_ = other.node_;
+        bytecode_block_ = std::move(other.bytecode_block_);
+        handler_shard_ = std::move(other.handler_shard_);
+        other.clear();
+    }
+    return *this;
+}
+
+DecryptedDynamicVmNodeV3::~DecryptedDynamicVmNodeV3() { clear(); }
+
+void DecryptedDynamicVmNodeV3::clear() {
+    secureClear(bytecode_block_);
+    secureClear(handler_shard_);
+    OPENSSL_cleanse(&abi_, sizeof(abi_));
+    OPENSSL_cleanse(&descriptor_, sizeof(descriptor_));
+    OPENSSL_cleanse(&node_, sizeof(node_));
+}
+
+std::optional<BuiltDynamicVmArtifactV3> buildSelectiveEncryptedVmArtifactV3(
+    const ArtifactSourceV3 &source) {
     if (source.bytecode.empty() ||
         source.bytecode.size() > kDynamicVmMaxWindowMaterial ||
         source.handler_shards.size() <= kLegacyHandlerDescriptorSize ||
@@ -485,14 +573,27 @@ std::optional<EncryptedVmArtifact> buildEncryptedVmArtifact(
             kLegacyHandlerDescriptorSize + kDynamicVmMaxWindowMaterial ||
         source.continuation_descriptors.size() > kDynamicVmMaxDescriptor ||
         !source.relocation_descriptors.empty() || !nonzero(source.build_id) ||
-        !nonzero(source.region_id) || !nonzero(source.artifact_key))
+        !nonzero(source.region_id))
         return std::nullopt;
     auto descriptors = parseDescriptors(source.continuation_descriptors);
-    if (!descriptors) return std::nullopt;
+    if (!descriptors ||
+        source.node_capabilities.size() != descriptors->graph.nodes.size())
+        return std::nullopt;
     auto handler_payload = decodeHandlerShardPayload(source.handler_shards);
     if (!handler_payload) return std::nullopt;
     VectorScrubber handler_code_scrubber(handler_payload->code);
     const auto &graph = descriptors->graph;
+    for (size_t index = 0; index < graph.nodes.size(); ++index) {
+        if (source.node_capabilities[index].node_id != graph.nodes[index].node_id ||
+            !nonzero(source.node_capabilities[index].capability))
+            return std::nullopt;
+        for (size_t prior = 0; prior < index; ++prior)
+            if (source.node_capabilities[prior].node_id ==
+                    source.node_capabilities[index].node_id ||
+                source.node_capabilities[prior].capability ==
+                    source.node_capabilities[index].capability)
+                return std::nullopt;
+    }
     if (handler_payload->descriptor.shard_id != graph.nodes.front().shard_id ||
         handler_payload->descriptor.code_size != handler_payload->code.size() ||
         handler_payload->descriptor.relocation_count != 0 ||
@@ -506,78 +607,127 @@ std::optional<EncryptedVmArtifact> buildEncryptedVmArtifact(
                               handler_payload->code))
         return std::nullopt;
 
-    EncryptedVmArtifact artifact;
-    artifact.build_id = source.build_id;
-    artifact.region_id = source.region_id;
-    artifact.encrypted_bytecode_blocks = encodeRecordContainer(
-        RecordRole::BytecodeBlock, source.bytecode, source.artifact_key,
+    BuiltDynamicVmArtifactV3 built;
+    built.artifact.build_id = source.build_id;
+    built.artifact.region_id = source.region_id;
+    built.artifact.encrypted_bytecode_blocks = encodeRecordContainer(
+        RecordRole::BytecodeBlock, source.bytecode, source.node_capabilities,
         source.build_id, source.region_id, source.continuation_descriptors,
-        graph);
-    artifact.encrypted_handler_shards = encodeRecordContainer(
-        RecordRole::HandlerShard, handler_payload->code, source.artifact_key,
-        source.build_id, source.region_id, source.continuation_descriptors,
-        graph);
-    if (artifact.encrypted_bytecode_blocks.empty() ||
-        artifact.encrypted_handler_shards.empty())
+        descriptors->abi, graph);
+    built.artifact.encrypted_handler_shards = encodeRecordContainer(
+        RecordRole::HandlerShard, handler_payload->code,
+        source.node_capabilities, source.build_id, source.region_id,
+        source.continuation_descriptors, descriptors->abi, graph);
+    if (built.artifact.encrypted_bytecode_blocks.empty() ||
+        built.artifact.encrypted_handler_shards.empty())
         return std::nullopt;
-    artifact.continuation_descriptors = source.continuation_descriptors;
-    artifact.artifact_hash = computeEncryptedVmArtifactHash(artifact);
-    if (artifact.artifact_hash == DynamicHash{}) return std::nullopt;
-    return artifact;
+    built.artifact.continuation_descriptors = source.continuation_descriptors;
+    built.artifact.artifact_hash = computeEncryptedVmArtifactHash(built.artifact);
+    if (!nonzero(built.artifact.artifact_hash)) return std::nullopt;
+
+    built.registration.build_id_ = source.build_id;
+    built.registration.region_id_ = source.region_id;
+    built.registration.artifact_hash_ = built.artifact.artifact_hash;
+    built.registration.capabilities_.reserve(graph.nodes.size());
+    for (size_t index = 0; index < graph.nodes.size(); ++index) {
+        auto selector = dynamicVmWindowSelectorV3(
+            descriptors->abi, graph.descriptor, graph.nodes[index]);
+        if (!selector) return std::nullopt;
+        built.registration.capabilities_.push_back(
+            {*selector, source.node_capabilities[index].capability});
+    }
+    return std::optional<BuiltDynamicVmArtifactV3>(std::move(built));
 }
 
-std::optional<DecryptedVmArtifact> decryptEncryptedVmArtifact(
+std::optional<DecryptedDynamicVmNodeV3> decryptSelectiveDynamicVmNodeV3(
     const EncryptedVmArtifact &artifact,
-    std::span<const uint8_t, 32> artifact_key,
+    const DynamicVmWindowSelectorV3 &selector,
+    std::span<const uint8_t, 32> node_capability,
     const DynamicHash &build_id, const DynamicHash &region_id,
     const DynamicHash &expected_artifact_hash) {
-    if (!validateEncryptedVmArtifactMetadata(
+    if (!nonzero(node_capability) ||
+        !validateEncryptedVmArtifactMetadata(
             artifact, build_id, region_id, expected_artifact_hash))
         return std::nullopt;
     const auto descriptors = parseDescriptors(artifact.continuation_descriptors);
     if (!descriptors) return std::nullopt;
-    auto bytecode = decryptRecordContainer(
-        artifact.encrypted_bytecode_blocks, RecordRole::BytecodeBlock,
-        artifact_key, build_id, region_id, artifact.continuation_descriptors,
-        descriptors->graph);
-    if (!bytecode) return std::nullopt;
-    VectorScrubber bytecode_scrubber(*bytecode);
-    auto raw_handlers = decryptRecordContainer(
-        artifact.encrypted_handler_shards, RecordRole::HandlerShard,
-        artifact_key, build_id, region_id, artifact.continuation_descriptors,
-        descriptors->graph);
-    if (!raw_handlers) return std::nullopt;
-    VectorScrubber raw_handler_scrubber(*raw_handlers);
-    if (validateContinuationGraphV2(descriptors->abi, descriptors->graph,
-                                    *bytecode, *raw_handlers) !=
-            DynamicVmSchemaStatusV2::Valid ||
-        !validateAarch64Shard(*raw_handlers) ||
-        !validateNativeShards(descriptors->abi, descriptors->graph, *bytecode,
-                              *raw_handlers))
+    const auto node_it = std::find_if(
+        descriptors->graph.nodes.begin(), descriptors->graph.nodes.end(),
+        [&](const auto &node) {
+            auto expected = dynamicVmWindowSelectorV3(
+                descriptors->abi, descriptors->graph.descriptor, node);
+            return expected && *expected == selector;
+        });
+    if (node_it == descriptors->graph.nodes.end()) return std::nullopt;
+    const size_t node_index = static_cast<size_t>(
+        node_it - descriptors->graph.nodes.begin());
+    auto blocks = parseRecordContainer(artifact.encrypted_bytecode_blocks,
+                                       RecordRole::BytecodeBlock,
+                                       descriptors->graph);
+    auto shards = parseRecordContainer(artifact.encrypted_handler_shards,
+                                       RecordRole::HandlerShard,
+                                       descriptors->graph);
+    if (!blocks || !shards || node_index >= blocks->size() ||
+        node_index >= shards->size())
         return std::nullopt;
 
-    HandlerShardDescriptor legacy_descriptor;
-    legacy_descriptor.shard_id = descriptors->graph.nodes.front().shard_id;
-    legacy_descriptor.code_size = static_cast<uint32_t>(raw_handlers->size());
-    legacy_descriptor.commitment = hashAarch64ShardCode(*raw_handlers);
-    auto legacy_handlers = encodeHandlerShardPayload(legacy_descriptor,
-                                                     *raw_handlers);
-    VectorScrubber legacy_handler_scrubber(legacy_handlers);
-    if (legacy_handlers.empty()) return std::nullopt;
+    auto block_key = deriveRecordKeyV3(node_capability,
+        RecordRole::BytecodeBlock, build_id, region_id, selector);
+    auto shard_key = deriveRecordKeyV3(node_capability,
+        RecordRole::HandlerShard, build_id, region_id, selector);
+    if (!nonzero(block_key) || !nonzero(shard_key)) {
+        OPENSSL_cleanse(block_key.data(), block_key.size());
+        OPENSSL_cleanse(shard_key.data(), shard_key.size());
+        return std::nullopt;
+    }
+    const auto block_aad = recordAad(
+        RecordRole::BytecodeBlock, build_id, region_id,
+        artifact.continuation_descriptors, descriptors->graph.descriptor,
+        *node_it, node_it->bytecode_size);
+    const auto shard_aad = recordAad(
+        RecordRole::HandlerShard, build_id, region_id,
+        artifact.continuation_descriptors, descriptors->graph.descriptor,
+        *node_it, node_it->shard_size);
+    auto block = decrypt((*blocks)[node_index].encoded, block_key, block_aad);
+    auto shard = decrypt((*shards)[node_index].encoded, shard_key, shard_aad);
+    OPENSSL_cleanse(block_key.data(), block_key.size());
+    OPENSSL_cleanse(shard_key.data(), shard_key.size());
+    VectorScrubber block_scrubber(block);
+    VectorScrubber shard_scrubber(shard);
+    if (block.size() != node_it->bytecode_size ||
+        shard.size() != node_it->shard_size ||
+        hashDynamicVmBytecodeBlockV2(block) !=
+            node_it->bytecode_block_commitment ||
+        hashDynamicVmHandlerShardV2(shard) !=
+            node_it->handler_shard_commitment)
+        return std::nullopt;
 
-    DecryptedVmArtifact result{
-        artifact.build_id, artifact.region_id, std::move(*bytecode),
-        std::move(legacy_handlers), artifact.continuation_descriptors, {}};
-    bytecode_scrubber.release();
-    legacy_handler_scrubber.release();
-    return result;
-}
+    const uint32_t next_ip = node_it->bytecode_offset + node_it->bytecode_size;
+    bool native_valid = false;
+    if (node_it->semantic == ContinuationNodeSemanticV2::LoadI32 &&
+        descriptors->abi.loadi32_immediate_offset <= block.size() &&
+        sizeof(uint32_t) <= block.size() -
+            descriptors->abi.loadi32_immediate_offset) {
+        native_valid = validateAarch64LoadImmediateShard(
+            shard, node_it->register_index,
+            readLittleEndian32(std::span<const uint8_t>(block).subspan(
+                descriptors->abi.loadi32_immediate_offset, sizeof(uint32_t))),
+            next_ip);
+    } else if (node_it->semantic == ContinuationNodeSemanticV2::ReturnI32) {
+        native_valid = validateAarch64ReturnIntShard(
+            shard, node_it->register_index, next_ip);
+    }
+    if (!native_valid) return std::nullopt;
 
-void secureClear(DecryptedVmArtifact &artifact) {
-    secureClear(artifact.bytecode);
-    secureClear(artifact.handler_shards);
-    secureClear(artifact.continuation_descriptors);
-    secureClear(artifact.relocation_descriptors);
+    DecryptedDynamicVmNodeV3 result;
+    result.abi_ = descriptors->abi;
+    result.descriptor_ = descriptors->graph.descriptor;
+    result.node_ = *node_it;
+    result.bytecode_block_ = std::move(block);
+    result.handler_shard_ = std::move(shard);
+    block_scrubber.release();
+    shard_scrubber.release();
+    return std::optional<DecryptedDynamicVmNodeV3>(std::move(result));
 }
 
 } // namespace xovm::material

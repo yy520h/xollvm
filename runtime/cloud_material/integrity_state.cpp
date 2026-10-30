@@ -26,6 +26,11 @@ std::optional<DynamicHash> IntegrityState::commit(const WindowGrant &grant,
     input.insert(input.end(), state_.begin(), state_.end());
     input.insert(input.end(), grant.build_id.begin(), grant.build_id.end());
     input.insert(input.end(), grant.region_id.begin(), grant.region_id.end());
+    input.insert(input.end(), grant.artifact_hash.begin(), grant.artifact_hash.end());
+    const auto selector = encodeDynamicVmWindowSelectorV3(grant.selector);
+    if (selector.size() != kDynamicVmWindowSelectorV3EncodedSize)
+        return std::nullopt;
+    input.insert(input.end(), selector.begin(), selector.end());
     input.insert(input.end(), grant.session_id.begin(), grant.session_id.end());
     for (int shift = 56; shift >= 0; shift -= 8)
         input.push_back(static_cast<uint8_t>(grant.generation >> shift));

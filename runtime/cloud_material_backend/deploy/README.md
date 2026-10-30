@@ -59,16 +59,23 @@ script.
 - Treat any checksum, sequence, schema, provider, or snapshot failure as a
   startup failure. Do not delete WAL or checkpoint files to force startup.
 - Test backup restoration on an isolated copy before using it for recovery.
-- To reclaim expired exact-response payloads and rotate the state WAL, stop the
-  backend and run
+- To reclaim expired exact-response payloads, compact inactive state, and rotate
+  the state WAL, stop the backend and run
   `xovm-cloud-material-state-maintenance reclaim-expired` as the same non-root
   service account with only `XOVM_STATE_DIR` and
   `XOVM_TRUSTED_TIME_PROVIDER` configured. The command fails with `lock_busy`
   if the backend or another maintenance process still owns the state directory.
-- Each maintenance invocation performs one bounded batch. Invoke it again only
-  when it reports `more_work=true`, and restart the backend only after exit 0.
-  Never delete `.xovm.lock`, checkpoint, WAL, or quarantine files to bypass a
-  failure.
+- The offline command uses trusted time and performs one bounded pass. It first
+  recovers and validates the checkpoint plus WAL, records maintenance through a
+  maintenance WAL, re-recovers and validates the resulting state, then writes an
+  atomic checkpoint and retires the WAL. Active expired reply, registration,
+  session, and claim slots are compacted into permanent replay evidence rather
+  than simply deleted. That evidence remains authoritative and is never evicted
+  by TTL expiry or build revocation.
+- Invoke maintenance again whenever it reports `more_work=true`; each invocation
+  advances at most one bounded pass. Restart the backend only after the final
+  pass exits 0 with `more_work=false`. Never delete `.xovm.lock`, checkpoint,
+  WAL, quarantine files, or permanent replay evidence to bypass a failure.
 - Rotate relay and administrator credentials independently. Revoke old
   credentials at the proxy and backend configuration boundary before deleting
   them.

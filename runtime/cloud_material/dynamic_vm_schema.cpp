@@ -654,8 +654,168 @@ std::optional<ContinuationGraphV2> decodeContinuationGraphV2(
     return graph;
 }
 
+bool validateDynamicVmWindowSelectorV3(
+    const DynamicVmWindowSelectorV3 &selector) {
+    const bool semantic_known =
+        selector.semantic == ContinuationNodeSemanticV2::LoadI32 ||
+        selector.semantic == ContinuationNodeSemanticV2::ReturnI32;
+    const bool status_known =
+        selector.status == ContinuationNodeStatusV2::Continue ||
+        selector.status == ContinuationNodeStatusV2::Return;
+    const bool closed_profile_semantics =
+        (selector.semantic == ContinuationNodeSemanticV2::LoadI32 &&
+         selector.status == ContinuationNodeStatusV2::Continue &&
+         selector.next_node_id != 0) ||
+        (selector.semantic == ContinuationNodeSemanticV2::ReturnI32 &&
+         selector.status == ContinuationNodeStatusV2::Return &&
+         selector.next_node_id == 0);
+    return selector.format_version == kDynamicVmSelectiveFormatVersionV3 &&
+           selector.execution_schema_version ==
+               kDynamicVmExecutionSchemaVersionV2 &&
+           selector.profile == DynamicVmExecutionProfileV2::LoadI32ReturnI32 &&
+           selector.flags == 0 && selector.abi_id != 0 &&
+           !zeroHash(selector.abi_hash) &&
+           !zeroHash(selector.graph_commitment) && selector.node_id != 0 &&
+           selector.shard_id != 0 && selector.variant_id != 0 &&
+           semantic_known && status_known && closed_profile_semantics &&
+           selector.reserved16 == 0 && selector.bytecode_size != 0 &&
+           selector.bytecode_size <= kDynamicVmMaxWindowMaterial &&
+           selector.bytecode_offset <= UINT32_MAX - selector.bytecode_size &&
+           !zeroHash(selector.bytecode_block_commitment) &&
+           selector.shard_size != 0 &&
+           selector.shard_size <= kDynamicVmMaxWindowMaterial &&
+           selector.shard_offset <= UINT32_MAX - selector.shard_size &&
+           !zeroHash(selector.handler_shard_commitment) &&
+           !zeroHash(selector.transition_tail_commitment) &&
+           selector.relocation_count == 0 && selector.reserved == 0;
+}
+
+std::optional<DynamicVmWindowSelectorV3> dynamicVmWindowSelectorV3(
+    const DynamicVmExecutionAbiV2 &abi,
+    const DynamicVmExecutionDescriptorV2 &descriptor,
+    const ContinuationNodeV2 &node) {
+    if (validateDynamicVmExecutionAbiV2(abi) !=
+            DynamicVmSchemaStatusV2::Valid ||
+        !validDescriptorV2(descriptor) || !validNodeV2(node) ||
+        descriptor.abi_id != abi.abi_id ||
+        descriptor.abi_hash != hashDynamicVmExecutionAbiV2(abi) ||
+        !boundedSlice(node.bytecode_offset, node.bytecode_size,
+                      descriptor.bytecode_size) ||
+        !boundedSlice(node.shard_offset, node.shard_size,
+                      descriptor.handler_shards_size))
+        return std::nullopt;
+    DynamicVmWindowSelectorV3 selector;
+    selector.profile = abi.profile;
+    selector.abi_id = abi.abi_id;
+    selector.abi_hash = descriptor.abi_hash;
+    selector.graph_commitment = descriptor.graph_commitment;
+    selector.node_id = node.node_id;
+    selector.shard_id = node.shard_id;
+    selector.variant_id = node.variant_id;
+    selector.semantic = node.semantic;
+    selector.status = node.status;
+    selector.bytecode_offset = node.bytecode_offset;
+    selector.bytecode_size = node.bytecode_size;
+    selector.bytecode_block_commitment = node.bytecode_block_commitment;
+    selector.shard_offset = node.shard_offset;
+    selector.shard_size = node.shard_size;
+    selector.handler_shard_commitment = node.handler_shard_commitment;
+    selector.next_node_id = node.next_node_id;
+    selector.transition_tail_commitment = node.transition_tail_commitment;
+    if (!validateDynamicVmWindowSelectorV3(selector)) return std::nullopt;
+    return selector;
+}
+
+std::vector<uint8_t> encodeDynamicVmWindowSelectorV3(
+    const DynamicVmWindowSelectorV3 &selector) {
+    if (!validateDynamicVmWindowSelectorV3(selector)) return {};
+    std::vector<uint8_t> out;
+    out.reserve(kDynamicVmWindowSelectorV3EncodedSize);
+    put16(out, selector.format_version);
+    put16(out, selector.execution_schema_version);
+    put16(out, static_cast<uint16_t>(selector.profile));
+    put16(out, selector.flags);
+    put32(out, selector.abi_id);
+    putHash(out, selector.abi_hash);
+    putHash(out, selector.graph_commitment);
+    put32(out, selector.node_id);
+    put32(out, selector.shard_id);
+    put32(out, selector.variant_id);
+    out.push_back(static_cast<uint8_t>(selector.semantic));
+    out.push_back(static_cast<uint8_t>(selector.status));
+    put16(out, selector.reserved16);
+    put32(out, selector.bytecode_offset);
+    put32(out, selector.bytecode_size);
+    putHash(out, selector.bytecode_block_commitment);
+    put32(out, selector.shard_offset);
+    put32(out, selector.shard_size);
+    putHash(out, selector.handler_shard_commitment);
+    put32(out, selector.next_node_id);
+    putHash(out, selector.transition_tail_commitment);
+    put16(out, selector.relocation_count);
+    put16(out, selector.reserved);
+    if (out.size() != kDynamicVmWindowSelectorV3EncodedSize) return {};
+    return out;
+}
+
+std::optional<DynamicVmWindowSelectorV3> decodeDynamicVmWindowSelectorV3(
+    std::span<const uint8_t> encoded) {
+    if (encoded.size() != kDynamicVmWindowSelectorV3EncodedSize)
+        return std::nullopt;
+    DynamicVmWindowSelectorV3 selector;
+    size_t offset = 0;
+    auto take = [&](size_t size) {
+        auto result = encoded.subspan(offset, size);
+        offset += size;
+        return result;
+    };
+    selector.format_version = get16(take(2), 0);
+    selector.execution_schema_version = get16(take(2), 0);
+    selector.profile = static_cast<DynamicVmExecutionProfileV2>(get16(take(2), 0));
+    selector.flags = get16(take(2), 0);
+    selector.abi_id = get32(take(4), 0);
+    for (DynamicHash *value : {&selector.abi_hash,
+                               &selector.graph_commitment}) {
+        const auto bytes = take(value->size());
+        std::copy(bytes.begin(), bytes.end(), value->begin());
+    }
+    selector.node_id = get32(take(4), 0);
+    selector.shard_id = get32(take(4), 0);
+    selector.variant_id = get32(take(4), 0);
+    selector.semantic = static_cast<ContinuationNodeSemanticV2>(take(1)[0]);
+    selector.status = static_cast<ContinuationNodeStatusV2>(take(1)[0]);
+    selector.reserved16 = get16(take(2), 0);
+    selector.bytecode_offset = get32(take(4), 0);
+    selector.bytecode_size = get32(take(4), 0);
+    {
+        const auto bytes = take(selector.bytecode_block_commitment.size());
+        std::copy(bytes.begin(), bytes.end(),
+                  selector.bytecode_block_commitment.begin());
+    }
+    selector.shard_offset = get32(take(4), 0);
+    selector.shard_size = get32(take(4), 0);
+    {
+        const auto bytes = take(selector.handler_shard_commitment.size());
+        std::copy(bytes.begin(), bytes.end(),
+                  selector.handler_shard_commitment.begin());
+    }
+    selector.next_node_id = get32(take(4), 0);
+    {
+        const auto bytes = take(selector.transition_tail_commitment.size());
+        std::copy(bytes.begin(), bytes.end(),
+                  selector.transition_tail_commitment.begin());
+    }
+    selector.relocation_count = get16(take(2), 0);
+    selector.reserved = get16(take(2), 0);
+    if (!validateDynamicVmWindowSelectorV3(selector) ||
+        encodeDynamicVmWindowSelectorV3(selector) !=
+            std::vector<uint8_t>(encoded.begin(), encoded.end()))
+        return std::nullopt;
+    return selector;
+}
+
 std::vector<uint8_t> encodeEncryptedVmArtifact(const EncryptedVmArtifact &artifact) {
-    if (artifact.format_version != kDynamicVmFormatVersion ||
+    if (artifact.format_version != kDynamicVmSelectiveFormatVersionV3 ||
         artifact.encrypted_bytecode_blocks.size() > kDynamicVmMaxWindowMaterial * 64 ||
         artifact.encrypted_handler_shards.size() > kDynamicVmMaxWindowMaterial * 64 ||
         artifact.continuation_descriptors.size() > kDynamicVmMaxDescriptor ||
@@ -684,7 +844,7 @@ std::optional<EncryptedVmArtifact> decodeEncryptedVmArtifact(std::span<const uin
     auto version_bytes = take(2);
     if (!version_bytes) return std::nullopt;
     const uint16_t version = static_cast<uint16_t>((*version_bytes)[0] << 8 | (*version_bytes)[1]);
-    if (version != kDynamicVmFormatVersion) return std::nullopt;
+    if (version != kDynamicVmSelectiveFormatVersionV3) return std::nullopt;
     EncryptedVmArtifact artifact;
     artifact.format_version = version;
     for (DynamicHash *hash : {&artifact.build_id, &artifact.region_id, &artifact.artifact_hash}) {
@@ -715,9 +875,11 @@ std::optional<EncryptedVmArtifact> decodeEncryptedVmArtifact(std::span<const uin
 }
 
 std::vector<uint8_t> encodeWindowAcquireRequest(const WindowAcquireRequest &request) {
-    if (request.format_version != kDynamicVmFormatVersion ||
+    const auto selector = encodeDynamicVmWindowSelectorV3(request.selector);
+    if (request.format_version != kDynamicVmSelectiveFormatVersionV3 ||
         request.request_id == std::array<uint8_t, 16>{} ||
         request.build_id == DynamicHash{} || request.region_id == DynamicHash{} ||
+        request.artifact_hash == DynamicHash{} || selector.empty() ||
         request.generation == 0 || request.window_id == 0 ||
         request.previous_state_hash == DynamicHash{})
         return {};
@@ -728,9 +890,12 @@ std::vector<uint8_t> encodeWindowAcquireRequest(const WindowAcquireRequest &requ
     putBytes(out, request.request_id);
     putHash(out, request.build_id);
     putHash(out, request.region_id);
+    putHash(out, request.artifact_hash);
     put64(out, request.generation);
     put64(out, request.window_id);
     putHash(out, request.previous_state_hash);
+    putBytes(out, selector);
+    if (out.size() != kWindowAcquireRequestEncodedSize) return {};
     return out;
 }
 
@@ -749,7 +914,8 @@ std::optional<WindowAcquireRequest> decodeWindowAcquireRequest(
     request.format_version = static_cast<uint16_t>(version[0]) << 8 | version[1];
     const auto request_id = take(request.request_id.size());
     std::copy(request_id.begin(), request_id.end(), request.request_id.begin());
-    for (DynamicHash *hash : {&request.build_id, &request.region_id}) {
+    for (DynamicHash *hash : {&request.build_id, &request.region_id,
+                              &request.artifact_hash}) {
         const auto bytes = take(hash->size());
         std::copy(bytes.begin(), bytes.end(), hash->begin());
     }
@@ -762,6 +928,10 @@ std::optional<WindowAcquireRequest> decodeWindowAcquireRequest(
     const auto previous_state = take(request.previous_state_hash.size());
     std::copy(previous_state.begin(), previous_state.end(),
               request.previous_state_hash.begin());
+    const auto selector = decodeDynamicVmWindowSelectorV3(
+        take(kDynamicVmWindowSelectorV3EncodedSize));
+    if (!selector) return std::nullopt;
+    request.selector = *selector;
 
     const auto canonical = encodeWindowAcquireRequest(request);
     if (canonical.size() != encoded.size() ||
@@ -824,12 +994,15 @@ std::optional<HandlerShardPayload> decodeHandlerShardPayload(
 }
 
 std::vector<uint8_t> encodeWindowGrant(const WindowGrant &grant) {
-    if (grant.format_version != kDynamicVmFormatVersion ||
+    const auto selector = encodeDynamicVmWindowSelectorV3(grant.selector);
+    if (grant.format_version != kDynamicVmSelectiveFormatVersionV3 ||
         grant.generation == 0 || grant.window_id == 0 ||
         std::all_of(grant.build_id.begin(), grant.build_id.end(),
                     [](uint8_t value) { return value == 0; }) ||
         std::all_of(grant.region_id.begin(), grant.region_id.end(),
                     [](uint8_t value) { return value == 0; }) ||
+        std::all_of(grant.artifact_hash.begin(), grant.artifact_hash.end(),
+                    [](uint8_t value) { return value == 0; }) || selector.empty() ||
         std::all_of(grant.session_id.begin(), grant.session_id.end(),
                     [](uint8_t value) { return value == 0; }) ||
         std::all_of(grant.previous_state_hash.begin(), grant.previous_state_hash.end(),
@@ -843,6 +1016,8 @@ std::vector<uint8_t> encodeWindowGrant(const WindowGrant &grant) {
     put16(out, grant.format_version);
     putHash(out, grant.build_id);
     putHash(out, grant.region_id);
+    putHash(out, grant.artifact_hash);
+    putBytes(out, selector);
     putBytes(out, grant.session_id);
     put64(out, grant.generation);
     put64(out, grant.window_id);
@@ -885,13 +1060,20 @@ std::optional<WindowGrant> decodeWindowGrant(std::span<const uint8_t> encoded) {
         return true;
     };
     WindowGrant grant;
-    if (!read16(grant.format_version) || grant.format_version != kDynamicVmFormatVersion)
+    if (!read16(grant.format_version) ||
+        grant.format_version != kDynamicVmSelectiveFormatVersionV3)
         return std::nullopt;
-    for (DynamicHash *hash : {&grant.build_id, &grant.region_id}) {
+    for (DynamicHash *hash : {&grant.build_id, &grant.region_id,
+                              &grant.artifact_hash}) {
         auto bytes = take(hash->size());
         if (!bytes) return std::nullopt;
         std::copy(bytes->begin(), bytes->end(), hash->begin());
     }
+    auto selector_bytes = take(kDynamicVmWindowSelectorV3EncodedSize);
+    if (!selector_bytes) return std::nullopt;
+    auto selector = decodeDynamicVmWindowSelectorV3(*selector_bytes);
+    if (!selector) return std::nullopt;
+    grant.selector = *selector;
     auto session = take(grant.session_id.size());
     if (!session || !read64(grant.generation) || !read64(grant.window_id))
         return std::nullopt;
@@ -927,9 +1109,11 @@ std::optional<WindowGrant> decodeWindowGrant(std::span<const uint8_t> encoded) {
 }
 
 bool validateWindowBinding(const WindowGrant &grant, const WindowBinding &binding) {
-    return grant.format_version == kDynamicVmFormatVersion &&
+    return grant.format_version == kDynamicVmSelectiveFormatVersionV3 &&
            same(grant.build_id, binding.build_id) &&
            same(grant.region_id, binding.region_id) &&
+           same(grant.artifact_hash, binding.artifact_hash) &&
+           grant.selector == binding.selector &&
            same(grant.session_id, binding.session_id) &&
            grant.generation == binding.generation && grant.window_id == binding.window_id &&
            same(grant.previous_state_hash, binding.previous_state_hash) &&

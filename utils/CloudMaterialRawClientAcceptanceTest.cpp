@@ -64,7 +64,7 @@ std::array<uint8_t, 32> decodeHash(const std::string &hex) {
 
 std::array<uint8_t, 32> requestDigest(std::span<const uint8_t> canonical) {
     constexpr std::string_view domain =
-        "xovm/raw-window-acquire/request/v1";
+        "xovm/raw-window-acquire/request/v3";
     std::vector<uint8_t> framed;
     framed.reserve(domain.size() + 4 + canonical.size());
     framed.insert(framed.end(), domain.begin(), domain.end());
@@ -142,6 +142,23 @@ int main(int argc, char **argv) {
         request.request_id.fill(0x66);
         request.build_id = decodeHash(argv[2]);
         request.region_id = decodeHash(argv[3]);
+        request.artifact_hash.fill(0x22);
+        request.selector.abi_id = 7;
+        request.selector.abi_hash.fill(0xa1);
+        request.selector.graph_commitment.fill(0xa2);
+        request.selector.node_id = 1;
+        request.selector.shard_id = 1;
+        request.selector.variant_id = 1;
+        request.selector.semantic =
+            xovm::material::ContinuationNodeSemanticV2::LoadI32;
+        request.selector.status =
+            xovm::material::ContinuationNodeStatusV2::Continue;
+        request.selector.bytecode_size = 6;
+        request.selector.bytecode_block_commitment.fill(0xb1);
+        request.selector.shard_size = 16;
+        request.selector.handler_shard_commitment.fill(0xc1);
+        request.selector.next_node_id = 2;
+        request.selector.transition_tail_commitment.fill(0xd1);
         request.generation = 1;
         request.window_id = 1;
         request.previous_state_hash = client.initialStateCommitment();
@@ -163,6 +180,8 @@ int main(int argc, char **argv) {
         require(grant.has_value(), "algorithm response was not a canonical grant");
         require(grant->build_id == request.build_id &&
                     grant->region_id == request.region_id &&
+                    grant->artifact_hash == request.artifact_hash &&
+                    grant->selector == request.selector &&
                     grant->session_id == client.sessionId() &&
                     grant->generation == request.generation &&
                     grant->window_id == request.window_id &&

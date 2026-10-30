@@ -135,6 +135,30 @@ WindowMaterial material(std::uint8_t value) {
     return result;
 }
 
+DynamicVmWindowSelectorV3 selector(std::uint64_t window) {
+    DynamicVmWindowSelectorV3 value;
+    value.abi_id = 7;
+    value.abi_hash.fill(0xa1);
+    value.graph_commitment.fill(0xa2);
+    value.node_id = static_cast<std::uint32_t>(window);
+    value.shard_id = static_cast<std::uint32_t>(window);
+    value.variant_id = 1;
+    value.semantic = ContinuationNodeSemanticV2::LoadI32;
+    value.status = ContinuationNodeStatusV2::Continue;
+    value.bytecode_offset = static_cast<std::uint32_t>((window - 1) * 6);
+    value.bytecode_size = 6;
+    value.bytecode_block_commitment.fill(
+        static_cast<std::uint8_t>(0xb0 + window));
+    value.shard_offset = static_cast<std::uint32_t>((window - 1) * 16);
+    value.shard_size = 16;
+    value.handler_shard_commitment.fill(
+        static_cast<std::uint8_t>(0xc0 + window));
+    value.next_node_id = static_cast<std::uint32_t>(window + 1);
+    value.transition_tail_commitment.fill(
+        static_cast<std::uint8_t>(0xd0 + window));
+    return value;
+}
+
 struct Fixture {
     DynamicHash build_id{};
     DynamicHash region_id{};
@@ -145,6 +169,10 @@ struct Fixture {
     std::uint64_t now = 1000;
     unsigned builder_calls = 0;
     bool fail_builder = false;
+    bool mismatch_provider_artifact = false;
+    bool mismatch_provider_selector = false;
+    bool mismatch_provider_successor = false;
+    bool zero_provider_capability = false;
     RawWindowAcquisitionService service;
 
     explicit Fixture(std::size_t requestBudget = 32,
@@ -165,11 +193,26 @@ struct Fixture {
               .trusted_now = [this] {
                   return std::variant<std::uint64_t, BackendError>{now};
               },
-              .build_material = [this](const WindowAcquireRequest &)
-                  -> std::variant<WindowMaterial, BackendError> {
+              .build_material = [this](const WindowAcquireRequest &request)
+                  -> std::variant<WindowMaterialProvisionV3, BackendError> {
                   ++builder_calls;
                   if (fail_builder) return BackendError{"builder_private_detail"};
-                  return material(static_cast<std::uint8_t>(0x40 + builder_calls));
+                  WindowMaterialProvisionV3 provision;
+                  provision.artifact_hash = request.artifact_hash;
+                  provision.selector = request.selector;
+                  if (mismatch_provider_artifact)
+                      provision.artifact_hash[0] ^= 1;
+                  if (mismatch_provider_selector)
+                      provision.selector = selector(request.window_id + 1);
+                  provision.material = zero_provider_capability
+                      ? WindowMaterial{}
+                      : material(static_cast<std::uint8_t>(
+                            0x40 + builder_calls));
+                  provision.entry_selector = selector(1);
+                  provision.next_selector = selector(
+                      request.selector.next_node_id +
+                      (mismatch_provider_successor ? 1 : 0));
+                  return provision;
               },
               .window_ttl_ms = ttl,
               .rate_budget = 1}) {
@@ -235,6 +278,8 @@ struct Fixture {
         value.request_id.fill(id);
         value.build_id = build_id;
         value.region_id = region_id;
+        value.artifact_hash.fill(0x33);
+        value.selector = selector(window);
         value.generation = 1;
         value.window_id = window;
         value.previous_state_hash = raw.authenticatedContext().initialStateCommitment();
@@ -507,6 +552,106 @@ TEST(malformed_identity_and_genesis_do_not_mutate_state) {
     EXPECT_TRUE(fixture.builder_calls == 1);
 }
 
+TEST(non_entry_genesis_and_provider_mismatch_do_not_publish) {
+    const auto path = std::filesystem::temp_directory_path() /
+        ("xovm-raw-window-entry-proof-" + std::to_string(::getpid()) + ".wal");
+    std::filesystem::remove(path);
+    StateWal wal(path);
+    Fixture fixture(32, 5000, 4000, 120000, &wal);
+
+    const auto before = wal.recover();
+    EXPECT_TRUE(std::holds_alternative<RecoveredState>(before));
+    const auto beforeRecords = std::holds_alternative<RecoveredState>(before)
+        ? std::get<RecoveredState>(before).records.size() : 0;
+
+    auto nonEntry = fixture.request(8);
+    nonEntry.selector = selector(2);
+    auto rejected = fixture.service.acquire(
+        fixture.raw.authenticatedContext(), nonEntry);
+    EXPECT_ERROR(rejected, "window_chain_mismatch");
+    EXPECT_TRUE(fixture.builder_calls == 1);
+
+    const auto afterRejected = wal.recover();
+    EXPECT_TRUE(std::holds_alternative<RecoveredState>(afterRejected));
+    if (const auto *recovered = std::get_if<RecoveredState>(&afterRejected))
+        EXPECT_TRUE(recovered->records.size() == beforeRecords);
+
+    fixture.mismatch_provider_artifact = true;
+    auto artifactMismatch = fixture.service.acquire(
+        fixture.raw.authenticatedContext(), fixture.request(9));
+    EXPECT_ERROR(artifactMismatch, "authority_unavailable");
+    fixture.mismatch_provider_artifact = false;
+
+    fixture.mismatch_provider_selector = true;
+    auto selectorMismatch = fixture.service.acquire(
+        fixture.raw.authenticatedContext(), fixture.request(10));
+    EXPECT_ERROR(selectorMismatch, "authority_unavailable");
+    fixture.mismatch_provider_selector = false;
+
+    fixture.mismatch_provider_successor = true;
+    auto successorMismatch = fixture.service.acquire(
+        fixture.raw.authenticatedContext(), fixture.request(12));
+    EXPECT_ERROR(successorMismatch, "authority_unavailable");
+    fixture.mismatch_provider_successor = false;
+
+    fixture.zero_provider_capability = true;
+    auto zeroCapability = fixture.service.acquire(
+        fixture.raw.authenticatedContext(), fixture.request(13));
+    EXPECT_ERROR(zeroCapability, "authority_unavailable");
+    fixture.zero_provider_capability = false;
+
+    const auto afterMismatches = wal.recover();
+    EXPECT_TRUE(std::holds_alternative<RecoveredState>(afterMismatches));
+    if (const auto *recovered = std::get_if<RecoveredState>(&afterMismatches))
+        EXPECT_TRUE(recovered->records.size() == beforeRecords);
+
+    auto valid = fixture.service.acquire(
+        fixture.raw.authenticatedContext(), fixture.request(11));
+    EXPECT_TRUE(std::holds_alternative<std::vector<std::uint8_t>>(valid));
+    const auto afterValid = wal.recover();
+    EXPECT_TRUE(std::holds_alternative<RecoveredState>(afterValid));
+    if (const auto *recovered = std::get_if<RecoveredState>(&afterValid))
+        EXPECT_TRUE(recovered->records.size() == beforeRecords + 1);
+    std::filesystem::remove(path);
+}
+
+TEST(non_entry_replacement_does_not_advance_generation) {
+    Fixture fixture(32, 500000, 500000, 120000);
+    auto first = fixture.service.acquire(
+        fixture.raw.authenticatedContext(), fixture.request(31));
+    EXPECT_TRUE(std::holds_alternative<std::vector<std::uint8_t>>(first));
+    if (!std::holds_alternative<std::vector<std::uint8_t>>(first)) return;
+    const auto firstGrant = decodeWindowGrant(
+        std::get<std::vector<std::uint8_t>>(first));
+    EXPECT_TRUE(firstGrant.has_value());
+    if (!firstGrant) return;
+
+    fixture.now = firstGrant->expires_at_ms;
+    auto nonEntry = fixture.request(32);
+    nonEntry.generation = 2;
+    nonEntry.selector = selector(2);
+    nonEntry.previous_state_hash = firstGrant->next_state_hash;
+    auto rejected = fixture.service.acquire(
+        fixture.raw.authenticatedContext(), nonEntry);
+    EXPECT_ERROR(rejected, "window_chain_mismatch");
+
+    auto valid = fixture.request(33);
+    valid.generation = 2;
+    valid.previous_state_hash = firstGrant->next_state_hash;
+    auto accepted = fixture.service.acquire(
+        fixture.raw.authenticatedContext(), valid);
+    EXPECT_TRUE(std::holds_alternative<std::vector<std::uint8_t>>(accepted));
+    if (const auto *encoded = std::get_if<std::vector<std::uint8_t>>(&accepted)) {
+        const auto grant = decodeWindowGrant(*encoded);
+        EXPECT_TRUE(grant.has_value());
+        if (grant) {
+            EXPECT_TRUE(grant->generation == 2);
+            EXPECT_TRUE(grant->window_id == 1);
+            EXPECT_TRUE(grant->selector == selector(1));
+        }
+    }
+}
+
 TEST(wal_failure_releases_budget_and_chain_for_distinct_request) {
     const auto path = std::filesystem::temp_directory_path() /
         ("xovm-raw-window-wal-failure-" + std::to_string(::getpid()) + ".wal");
@@ -616,11 +761,15 @@ int main() {
         builder_failure_releases_budget_for_distinct_request);
     run("malformed_identity_and_genesis_do_not_mutate_state",
         malformed_identity_and_genesis_do_not_mutate_state);
+    run("non_entry_genesis_and_provider_mismatch_do_not_publish",
+        non_entry_genesis_and_provider_mismatch_do_not_publish);
+    run("non_entry_replacement_does_not_advance_generation",
+        non_entry_replacement_does_not_advance_generation);
     run("wal_failure_releases_budget_and_chain_for_distinct_request",
         wal_failure_releases_budget_and_chain_for_distinct_request);
     run("replay_skip_and_builder_failure_leave_contiguous_chain_unchanged",
         replay_skip_and_builder_failure_leave_contiguous_chain_unchanged);
-    std::fprintf(stdout, "9 tests, %u assertions, %u failures\n",
+    std::fprintf(stdout, "11 tests, %u assertions, %u failures\n",
                  state.assertions, state.failures);
     return state.failures == 0 ? 0 : 1;
 }

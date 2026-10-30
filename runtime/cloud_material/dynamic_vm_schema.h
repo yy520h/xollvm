@@ -12,9 +12,13 @@
 
 namespace xovm::material {
 
+// The execution ABI remains frozen at v2. Selective artifacts and their wire
+// requests use a separate format version so v2 bytes are never reinterpreted.
 inline constexpr uint16_t kDynamicVmFormatVersion = 2;
+inline constexpr uint16_t kDynamicVmSelectiveFormatVersionV3 = 3;
 inline constexpr size_t kDynamicVmHashSize = 32;
-inline constexpr size_t kWindowAcquireRequestEncodedSize = 130;
+inline constexpr size_t kDynamicVmWindowSelectorV3EncodedSize = 212;
+inline constexpr size_t kWindowAcquireRequestEncodedSize = 374;
 inline constexpr size_t kWindowMaterialSize = 192;
 inline constexpr size_t kEncryptedWindowMaterialSize = 220;
 inline constexpr size_t kDynamicVmMaxWindowMaterial = 256 * 1024;
@@ -153,8 +157,37 @@ struct ContinuationGraphV2 {
     bool operator==(const ContinuationGraphV2 &) const = default;
 };
 
+struct DynamicVmWindowSelectorV3 {
+    uint16_t format_version = kDynamicVmSelectiveFormatVersionV3;
+    uint16_t execution_schema_version = kDynamicVmExecutionSchemaVersionV2;
+    DynamicVmExecutionProfileV2 profile =
+        DynamicVmExecutionProfileV2::LoadI32ReturnI32;
+    uint16_t flags = 0;
+    uint32_t abi_id = 0;
+    DynamicHash abi_hash{};
+    DynamicHash graph_commitment{};
+    uint32_t node_id = 0;
+    uint32_t shard_id = 0;
+    uint32_t variant_id = 0;
+    ContinuationNodeSemanticV2 semantic = ContinuationNodeSemanticV2::LoadI32;
+    ContinuationNodeStatusV2 status = ContinuationNodeStatusV2::Continue;
+    uint16_t reserved16 = 0;
+    uint32_t bytecode_offset = 0;
+    uint32_t bytecode_size = 0;
+    DynamicHash bytecode_block_commitment{};
+    uint32_t shard_offset = 0;
+    uint32_t shard_size = 0;
+    DynamicHash handler_shard_commitment{};
+    uint32_t next_node_id = 0;
+    DynamicHash transition_tail_commitment{};
+    uint16_t relocation_count = 0;
+    uint16_t reserved = 0;
+
+    bool operator==(const DynamicVmWindowSelectorV3 &) const = default;
+};
+
 struct EncryptedVmArtifact {
-    uint16_t format_version = kDynamicVmFormatVersion;
+    uint16_t format_version = kDynamicVmSelectiveFormatVersionV3;
     DynamicHash build_id{};
     DynamicHash region_id{};
     DynamicHash artifact_hash{};
@@ -166,21 +199,25 @@ struct EncryptedVmArtifact {
 
 // Canonical wire claim sent by a client when acquiring its next material window.
 struct WindowAcquireRequest {
-    uint16_t format_version = kDynamicVmFormatVersion;
+    uint16_t format_version = kDynamicVmSelectiveFormatVersionV3;
     std::array<uint8_t, 16> request_id{};
     DynamicHash build_id{};
     DynamicHash region_id{};
+    DynamicHash artifact_hash{};
     uint64_t generation = 0;
     uint64_t window_id = 0;
     DynamicHash previous_state_hash{};
+    DynamicVmWindowSelectorV3 selector{};
 
     bool operator==(const WindowAcquireRequest &) const = default;
 };
 
 struct WindowGrant {
-    uint16_t format_version = kDynamicVmFormatVersion;
+    uint16_t format_version = kDynamicVmSelectiveFormatVersionV3;
     DynamicHash build_id{};
     DynamicHash region_id{};
+    DynamicHash artifact_hash{};
+    DynamicVmWindowSelectorV3 selector{};
     std::array<uint8_t, 16> session_id{};
     uint64_t generation = 0;
     uint64_t window_id = 0;
@@ -224,6 +261,8 @@ struct GuardianChannelHello {
 struct WindowBinding {
     DynamicHash build_id{};
     DynamicHash region_id{};
+    DynamicHash artifact_hash{};
+    DynamicVmWindowSelectorV3 selector{};
     std::array<uint8_t, 16> session_id{};
     uint64_t generation = 0;
     uint64_t window_id = 0;
@@ -275,6 +314,17 @@ DynamicVmSchemaStatusV2 validateContinuationGraphV2(
     const ContinuationGraphV2 &graph,
     std::span<const uint8_t> bytecode,
     std::span<const uint8_t> handler_shards);
+
+bool validateDynamicVmWindowSelectorV3(
+    const DynamicVmWindowSelectorV3 &selector);
+std::optional<DynamicVmWindowSelectorV3> dynamicVmWindowSelectorV3(
+    const DynamicVmExecutionAbiV2 &abi,
+    const DynamicVmExecutionDescriptorV2 &descriptor,
+    const ContinuationNodeV2 &node);
+std::vector<uint8_t> encodeDynamicVmWindowSelectorV3(
+    const DynamicVmWindowSelectorV3 &selector);
+std::optional<DynamicVmWindowSelectorV3> decodeDynamicVmWindowSelectorV3(
+    std::span<const uint8_t> encoded);
 
 std::vector<uint8_t> encodeEncryptedVmArtifact(const EncryptedVmArtifact &artifact);
 std::optional<EncryptedVmArtifact> decodeEncryptedVmArtifact(std::span<const uint8_t> encoded);

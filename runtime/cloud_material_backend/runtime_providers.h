@@ -5,6 +5,7 @@
 #include "cloud_api.h"
 #include "config.h"
 #include "protocol_service.h"
+#include "../cloud_material/dynamic_vm_window_provider.h"
 
 #include <array>
 #include <functional>
@@ -25,7 +26,7 @@ struct RuntimeProviderBundle {
     // remain the acquisition service's responsibility. The caller must scrub the
     // returned material immediately after copying/encrypting it into a grant.
     using BuildWindowMaterial = std::function<std::variant<
-        xovm::material::WindowMaterial, BackendError>(
+        xovm::material::WindowMaterialProvisionV3, BackendError>(
         const xovm::material::WindowAcquireRequest &)>;
 
     std::function<std::variant<std::uint64_t, BackendError>()> trusted_now;

@@ -64,10 +64,14 @@ StateMaintenanceOutcome runOfflineStateMaintenance(
     }
 
     return StateMaintenanceResult{
-        reclamation.records_retired,
-        reclamation.response_bytes_reclaimed,
-        latest.last_sequence,
-        reclamation.more_work,
+        .records_retired = reclamation.records_retired,
+        .response_bytes_reclaimed = reclamation.response_bytes_reclaimed,
+        .replies_compacted = reclamation.replies_compacted,
+        .raw_registrations_compacted = reclamation.raw_registrations_compacted,
+        .sessions_compacted = reclamation.sessions_compacted,
+        .claims_compacted = reclamation.claims_compacted,
+        .sequence = latest.last_sequence,
+        .more_work = reclamation.more_work,
     };
 }
 

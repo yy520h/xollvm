@@ -38,8 +38,13 @@ int run() {
         return fail(*error);
     const auto &result = std::get<StateMaintenanceResult>(maintained);
     std::printf(
-        "records_retired=%zu response_bytes_reclaimed=%zu sequence=%llu more_work=%s\n",
+        "records_retired=%zu response_bytes_reclaimed=%zu "
+        "replies_compacted=%zu raw_registrations_compacted=%zu "
+        "sessions_compacted=%zu claims_compacted=%zu "
+        "sequence=%llu more_work=%s\n",
         result.records_retired, result.response_bytes_reclaimed,
+        result.replies_compacted, result.raw_registrations_compacted,
+        result.sessions_compacted, result.claims_compacted,
         static_cast<unsigned long long>(result.sequence),
         result.more_work ? "true" : "false");
     return 0;

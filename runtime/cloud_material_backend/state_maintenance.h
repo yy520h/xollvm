@@ -16,6 +16,10 @@ using TrustedNow =
 struct StateMaintenanceResult {
     std::size_t records_retired = 0;
     std::size_t response_bytes_reclaimed = 0;
+    std::size_t replies_compacted = 0;
+    std::size_t raw_registrations_compacted = 0;
+    std::size_t sessions_compacted = 0;
+    std::size_t claims_compacted = 0;
     std::uint64_t sequence = 0;
     bool more_work = false;
     bool operator==(const StateMaintenanceResult &) const = default;

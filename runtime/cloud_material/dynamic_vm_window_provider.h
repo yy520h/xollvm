@@ -8,11 +8,27 @@
 
 namespace xovm::material {
 
+// Trusted provider output. The capability is stored only in material.window;
+// selector identities are public and are persisted as commitments by the backend.
+struct WindowMaterialProvisionV3 {
+    DynamicHash artifact_hash{};
+    DynamicVmWindowSelectorV3 selector{};
+    WindowMaterial material{};
+    // Public graph identities returned from the provider's private registration.
+    // The service never trusts a request-side entry/successor assertion.
+    DynamicVmWindowSelectorV3 entry_selector{};
+    std::optional<DynamicVmWindowSelectorV3> next_selector;
+};
+
+void secureClear(WindowMaterialProvisionV3 &provision);
+
 // Trusted provider-only input. Unlike WindowAcquireRequest, this contains secret
 // and server-derived values and must never be accepted as a wire representation.
 struct WindowIssueInput {
     DynamicHash build_id{};
     DynamicHash region_id{};
+    DynamicHash artifact_hash{};
+    DynamicVmWindowSelectorV3 selector{};
     std::array<uint8_t, 16> session_id{};
     std::array<uint8_t, 32> session_secret{};
     uint64_t generation = 0;

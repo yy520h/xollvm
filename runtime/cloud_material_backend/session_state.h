@@ -34,6 +34,11 @@ struct WindowPreflightInput {
     std::uint64_t generation = 0;
     std::uint64_t window_id = 0;
     std::string previous_state;
+    // Raw v3 windows persist only a public selector commitment. The selector and
+    // its capability remain owned by the protocol/provider layers.
+    std::string selector_commitment;
+    bool selector_is_entry = false;
+    bool requires_entry_proof = false;
     std::uint64_t expires_at_ms = 0;
     // Set by preflight. Callers supply only expires_at_ms, which is the current
     // policy/session/window bound. Raw generation timing is independently fixed
@@ -44,6 +49,10 @@ struct WindowPreflightInput {
 struct WindowFinalizeInput {
     std::string next_state;
     std::vector<std::byte> encoded_response;
+    // Empty means the executed selector is terminal. Otherwise this is the
+    // canonical public commitment required by the next contiguous request.
+    std::string next_selector_commitment;
+    bool selector_is_entry = false;
 };
 
 // All values are canonical lowercase hex except software/build identity carried
@@ -78,6 +87,10 @@ using BuildRawSessionMetadata = std::function<
 struct ReclamationResult {
     std::size_t records_retired = 0;
     std::size_t response_bytes_reclaimed = 0;
+    std::size_t replies_compacted = 0;
+    std::size_t raw_registrations_compacted = 0;
+    std::size_t sessions_compacted = 0;
+    std::size_t claims_compacted = 0;
     bool more_work = false;
     bool operator==(const ReclamationResult &) const = default;
 };
@@ -164,9 +177,52 @@ private:
         bool retired = false;
         bool legacy_window_identity = false;
     };
+    struct RequestTombstone {
+        std::string request_digest;
+        std::string subject_id;
+        std::string build_id;
+        std::string software_id;
+        std::string artifact_hash;
+        std::string region_id;
+        std::string request_type;
+        std::string session_id;
+        std::string counter_epoch;
+        std::uint64_t generation = 0;
+        std::uint64_t window_id = 0;
+        std::uint64_t counter = 0;
+        bool closed = false;
+        bool legacy_window_identity = false;
+        // Raw registrations are never replayable, including after compaction.
+        bool raw_registration = false;
+    };
+    struct ClaimFence {
+        std::string build_id;
+        std::string kind;
+        std::string value;
+    };
+    struct RetiredRegionFloor {
+        std::uint64_t generation = 0;
+        std::uint64_t window_id = 0;
+    };
+    struct RetiredSessionRecord {
+        std::string build_id;
+        std::string subject_id;
+        std::string software_id;
+        std::string artifact_hash;
+        std::string counter_epoch;
+        std::string transport_kind;
+        std::uint64_t valid_until_ms = 0;
+        bool closed = false;
+        bool raw_chain_started = false;
+        std::unordered_map<std::string, RetiredRegionFloor> region_floors;
+    };
     std::mutex mutex_;
+    // Schema-v2 calls these active_* on disk so schema-v1 readers fail closed.
     std::unordered_map<std::string, ReplyRecord> replies_;
     std::unordered_map<std::string, std::string> claims_;
+    std::unordered_map<std::string, RequestTombstone> request_tombstones_;
+    std::unordered_map<std::string, ClaimFence> claim_fences_;
+    std::unordered_map<std::string, RetiredSessionRecord> retired_sessions_;
     // Fresh raw registration stores only its identity-bound request fence. It
     // never stores or serves a replayable hello response.
     struct RawRegistrationRecord {
@@ -205,6 +261,10 @@ private:
         std::uint64_t generation = 0;
         std::uint64_t window_id = 0;
         std::string state;
+        // Empty is legacy JSON state or a terminal selective chain. v3 raw
+        // requests set selector_binding=true so empty is unambiguously terminal.
+        std::string next_selector_commitment;
+        bool selector_binding = false;
         std::uint64_t epoch_at_ms = 0;
         std::uint64_t deadline_ms = 0;
         bool legacy_timing = false;

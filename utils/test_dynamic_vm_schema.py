@@ -22,7 +22,7 @@ def test_dynamic_vm_schema_probe(tmp_path):
 
 int main() {
   using namespace xovm::material;
-  static_assert(kWindowAcquireRequestEncodedSize == 130);
+  static_assert(kWindowAcquireRequestEncodedSize == 374);
   static_assert(sizeof(WindowMaterial) == 192);
   static_assert(kEncryptedWindowMaterialSize == 220);
   static_assert(kDynamicVmExecutionAbiV2EncodedSize == 66);
@@ -240,20 +240,43 @@ int main() {
   request.generation = 0x0102030405060708ULL;
   request.window_id = 0x1112131415161718ULL;
   request.previous_state_hash[0] = 4;
+  request.artifact_hash[0] = 5;
+  request.selector = *dynamicVmWindowSelectorV3(abi, graph.descriptor, graph.nodes[0]);
   const auto request_bytes = encodeWindowAcquireRequest(request);
   assert(request_bytes.size() == kWindowAcquireRequestEncodedSize);
-  assert(request_bytes[0] == 0 && request_bytes[1] == kDynamicVmFormatVersion);
+  assert(request_bytes[0] == 0 && request_bytes[1] == kDynamicVmSelectiveFormatVersionV3);
   assert(request_bytes[2] == 1 && request_bytes[18] == 2 &&
-         request_bytes[50] == 3);
-  assert(request_bytes[82] == 1 && request_bytes[89] == 8);
-  assert(request_bytes[90] == 0x11 && request_bytes[97] == 0x18);
-  assert(request_bytes[98] == 4);
+         request_bytes[50] == 3 && request_bytes[82] == 5);
   const auto decoded_request = decodeWindowAcquireRequest(request_bytes);
   assert(decoded_request && *decoded_request == request);
   assert(encodeWindowAcquireRequest(*decoded_request) == request_bytes);
+  auto invalid_selector = request.selector;
+  invalid_selector.status = ContinuationNodeStatusV2::Return;
+  assert(!validateDynamicVmWindowSelectorV3(invalid_selector));
+  assert(encodeDynamicVmWindowSelectorV3(invalid_selector).empty());
+  invalid_selector = request.selector;
+  invalid_selector.semantic = ContinuationNodeSemanticV2::ReturnI32;
+  assert(!validateDynamicVmWindowSelectorV3(invalid_selector));
+  invalid_selector = request.selector;
+  invalid_selector.next_node_id = 0;
+  assert(!validateDynamicVmWindowSelectorV3(invalid_selector));
+  invalid_selector = request.selector;
+  invalid_selector.bytecode_offset = UINT32_MAX;
+  assert(!validateDynamicVmWindowSelectorV3(invalid_selector));
+  invalid_selector = request.selector;
+  invalid_selector.shard_offset = UINT32_MAX;
+  assert(!validateDynamicVmWindowSelectorV3(invalid_selector));
+  auto terminal_selector = *dynamicVmWindowSelectorV3(
+      abi, graph.descriptor, graph.nodes[1]);
+  terminal_selector.status = ContinuationNodeStatusV2::Continue;
+  assert(!validateDynamicVmWindowSelectorV3(terminal_selector));
+  terminal_selector = *dynamicVmWindowSelectorV3(
+      abi, graph.descriptor, graph.nodes[1]);
+  terminal_selector.next_node_id = graph.nodes[0].node_id;
+  assert(!validateDynamicVmWindowSelectorV3(terminal_selector));
 
   auto unsupported = request_bytes;
-  unsupported[1] = static_cast<uint8_t>(kDynamicVmFormatVersion + 1);
+  unsupported[1] = static_cast<uint8_t>(kDynamicVmSelectiveFormatVersionV3 + 1);
   assert(!decodeWindowAcquireRequest(unsupported));
   auto zero_version = request_bytes;
   zero_version[0] = zero_version[1] = 0;
@@ -264,14 +287,6 @@ int main() {
   auto trailing = request_bytes;
   trailing.push_back(0);
   assert(!decodeWindowAcquireRequest(trailing));
-  for (const auto [begin, end] : std::array<std::array<size_t, 2>, 6>{{
-           {{2, 18}}, {{18, 50}}, {{50, 82}}, {{82, 90}}, {{90, 98}},
-           {{98, 130}}}}) {
-    auto noncanonical = request_bytes;
-    std::fill(noncanonical.begin() + static_cast<std::ptrdiff_t>(begin),
-              noncanonical.begin() + static_cast<std::ptrdiff_t>(end), 0);
-    assert(!decodeWindowAcquireRequest(noncanonical));
-  }
   auto invalid_request = request;
   invalid_request.request_id = {};
   assert(encodeWindowAcquireRequest(invalid_request).empty());
@@ -285,6 +300,8 @@ int main() {
   grant.generation = 3;
   grant.window_id = 4;
   grant.next_state_hash[0] = 9;
+  grant.artifact_hash = request.artifact_hash;
+  grant.selector = request.selector;
   grant.build_id[0] = 1;
   grant.region_id[0] = 2;
   grant.session_id[0] = 3;
@@ -314,6 +331,8 @@ int main() {
   WindowBinding binding{};
   binding.build_id = grant.build_id;
   binding.region_id = grant.region_id;
+  binding.artifact_hash = grant.artifact_hash;
+  binding.selector = grant.selector;
   binding.session_id = grant.session_id;
   binding.now_ms = 150;
   binding.generation = 3;

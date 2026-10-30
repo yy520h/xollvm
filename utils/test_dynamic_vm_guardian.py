@@ -40,6 +40,37 @@ def test_authenticated_guardian_worker_lifecycle(tmp_path):
 
 using namespace xovm::material;
 
+static DynamicVmWindowSelectorV3 canonicalSelector() {
+    DynamicVmExecutionAbiV2 abi{};
+    abi.abi_id = 1;
+    abi.i32_register_count = 1;
+    abi.loadi32_opcode = 0xa1;
+    abi.return_i32_opcode = 0xb2;
+    DynamicVmExecutionDescriptorV2 descriptor{};
+    descriptor.abi_id = abi.abi_id;
+    descriptor.abi_hash = *hashDynamicVmExecutionAbiV2(abi);
+    descriptor.bytecode_hash[0] = 1;
+    descriptor.bytecode_size = 2;
+    descriptor.handler_shards_size = 1;
+    descriptor.entry_node_id = 1;
+    descriptor.node_count = 1;
+    descriptor.graph_commitment[0] = 2;
+    ContinuationNodeV2 node{};
+    node.node_id = 1;
+    node.shard_id = 1;
+    node.bytecode_size = 2;
+    node.shard_size = 1;
+    node.semantic = ContinuationNodeSemanticV2::ReturnI32;
+    node.status = ContinuationNodeStatusV2::Return;
+    node.variant_id = 1;
+    node.bytecode_block_commitment[0] = 3;
+    node.handler_shard_commitment[0] = 4;
+    node.transition_tail_commitment = *hashDynamicVmTransitionTailV2(node);
+    auto selector = dynamicVmWindowSelectorV3(abi, descriptor, node);
+    assert(selector);
+    return *selector;
+}
+
 int main() {
     GuardianChannel direct;
     assert(!direct.established());
@@ -96,6 +127,8 @@ int main() {
     WindowIssueInput issue;
     issue.build_id = next.grant.build_id;
     issue.region_id = next.grant.region_id;
+    issue.artifact_hash = next.artifact_hash;
+    issue.selector = canonicalSelector();
     issue.session_id = next.grant.session_id;
     issue.generation = next.grant.generation;
     issue.window_id = next.grant.window_id;
@@ -139,6 +172,37 @@ def test_generation_install_rejects_wrong_grant_key(tmp_path):
 
 using namespace xovm::material;
 
+static DynamicVmWindowSelectorV3 canonicalSelector() {
+    DynamicVmExecutionAbiV2 abi{};
+    abi.abi_id = 1;
+    abi.i32_register_count = 1;
+    abi.loadi32_opcode = 0xa1;
+    abi.return_i32_opcode = 0xb2;
+    DynamicVmExecutionDescriptorV2 descriptor{};
+    descriptor.abi_id = abi.abi_id;
+    descriptor.abi_hash = *hashDynamicVmExecutionAbiV2(abi);
+    descriptor.bytecode_hash[0] = 1;
+    descriptor.bytecode_size = 2;
+    descriptor.handler_shards_size = 1;
+    descriptor.entry_node_id = 1;
+    descriptor.node_count = 1;
+    descriptor.graph_commitment[0] = 2;
+    ContinuationNodeV2 node{};
+    node.node_id = 1;
+    node.shard_id = 1;
+    node.bytecode_size = 2;
+    node.shard_size = 1;
+    node.semantic = ContinuationNodeSemanticV2::ReturnI32;
+    node.status = ContinuationNodeStatusV2::Return;
+    node.variant_id = 1;
+    node.bytecode_block_commitment[0] = 3;
+    node.handler_shard_commitment[0] = 4;
+    node.transition_tail_commitment = *hashDynamicVmTransitionTailV2(node);
+    auto selector = dynamicVmWindowSelectorV3(abi, descriptor, node);
+    assert(selector);
+    return *selector;
+}
+
 int main() {
     Launcher::StartOptions options;
     options.hello.session_id[0] = 8;
@@ -163,6 +227,8 @@ int main() {
     WindowIssueInput issue;
     issue.build_id[0] = 1;
     issue.region_id[0] = 2;
+    issue.artifact_hash = next.artifact_hash;
+    issue.selector = canonicalSelector();
     issue.session_id = options.hello.session_id;
     issue.session_secret[0] = 6;
     issue.generation = 2;

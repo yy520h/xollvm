@@ -1,6 +1,8 @@
 #include "runtime_providers.h"
+#include "dynamic_vm_artifact.h"
 
 #include <openssl/evp.h>
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -22,8 +24,74 @@ std::string hex(std::span<const std::uint8_t> bytes) {
     return result;
 }
 
-std::variant<xovm::material::WindowMaterial, BackendError> buildWindowMaterial(
-    const xovm::material::WindowAcquireRequest &request) {
+using xovm::material::DynamicHash;
+using xovm::material::DynamicVmPrivateCapabilityV3;
+using xovm::material::DynamicVmWindowSelectorV3;
+
+// Immutable fixture analogue of DynamicVmPrivateRegistrationV3. Keeping the
+// canonical selectors beside their capabilities makes the request only a lookup
+// key; it is never an authority for graph identity or material.
+struct FixtureDynamicVmRegistrationV3 {
+    DynamicHash artifact_hash{};
+    std::vector<DynamicVmPrivateCapabilityV3> capabilities;
+};
+
+DynamicVmWindowSelectorV3 fixtureSelector(std::uint32_t nodeId) {
+    DynamicVmWindowSelectorV3 selector;
+    selector.abi_id = 7;
+    selector.abi_hash.fill(0xa1);
+    selector.graph_commitment.fill(0xa2);
+    selector.node_id = nodeId;
+    selector.shard_id = nodeId;
+    selector.variant_id = nodeId;
+    selector.semantic = nodeId == 1
+        ? xovm::material::ContinuationNodeSemanticV2::LoadI32
+        : xovm::material::ContinuationNodeSemanticV2::ReturnI32;
+    selector.status = nodeId == 1
+        ? xovm::material::ContinuationNodeStatusV2::Continue
+        : xovm::material::ContinuationNodeStatusV2::Return;
+    selector.bytecode_offset = (nodeId - 1) * 6;
+    selector.bytecode_size = nodeId == 1 ? 6 : 2;
+    selector.bytecode_block_commitment.fill(
+        static_cast<std::uint8_t>(0xb0 + nodeId));
+    selector.shard_offset = (nodeId - 1) * 16;
+    selector.shard_size = 16;
+    selector.handler_shard_commitment.fill(
+        static_cast<std::uint8_t>(0xc0 + nodeId));
+    selector.next_node_id = nodeId == 1 ? 2 : 0;
+    selector.transition_tail_commitment.fill(
+        static_cast<std::uint8_t>(0xd0 + nodeId));
+    return selector;
+}
+
+const FixtureDynamicVmRegistrationV3 &fixtureRegistration() {
+    static const FixtureDynamicVmRegistrationV3 registration = [] {
+        FixtureDynamicVmRegistrationV3 value;
+        value.artifact_hash.fill(0x22);
+        for (std::uint32_t nodeId = 1; nodeId <= 2; ++nodeId) {
+            DynamicVmPrivateCapabilityV3 capability;
+            capability.selector = fixtureSelector(nodeId);
+            capability.capability.fill(
+                static_cast<std::uint8_t>(0x40 + nodeId));
+            value.capabilities.push_back(capability);
+        }
+        return value;
+    }();
+    return registration;
+}
+
+std::variant<xovm::material::WindowMaterialProvisionV3, BackendError>
+buildWindowMaterial(const xovm::material::WindowAcquireRequest &request) {
+    const auto &registration = fixtureRegistration();
+    if (request.artifact_hash != registration.artifact_hash ||
+        registration.capabilities.empty())
+        return BackendError{"build_unavailable"};
+    const auto current = std::find_if(
+        registration.capabilities.begin(), registration.capabilities.end(),
+        [&](const auto &entry) { return entry.selector == request.selector; });
+    if (current == registration.capabilities.end())
+        return BackendError{"build_unavailable"};
+
     const auto encoded = xovm::material::encodeWindowAcquireRequest(request);
     if (encoded.empty()) return BackendError{"window_material_unavailable"};
 
@@ -43,16 +111,31 @@ std::variant<xovm::material::WindowMaterial, BackendError> buildWindowMaterial(
         return digest;
     };
 
-    xovm::material::WindowMaterial material{};
-    std::array<std::array<std::uint8_t, 32> *, 6> fields = {
-        &material.window, &material.permutation, &material.decode,
-        &material.chaff, &material.integrity, &material.jit};
+    xovm::material::WindowMaterialProvisionV3 provision{};
+    provision.artifact_hash = registration.artifact_hash;
+    provision.selector = current->selector;
+    provision.entry_selector = registration.capabilities.front().selector;
+    if (current->selector.next_node_id != 0) {
+        const auto successor = std::find_if(
+            registration.capabilities.begin(), registration.capabilities.end(),
+            [&](const auto &entry) {
+                return entry.selector.node_id == current->selector.next_node_id;
+            });
+        if (successor == registration.capabilities.end())
+            return BackendError{"build_unavailable"};
+        provision.next_selector = successor->selector;
+    }
+    provision.material.window = current->capability;
+    std::array<std::array<std::uint8_t, 32> *, 5> fields = {
+        &provision.material.permutation, &provision.material.decode,
+        &provision.material.chaff, &provision.material.integrity,
+        &provision.material.jit};
     for (std::uint8_t domain = 0; domain < fields.size(); ++domain) {
-        auto value = derive(domain);
+        auto value = derive(static_cast<std::uint8_t>(domain + 1));
         if (const auto *error = std::get_if<BackendError>(&value)) return *error;
         *fields[domain] = std::get<std::array<std::uint8_t, 32>>(std::move(value));
     }
-    return material;
+    return provision;
 }
 
 std::string packageHash(nlohmann::json package) {

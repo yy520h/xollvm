@@ -17,6 +17,9 @@ constexpr std::size_t kMaxReplies = 4096;
 constexpr std::size_t kMaxRawRegistrations = 4096;
 constexpr std::size_t kMaxClaims = 32768;
 constexpr std::size_t kMaxGenerations = 16384;
+constexpr std::size_t kMaxRequestTombstones = 32768;
+constexpr std::size_t kMaxClaimFences = 65536;
+constexpr std::size_t kMaxRetiredSessions = 4096;
 constexpr std::size_t kMaxIdentityBytes = 1024;
 constexpr std::size_t kMaxChainStateBytes = 256;
 constexpr std::size_t kMaxWindowResponseBytes = 512 * 1024;
@@ -121,7 +124,8 @@ StateResult SessionState::Transaction::allocate(const std::string &sessionId,
     for (const auto &[label, value] : std::vector<std::pair<std::string, std::string>>{
              {"client_nonce", clientNonce}, {"client_key", clientEphemeralKey}}) {
         const auto key = label + ":" + scope + ":" + value;
-        if (state_.claims_.contains(key)) throw std::runtime_error("replay_detected");
+        if (state_.claims_.contains(key) || state_.claim_fences_.contains(key))
+            throw std::runtime_error("replay_detected");
         state_.claims_[key] = facts_.request_digest;
     }
     auto &generation = state_.generations_[scope];
@@ -145,7 +149,8 @@ StateResult SessionState::Transaction::claimServer(const std::string &serverNonc
     for (const auto &[label, value] : std::vector<std::pair<std::string, std::string>>{
              {"server_nonce", serverNonce}, {"server_key", serverEphemeralKey}}) {
         const auto key = label + ":" + facts_.build_id + ":" + value;
-        if (state_.claims_.contains(key)) throw std::runtime_error("invalid_key");
+        if (state_.claims_.contains(key) || state_.claim_fences_.contains(key))
+            throw std::runtime_error("invalid_key");
         state_.claims_[key] = facts_.request_digest;
     }
     return {};
@@ -153,9 +158,12 @@ StateResult SessionState::Transaction::claimServer(const std::string &serverNonc
 
 std::uint64_t SessionState::Transaction::preflightWindow(WindowPreflightInput input) {
     if (window_preflight_) throw std::runtime_error("window_invalid");
+    const bool selectorBinding = !input.selector_commitment.empty();
     if (!boundedString(input.session_id, kMaxIdentityBytes) ||
         !boundedString(input.region_id, kMaxIdentityBytes) ||
         !boundedString(input.previous_state, kMaxChainStateBytes) ||
+        (selectorBinding && !canonicalHex(input.selector_commitment, 64)) ||
+        (input.selector_is_entry || input.requires_entry_proof) ||
         input.generation == 0 || input.window_id == 0 ||
         input.window_id == UINT64_MAX || input.expires_at_ms <= now_ ||
         input.generation_deadline_ms != 0)
@@ -174,6 +182,7 @@ std::uint64_t SessionState::Transaction::preflightWindow(WindowPreflightInput in
     const bool raw = session->second.transport_kind == kRawTransportKind;
     const auto current = state_.windows_.find(input.session_id);
     if (current == state_.windows_.end()) {
+        input.requires_entry_proof = selectorBinding;
         if ((raw && session->second.raw_chain_started) || input.window_id != 1 ||
             (raw && input.generation != 1) ||
             (!session->second.initial_state_commitment.empty() &&
@@ -195,14 +204,20 @@ std::uint64_t SessionState::Transaction::preflightWindow(WindowPreflightInput in
         if (input.generation == record.generation) {
             if (record.deadline_ms <= now_ || record.window_id == UINT64_MAX ||
                 input.window_id != record.window_id + 1 ||
-                input.previous_state != record.state)
+                input.previous_state != record.state ||
+                record.selector_binding != selectorBinding ||
+                (selectorBinding &&
+                 (record.next_selector_commitment.empty() ||
+                  input.selector_commitment != record.next_selector_commitment)))
                 throw std::runtime_error("window_chain_mismatch");
             input.generation_deadline_ms = record.deadline_ms;
             input.expires_at_ms = std::min(input.expires_at_ms, record.deadline_ms);
         } else {
+            input.requires_entry_proof = selectorBinding;
             if (record.generation == UINT64_MAX ||
                 input.generation != record.generation + 1 || input.window_id != 1 ||
-                input.previous_state != record.state)
+                input.previous_state != record.state ||
+                record.selector_binding != selectorBinding)
                 throw std::runtime_error("window_chain_mismatch");
             const auto renewAt = record.deadline_ms - record.epoch_at_ms >
                     kGenerationRenewLeadMs
@@ -230,23 +245,36 @@ std::uint64_t SessionState::Transaction::preflightWindow(WindowPreflightInput in
 StateResult SessionState::Transaction::finalizeWindow(WindowFinalizeInput input) {
     if (!window_preflight_) throw std::runtime_error("window_invalid");
     if (!boundedString(input.next_state, kMaxChainStateBytes) ||
+        (!input.next_selector_commitment.empty() &&
+         !canonicalHex(input.next_selector_commitment, 64)) ||
         input.encoded_response.empty() || input.encoded_response.size() > kMaxWindowResponseBytes)
         throw std::runtime_error("window_invalid");
 
     auto preflight = std::move(*window_preflight_);
+    const bool selectorBinding = !preflight.selector_commitment.empty();
+    if (!selectorBinding &&
+        (!input.next_selector_commitment.empty() || input.selector_is_entry))
+        throw std::runtime_error("window_invalid");
+    if (preflight.requires_entry_proof && !input.selector_is_entry)
+        throw std::runtime_error("window_chain_mismatch");
     auto current = state_.windows_.find(preflight.session_id);
     if (current == state_.windows_.end()) {
         state_.windows_.emplace(preflight.session_id, WindowRecord{
             preflight.region_id, preflight.generation, preflight.window_id,
-            std::move(input.next_state), now_, preflight.generation_deadline_ms});
+            std::move(input.next_state), std::move(input.next_selector_commitment),
+            selectorBinding, now_, preflight.generation_deadline_ms});
     } else if (current->second.generation == preflight.generation) {
         current->second.window_id = preflight.window_id;
         current->second.state = std::move(input.next_state);
+        current->second.next_selector_commitment =
+            std::move(input.next_selector_commitment);
+        current->second.selector_binding = selectorBinding;
         if (state_.sessions_.at(preflight.session_id).transport_kind != kRawTransportKind)
             current->second.deadline_ms = preflight.generation_deadline_ms;
     } else {
         current->second = WindowRecord{preflight.region_id, preflight.generation,
-            preflight.window_id, std::move(input.next_state), now_,
+            preflight.window_id, std::move(input.next_state),
+            std::move(input.next_selector_commitment), selectorBinding, now_,
             preflight.generation_deadline_ms};
     }
     if (state_.sessions_.at(preflight.session_id).transport_kind == kRawTransportKind)
@@ -266,12 +294,14 @@ StateResult SessionState::Transaction::openSession(
     std::uint64_t validUntilMs, const std::string &serverNonce,
     const std::string &serverEphemeralKey, const std::string &clientNonce,
     const std::string &clientEphemeralKey) {
-    if (validUntilMs <= now_ || state_.sessions_.contains(sessionId))
+    if (validUntilMs <= now_ || state_.sessions_.contains(sessionId) ||
+        state_.retired_sessions_.contains(sessionId))
         throw std::runtime_error("session_closed");
     claimServer(serverNonce, serverEphemeralKey);
     const auto nonceKey = "client_nonce:" + facts_.build_id + ":" + clientNonce;
     const auto keyKey = "client_key:" + facts_.build_id + ":" + clientEphemeralKey;
-    if (state_.claims_.contains(nonceKey) || state_.claims_.contains(keyKey))
+    if (state_.claims_.contains(nonceKey) || state_.claims_.contains(keyKey) ||
+        state_.claim_fences_.contains(nonceKey) || state_.claim_fences_.contains(keyKey))
         throw std::runtime_error("replay_detected");
     state_.claims_[nonceKey] = facts_.request_digest;
     state_.claims_[keyKey] = facts_.request_digest;
@@ -305,7 +335,8 @@ StateResult SessionState::Transaction::closeSession(
     claimServer(serverNonce, serverEphemeralKey);
     const auto nonceKey = "client_nonce:" + facts_.build_id + ":" + clientNonce;
     const auto keyKey = "client_key:" + facts_.build_id + ":" + clientEphemeralKey;
-    if (state_.claims_.contains(nonceKey) || state_.claims_.contains(keyKey))
+    if (state_.claims_.contains(nonceKey) || state_.claims_.contains(keyKey) ||
+        state_.claim_fences_.contains(nonceKey) || state_.claim_fences_.contains(keyKey))
         throw std::runtime_error("replay_detected");
     state_.claims_[nonceKey] = facts_.request_digest;
     state_.claims_[keyKey] = facts_.request_digest;
@@ -345,7 +376,9 @@ StateResult SessionState::Transaction::controlSession(
     claimServer(serverNonce, serverEphemeralKey);
     const auto key = "client_nonce:" + facts_.build_id + ":" + clientNonce;
     const auto ephemeral = "client_key:" + facts_.build_id + ":" + clientEphemeralKey;
-    if (state_.claims_.contains(key) || state_.claims_.contains(ephemeral))
+    if (state_.claims_.contains(key) || state_.claims_.contains(ephemeral) ||
+        state_.claim_fences_.contains(key) ||
+        state_.claim_fences_.contains(ephemeral))
         throw std::runtime_error("replay_detected");
     state_.claims_[key] = facts_.request_digest;
     state_.claims_[ephemeral] = facts_.request_digest;
@@ -369,6 +402,18 @@ StateOutcome SessionState::transact(const RequestFacts &facts, const AnonymousGr
         return StateOutcome{BackendError{"unauthorized"}};
     std::lock_guard lock(mutex_);
     const auto requestKey = makeRequestKey(facts);
+    if (const auto tombstone = request_tombstones_.find(requestKey);
+        tombstone != request_tombstones_.end()) {
+        const auto &record = tombstone->second;
+        if (record.request_digest != facts.request_digest)
+            return stateError("request_conflict");
+        if (record.subject_id != grant.subject_id_ || record.build_id != facts.build_id ||
+            record.software_id != facts.software_id ||
+            record.artifact_hash != facts.final_artifact_hash ||
+            record.region_id != facts.region_id || record.request_type != facts.type)
+            return stateError("unauthorized");
+        return stateError(record.raw_registration ? "replay_detected" : "request_retired");
+    }
     if (const auto raw = raw_registrations_.find(requestKey);
         raw != raw_registrations_.end()) {
         if (raw->second.request_digest != facts.request_digest)
@@ -424,6 +469,9 @@ StateOutcome SessionState::transact(const RequestFacts &facts, const AnonymousGr
         SessionState draft;
         draft.replies_ = replies_;
         draft.claims_ = claims_;
+        draft.request_tombstones_ = request_tombstones_;
+        draft.claim_fences_ = claim_fences_;
+        draft.retired_sessions_ = retired_sessions_;
         draft.raw_registrations_ = raw_registrations_;
         draft.generations_ = generations_;
         draft.sessions_ = sessions_;
@@ -455,6 +503,9 @@ StateOutcome SessionState::transact(const RequestFacts &facts, const AnonymousGr
         }
         replies_.swap(draft.replies_);
         claims_.swap(draft.claims_);
+        request_tombstones_.swap(draft.request_tombstones_);
+        claim_fences_.swap(draft.claim_fences_);
+        retired_sessions_.swap(draft.retired_sessions_);
         raw_registrations_.swap(draft.raw_registrations_);
         generations_.swap(draft.generations_);
         sessions_.swap(draft.sessions_);
@@ -487,6 +538,17 @@ RawSessionRegistrationOutcome SessionState::registerRawSession(
 
     std::lock_guard lock(mutex_);
     const auto requestKey = makeRequestKey(facts);
+    if (const auto tombstone = request_tombstones_.find(requestKey);
+        tombstone != request_tombstones_.end()) {
+        const auto &record = tombstone->second;
+        if (record.request_digest != facts.request_digest)
+            return BackendError{"request_conflict"};
+        if (record.subject_id != grant.subject_id_ || record.build_id != facts.build_id ||
+            record.software_id != facts.software_id ||
+            record.artifact_hash != facts.final_artifact_hash)
+            return BackendError{"unauthorized"};
+        return BackendError{record.raw_registration ? "replay_detected" : "request_retired"};
+    }
     if (const auto previous = raw_registrations_.find(requestKey);
         previous != raw_registrations_.end()) {
         if (previous->second.request_digest != facts.request_digest)
@@ -508,7 +570,8 @@ RawSessionRegistrationOutcome SessionState::registerRawSession(
     }
     const auto clientNonceClaim = "client_nonce:" + facts.build_id + ":" + input.client_nonce;
     const auto clientKeyClaim = "client_key:" + facts.build_id + ":" + input.client_ephemeral_key;
-    if (claims_.contains(clientNonceClaim) || claims_.contains(clientKeyClaim))
+    if (claims_.contains(clientNonceClaim) || claims_.contains(clientKeyClaim) ||
+        claim_fences_.contains(clientNonceClaim) || claim_fences_.contains(clientKeyClaim))
         return BackendError{"replay_detected"};
     if (next_counter_ == UINT64_MAX) return BackendError{"counter_exhausted"};
     constexpr std::size_t metadataBytes = 32 + 64 + sizeof(std::uint32_t) +
@@ -550,16 +613,29 @@ RawSessionRegistrationOutcome SessionState::registerRawSession(
                 return BackendError{"unauthorized"};
             return BackendError{"request_conflict"};
         }
+        if (const auto retired = retired_sessions_.find(metadata.session_id);
+            retired != retired_sessions_.end()) {
+            if (retired->second.subject_id != grant.subject_id_ ||
+                retired->second.build_id != facts.build_id ||
+                retired->second.software_id != facts.software_id ||
+                retired->second.artifact_hash != facts.final_artifact_hash)
+                return BackendError{"unauthorized"};
+            return BackendError{"request_conflict"};
+        }
         const auto serverNonceClaim =
             "server_nonce:" + facts.build_id + ":" + metadata.server_nonce;
         const auto serverKeyClaim =
             "server_key:" + facts.build_id + ":" + metadata.server_ephemeral_key;
-        if (claims_.contains(serverNonceClaim) || claims_.contains(serverKeyClaim))
+        if (claims_.contains(serverNonceClaim) || claims_.contains(serverKeyClaim) ||
+            claim_fences_.contains(serverNonceClaim) || claim_fences_.contains(serverKeyClaim))
             return BackendError{"invalid_key"};
 
         SessionState draft;
         draft.replies_ = replies_;
         draft.claims_ = claims_;
+        draft.request_tombstones_ = request_tombstones_;
+        draft.claim_fences_ = claim_fences_;
+        draft.retired_sessions_ = retired_sessions_;
         draft.raw_registrations_ = raw_registrations_;
         draft.generations_ = generations_;
         draft.sessions_ = sessions_;
@@ -602,6 +678,9 @@ RawSessionRegistrationOutcome SessionState::registerRawSession(
         }
 
         claims_.swap(draft.claims_);
+        request_tombstones_.swap(draft.request_tombstones_);
+        claim_fences_.swap(draft.claim_fences_);
+        retired_sessions_.swap(draft.retired_sessions_);
         raw_registrations_.swap(draft.raw_registrations_);
         sessions_.swap(draft.sessions_);
         next_counter_ = draft.next_counter_;
@@ -622,13 +701,31 @@ std::optional<StateOutcome> SessionState::lookupRawWindowRequest(
     std::uint64_t trustedNow) {
     std::lock_guard lock(mutex_);
     const auto session = sessions_.find(sessionId);
-    if (session == sessions_.end() ||
-        session->second.transport_kind != kRawTransportKind ||
+    if (session == sessions_.end()) {
+        const auto retired = retired_sessions_.find(sessionId);
+        if (retired != retired_sessions_.end() &&
+            retired->second.transport_kind == kRawTransportKind &&
+            retired->second.software_id == softwareId && retired->second.build_id == buildId)
+            return StateOutcome{BackendError{"session_closed"}};
+        return StateOutcome{BackendError{"unauthorized"}};
+    }
+    if (session->second.transport_kind != kRawTransportKind ||
         session->second.software_id != softwareId ||
         session->second.build_id != buildId)
         return StateOutcome{BackendError{"unauthorized"}};
     const auto requestKey = softwareId + ":" + buildId + ":" +
         session->second.artifact_hash + ":" + requestId;
+    if (const auto tombstone = request_tombstones_.find(requestKey);
+        tombstone != request_tombstones_.end()) {
+        const auto &record = tombstone->second;
+        if (record.request_digest != requestDigest)
+            return StateOutcome{BackendError{"request_conflict"}};
+        if (record.session_id != sessionId || record.region_id != regionId ||
+            record.request_type != "material.issue")
+            return StateOutcome{BackendError{"unauthorized"}};
+        return StateOutcome{BackendError{record.raw_registration
+                ? "replay_detected" : "request_retired"}};
+    }
     const auto cached = replies_.find(requestKey);
     if (cached == replies_.end()) return std::nullopt;
     const auto &record = cached->second;
@@ -657,27 +754,43 @@ std::optional<StateOutcome> SessionState::lookupRawWindowRequest(
 ReclamationOutcome SessionState::reclaimExpiredResponses(
     std::uint64_t trustedNow) {
     std::lock_guard lock(mutex_);
-    struct Candidate {
+    struct ReplyCandidate {
         std::uint64_t retire_at_ms;
         std::string request_key;
     };
-    std::vector<Candidate> candidates;
-    candidates.reserve(replies_.size());
+    std::vector<ReplyCandidate> replyCandidates;
+    replyCandidates.reserve(replies_.size());
     for (const auto &[key, reply] : replies_) {
-        if (!reply.retired && reply.retire_at_ms != 0 &&
-            reply.retire_at_ms <= trustedNow)
-            candidates.push_back(Candidate{reply.retire_at_ms, key});
+        if (reply.retire_at_ms != 0 && reply.retire_at_ms <= trustedNow)
+            replyCandidates.push_back(ReplyCandidate{reply.retire_at_ms, key});
     }
-    std::sort(candidates.begin(), candidates.end(),
-        [](const Candidate &left, const Candidate &right) {
+    std::sort(replyCandidates.begin(), replyCandidates.end(),
+        [](const ReplyCandidate &left, const ReplyCandidate &right) {
             return left.retire_at_ms < right.retire_at_ms ||
                 (left.retire_at_ms == right.retire_at_ms &&
                  left.request_key < right.request_key);
         });
 
+    std::vector<std::string> sessionCandidates;
+    sessionCandidates.reserve(sessions_.size());
+    for (const auto &[sessionId, session] : sessions_) {
+        if (session.closed || session.valid_until_ms <= trustedNow)
+            sessionCandidates.push_back(sessionId);
+    }
+    std::sort(sessionCandidates.begin(), sessionCandidates.end(),
+        [&](const std::string &left, const std::string &right) {
+            const auto &leftSession = sessions_.at(left);
+            const auto &rightSession = sessions_.at(right);
+            return leftSession.valid_until_ms < rightSession.valid_until_ms ||
+                (leftSession.valid_until_ms == rightSession.valid_until_ms && left < right);
+        });
+
     SessionState draft;
     draft.replies_ = replies_;
     draft.claims_ = claims_;
+    draft.request_tombstones_ = request_tombstones_;
+    draft.claim_fences_ = claim_fences_;
+    draft.retired_sessions_ = retired_sessions_;
     draft.raw_registrations_ = raw_registrations_;
     draft.generations_ = generations_;
     draft.sessions_ = sessions_;
@@ -687,9 +800,11 @@ ReclamationOutcome SessionState::reclaimExpiredResponses(
     draft.next_sequence_ = next_sequence_;
 
     ReclamationResult result;
-    for (const auto &candidate : candidates) {
-        if (result.records_retired >= kReclamationRecordLimit) break;
+    std::size_t operations = 0;
+    for (const auto &candidate : replyCandidates) {
+        if (operations >= kReclamationRecordLimit) break;
         auto &reply = draft.replies_.at(candidate.request_key);
+        if (reply.retired) continue;
         const auto responseBytes = reply.result.response.size();
         if (result.response_bytes_reclaimed != 0 &&
             responseBytes > kReclamationByteLimit -
@@ -699,14 +814,183 @@ ReclamationOutcome SessionState::reclaimExpiredResponses(
         reply.result.response.shrink_to_fit();
         reply.retired = true;
         ++result.records_retired;
+        ++operations;
         result.response_bytes_reclaimed += responseBytes;
         if (result.response_bytes_reclaimed >= kReclamationByteLimit) break;
     }
-    result.more_work = std::any_of(
-        candidates.begin(), candidates.end(), [&](const Candidate &candidate) {
-            return !draft.replies_.at(candidate.request_key).retired;
+
+    for (const auto &candidate : replyCandidates) {
+        if (operations >= kReclamationRecordLimit) break;
+        const auto found = draft.replies_.find(candidate.request_key);
+        if (found == draft.replies_.end() || !found->second.retired) continue;
+        const auto &reply = found->second;
+        if (draft.request_tombstones_.size() >= kMaxRequestTombstones)
+            return BackendError{"state_capacity"};
+        RequestTombstone tombstone{.request_digest = reply.request_digest,
+            .subject_id = reply.subject_id, .build_id = reply.build_id,
+            .software_id = reply.software_id, .artifact_hash = reply.artifact_hash,
+            .region_id = reply.region_id, .request_type = reply.request_type,
+            .session_id = reply.result.session_id,
+            .counter_epoch = reply.result.counter_epoch,
+            .generation = reply.result.generation, .window_id = reply.result.window_id,
+            .counter = reply.result.counter, .closed = reply.result.closed,
+            .legacy_window_identity = reply.legacy_window_identity,
+            .raw_registration = false};
+        if (!draft.request_tombstones_.emplace(
+                candidate.request_key, std::move(tombstone)).second)
+            return BackendError{"wal_state_invalid"};
+        draft.claims_.erase("request:" + candidate.request_key);
+        draft.replies_.erase(found);
+        ++result.replies_compacted;
+        ++operations;
+    }
+
+    for (const auto &sessionId : sessionCandidates) {
+        if (operations >= kReclamationRecordLimit) break;
+        const auto sessionIt = draft.sessions_.find(sessionId);
+        if (sessionIt == draft.sessions_.end()) continue;
+        const auto &session = sessionIt->second;
+        const bool hasReplies = std::any_of(draft.replies_.begin(), draft.replies_.end(),
+            [&](const auto &entry) { return entry.second.result.session_id == sessionId; });
+        if (hasReplies) continue;
+
+        RetiredSessionRecord retired{.build_id = session.build_id,
+            .subject_id = session.subject_id, .software_id = session.software_id,
+            .artifact_hash = session.artifact_hash, .counter_epoch = session.counter_epoch,
+            .transport_kind = session.transport_kind,
+            .valid_until_ms = session.valid_until_ms, .closed = session.closed,
+            .raw_chain_started = session.raw_chain_started};
+        if (const auto window = draft.windows_.find(sessionId);
+            window != draft.windows_.end()) {
+            retired.region_floors.emplace(window->second.region_id,
+                RetiredRegionFloor{window->second.generation, window->second.window_id});
+        }
+        const auto generationPrefix = session.build_id + ":" + sessionId + ":";
+        for (const auto &[key, generation] : draft.generations_) {
+            if (!key.starts_with(generationPrefix)) continue;
+            const auto region = key.substr(generationPrefix.size());
+            if (region.empty()) return BackendError{"wal_state_invalid"};
+            auto &floor = retired.region_floors[region];
+            floor.generation = std::max(floor.generation, generation);
+        }
+        if (draft.retired_sessions_.size() >= kMaxRetiredSessions ||
+            !draft.retired_sessions_.emplace(sessionId, std::move(retired)).second)
+            return BackendError{"state_capacity"};
+
+        std::vector<std::string> registrations;
+        for (const auto &[key, registration] : draft.raw_registrations_)
+            if (registration.session_id == sessionId) registrations.push_back(key);
+        std::sort(registrations.begin(), registrations.end());
+        for (const auto &key : registrations) {
+            const auto registration = draft.raw_registrations_.at(key);
+            if (draft.request_tombstones_.size() >= kMaxRequestTombstones)
+                return BackendError{"state_capacity"};
+            RequestTombstone tombstone{.request_digest = registration.request_digest,
+                .subject_id = registration.subject_id, .build_id = registration.build_id,
+                .software_id = registration.software_id,
+                .artifact_hash = registration.artifact_hash,
+                .request_type = "session.open", .session_id = registration.session_id,
+                .counter = registration.counter, .raw_registration = true};
+            if (!draft.request_tombstones_.emplace(key, std::move(tombstone)).second)
+                return BackendError{"wal_state_invalid"};
+            const std::pair<std::string_view, const std::string &> values[] = {
+                {"client_nonce", registration.client_nonce},
+                {"client_key", registration.client_ephemeral_key},
+                {"server_nonce", registration.server_nonce},
+                {"server_key", registration.server_ephemeral_key}};
+            for (const auto &[kind, publicValue] : values) {
+                const auto claimKey = std::string(kind) + ":" + registration.build_id +
+                    ":" + publicValue;
+                const auto claim = draft.claims_.find(claimKey);
+                if (claim == draft.claims_.end() ||
+                    claim->second != registration.request_digest)
+                    return BackendError{"wal_state_invalid"};
+                if (draft.claim_fences_.size() >= kMaxClaimFences)
+                    return BackendError{"state_capacity"};
+                ClaimFence fence{registration.build_id, std::string(kind), publicValue};
+                if (!draft.claim_fences_.emplace(claimKey, std::move(fence)).second)
+                    return BackendError{"wal_state_invalid"};
+                draft.claims_.erase(claim);
+                ++result.claims_compacted;
+            }
+            draft.raw_registrations_.erase(key);
+            ++result.raw_registrations_compacted;
+        }
+        for (auto it = draft.generations_.begin(); it != draft.generations_.end();) {
+            if (it->first.starts_with(generationPrefix))
+                it = draft.generations_.erase(it);
+            else
+                ++it;
+        }
+        draft.windows_.erase(sessionId);
+        draft.sessions_.erase(sessionIt);
+        ++result.sessions_compacted;
+        ++operations;
+    }
+
+    std::unordered_set<std::string> activeRequestDigests;
+    activeRequestDigests.reserve(draft.replies_.size() + draft.raw_registrations_.size());
+    for (const auto &[key, reply] : draft.replies_) {
+        (void)key;
+        if (!reply.retired)
+            activeRequestDigests.emplace(reply.request_digest);
+    }
+    for (const auto &[key, registration] : draft.raw_registrations_) {
+        (void)key;
+        activeRequestDigests.emplace(registration.request_digest);
+    }
+    std::unordered_set<std::string> retiredRequestDigests;
+    retiredRequestDigests.reserve(draft.request_tombstones_.size());
+    for (const auto &[key, tombstone] : draft.request_tombstones_) {
+        (void)key;
+        retiredRequestDigests.emplace(tombstone.request_digest);
+    }
+    std::vector<std::string> claimCandidates;
+    claimCandidates.reserve(draft.claims_.size());
+    for (const auto &[key, digest] : draft.claims_) {
+        if (!key.starts_with("request:") && !activeRequestDigests.contains(digest) &&
+            retiredRequestDigests.contains(digest))
+            claimCandidates.push_back(key);
+    }
+    std::sort(claimCandidates.begin(), claimCandidates.end());
+    for (const auto &key : claimCandidates) {
+        const auto firstSeparator = key.find(':');
+        const auto secondSeparator = firstSeparator == std::string::npos
+            ? std::string::npos : key.find(':', firstSeparator + 1);
+        if (firstSeparator == std::string::npos || secondSeparator == std::string::npos ||
+            secondSeparator + 1 >= key.size())
+            return BackendError{"wal_state_invalid"};
+        const auto kind = key.substr(0, firstSeparator);
+        if (kind != "client_nonce" && kind != "client_key" &&
+            kind != "server_nonce" && kind != "server_key")
+            return BackendError{"wal_state_invalid"};
+        if (draft.claim_fences_.size() >= kMaxClaimFences)
+            return BackendError{"state_capacity"};
+        ClaimFence fence{key.substr(firstSeparator + 1,
+                secondSeparator - firstSeparator - 1),
+            kind, key.substr(secondSeparator + 1)};
+        if (!draft.claim_fences_.emplace(key, std::move(fence)).second)
+            return BackendError{"wal_state_invalid"};
+        draft.claims_.erase(key);
+        ++result.claims_compacted;
+    }
+
+    result.more_work = std::any_of(draft.replies_.begin(), draft.replies_.end(),
+        [&](const auto &entry) {
+            return entry.second.retire_at_ms != 0 &&
+                entry.second.retire_at_ms <= trustedNow;
+        }) || std::any_of(draft.sessions_.begin(), draft.sessions_.end(),
+        [&](const auto &entry) {
+            if (!entry.second.closed && entry.second.valid_until_ms > trustedNow) return false;
+            return std::none_of(draft.replies_.begin(), draft.replies_.end(),
+                [&](const auto &reply) {
+                    return reply.second.result.session_id == entry.first;
+                });
         });
-    if (result.records_retired == 0) return result;
+    const bool changed = result.records_retired != 0 || result.replies_compacted != 0 ||
+        result.raw_registrations_compacted != 0 || result.sessions_compacted != 0 ||
+        result.claims_compacted != 0;
+    if (!changed) return result;
     if (!draft.refreshRetainedBytes()) return BackendError{"state_capacity"};
     if (wal_) {
         if (next_sequence_ == UINT64_MAX) return BackendError{"counter_exhausted"};
@@ -716,6 +1000,14 @@ ReclamationOutcome SessionState::reclaimExpiredResponses(
         ++draft.next_sequence_;
     }
     replies_.swap(draft.replies_);
+    claims_.swap(draft.claims_);
+    request_tombstones_.swap(draft.request_tombstones_);
+    claim_fences_.swap(draft.claim_fences_);
+    retired_sessions_.swap(draft.retired_sessions_);
+    raw_registrations_.swap(draft.raw_registrations_);
+    generations_.swap(draft.generations_);
+    sessions_.swap(draft.sessions_);
+    windows_.swap(draft.windows_);
     retained_bytes_ = draft.retained_bytes_;
     next_sequence_ = draft.next_sequence_;
     return result;
@@ -724,7 +1016,10 @@ ReclamationOutcome SessionState::reclaimExpiredResponses(
 bool SessionState::refreshRetainedBytes() {
     if (replies_.size() > kMaxReplies || raw_registrations_.size() > kMaxRawRegistrations ||
         claims_.size() > kMaxClaims || generations_.size() > kMaxGenerations ||
-        sessions_.size() > kMaxSessions || windows_.size() > kMaxSessions)
+        sessions_.size() > kMaxSessions || windows_.size() > kMaxSessions ||
+        request_tombstones_.size() > kMaxRequestTombstones ||
+        claim_fences_.size() > kMaxClaimFences ||
+        retired_sessions_.size() > kMaxRetiredSessions)
         return false;
     std::size_t total = sizeof(next_counter_);
     const auto add = [&](std::size_t bytes) { return addRetained(total, bytes); };
@@ -745,6 +1040,36 @@ bool SessionState::refreshRetainedBytes() {
     }
     for (const auto &[key, value] : claims_)
         if (!add(key.size()) || !add(value.size())) return false;
+    for (const auto &[key, tombstone] : request_tombstones_) {
+        if (!add(key.size()) || !add(tombstone.request_digest.size()) ||
+            !add(tombstone.subject_id.size()) || !add(tombstone.build_id.size()) ||
+            !add(tombstone.software_id.size()) || !add(tombstone.artifact_hash.size()) ||
+            !add(tombstone.region_id.size()) || !add(tombstone.request_type.size()) ||
+            !add(tombstone.session_id.size()) || !add(tombstone.counter_epoch.size()) ||
+            !add(sizeof(tombstone.generation)) || !add(sizeof(tombstone.window_id)) ||
+            !add(sizeof(tombstone.counter)) || !add(sizeof(tombstone.closed)) ||
+            !add(sizeof(tombstone.legacy_window_identity)) ||
+            !add(sizeof(tombstone.raw_registration)))
+            return false;
+    }
+    for (const auto &[key, fence] : claim_fences_) {
+        if (!add(key.size()) || !add(fence.build_id.size()) || !add(fence.kind.size()) ||
+            !add(fence.value.size()))
+            return false;
+    }
+    for (const auto &[key, retired] : retired_sessions_) {
+        if (!add(key.size()) || !add(retired.build_id.size()) ||
+            !add(retired.subject_id.size()) || !add(retired.software_id.size()) ||
+            !add(retired.artifact_hash.size()) || !add(retired.counter_epoch.size()) ||
+            !add(retired.transport_kind.size()) || !add(sizeof(retired.valid_until_ms)) ||
+            !add(sizeof(retired.closed)) || !add(sizeof(retired.raw_chain_started)))
+            return false;
+        for (const auto &[region, floor] : retired.region_floors) {
+            if (!add(region.size()) || !add(sizeof(floor.generation)) ||
+                !add(sizeof(floor.window_id)))
+                return false;
+        }
+    }
     for (const auto &[key, registration] : raw_registrations_) {
         if (!add(key.size()) || !add(registration.request_digest.size()) ||
             !add(registration.subject_id.size()) || !add(registration.build_id.size()) ||
@@ -771,7 +1096,10 @@ bool SessionState::refreshRetainedBytes() {
     for (const auto &[key, window] : windows_) {
         if (!add(key.size()) || !add(window.region_id.size()) ||
             !add(sizeof(window.generation)) || !add(sizeof(window.window_id)) ||
-            !add(window.state.size()) || !add(sizeof(window.epoch_at_ms)) ||
+            !add(window.state.size()) ||
+            !add(window.next_selector_commitment.size()) ||
+            !add(sizeof(window.selector_binding)) ||
+            !add(sizeof(window.epoch_at_ms)) ||
             !add(sizeof(window.deadline_ms)) || !add(sizeof(window.legacy_timing)))
             return false;
     }
@@ -780,11 +1108,12 @@ bool SessionState::refreshRetainedBytes() {
 }
 
 std::vector<std::byte> SessionState::serialize() const {
-    Json value{{"next_counter", next_counter_}, {"retained_bytes", retained_bytes_}};
-    value["replies"] = Json::object();
+    Json value{{"schema_version", 2}, {"next_counter", next_counter_},
+        {"retained_bytes", retained_bytes_}};
+    value["active_replies"] = Json::object();
     for (const auto &[key, reply] : replies_) {
         const auto &result = reply.result;
-        value["replies"][key] = {{"generation", result.generation},
+        value["active_replies"][key] = {{"generation", result.generation},
             {"counter", result.counter},
             {"response", bytesJson(result.response)}, {"session_id", result.session_id},
             {"counter_epoch", result.counter_epoch}, {"valid_until_ms", result.valid_until_ms},
@@ -795,12 +1124,45 @@ std::vector<std::byte> SessionState::serialize() const {
             {"request_type", reply.request_type}, {"retire_at_ms", reply.retire_at_ms},
             {"status", reply.retired ? "retired" : "live"}};
         if (!reply.legacy_window_identity)
-            value["replies"][key]["window_id"] = result.window_id;
+            value["active_replies"][key]["window_id"] = result.window_id;
     }
-    value["claims"] = claims_;
-    value["raw_registrations"] = Json::object();
+    value["active_claims"] = claims_;
+    value["request_tombstones"] = Json::object();
+    for (const auto &[key, tombstone] : request_tombstones_) {
+        value["request_tombstones"][key] = {
+            {"request_digest", tombstone.request_digest},
+            {"subject_id", tombstone.subject_id}, {"build_id", tombstone.build_id},
+            {"software_id", tombstone.software_id},
+            {"artifact_hash", tombstone.artifact_hash}, {"region_id", tombstone.region_id},
+            {"request_type", tombstone.request_type}, {"session_id", tombstone.session_id},
+            {"counter_epoch", tombstone.counter_epoch},
+            {"generation", tombstone.generation}, {"window_id", tombstone.window_id},
+            {"counter", tombstone.counter}, {"closed", tombstone.closed},
+            {"legacy_window_identity", tombstone.legacy_window_identity},
+            {"raw_registration", tombstone.raw_registration}};
+    }
+    value["claim_fences"] = Json::object();
+    for (const auto &[key, fence] : claim_fences_)
+        value["claim_fences"][key] = {{"build_id", fence.build_id},
+            {"kind", fence.kind}, {"value", fence.value}};
+    value["retired_sessions"] = Json::object();
+    for (const auto &[key, retired] : retired_sessions_) {
+        Json floors = Json::object();
+        for (const auto &[region, floor] : retired.region_floors)
+            floors[region] = {{"generation", floor.generation},
+                {"window_id", floor.window_id}};
+        value["retired_sessions"][key] = {{"build_id", retired.build_id},
+            {"subject_id", retired.subject_id}, {"software_id", retired.software_id},
+            {"artifact_hash", retired.artifact_hash},
+            {"counter_epoch", retired.counter_epoch},
+            {"transport_kind", retired.transport_kind},
+            {"valid_until_ms", retired.valid_until_ms}, {"closed", retired.closed},
+            {"raw_chain_started", retired.raw_chain_started},
+            {"region_floors", std::move(floors)}};
+    }
+    value["active_raw_registrations"] = Json::object();
     for (const auto &[key, registration] : raw_registrations_) {
-        value["raw_registrations"][key] = {
+        value["active_raw_registrations"][key] = {
             {"request_digest", registration.request_digest},
             {"subject_id", registration.subject_id},
             {"build_id", registration.build_id},
@@ -813,10 +1175,10 @@ std::vector<std::byte> SessionState::serialize() const {
             {"server_nonce", registration.server_nonce},
             {"server_ephemeral_key", registration.server_ephemeral_key}};
     }
-    value["generations"] = generations_;
-    value["sessions"] = Json::object();
+    value["active_generations"] = generations_;
+    value["active_sessions"] = Json::object();
     for (const auto &[key, session] : sessions_) {
-        value["sessions"][key] = {{"build_id", session.build_id}, {"subject_id", session.subject_id},
+        value["active_sessions"][key] = {{"build_id", session.build_id}, {"subject_id", session.subject_id},
             {"software_id", session.software_id}, {"artifact_hash", session.artifact_hash},
             {"counter_epoch", session.counter_epoch},
             {"transport_kind", session.transport_kind},
@@ -824,16 +1186,21 @@ std::vector<std::byte> SessionState::serialize() const {
             {"key_version", session.key_version}, {"valid_until_ms", session.valid_until_ms},
             {"closed", session.closed}, {"raw_chain_started", session.raw_chain_started}};
     }
-    value["windows"] = Json::object();
+    value["active_windows"] = Json::object();
     for (const auto &[key, window] : windows_) {
-        value["windows"][key] = {{"region_id", window.region_id},
+        value["active_windows"][key] = {{"region_id", window.region_id},
             {"generation", window.generation}, {"window_id", window.window_id},
             {"state", window.state}};
+        if (window.selector_binding) {
+            value["active_windows"][key]["selector_binding"] = true;
+            value["active_windows"][key]["next_selector_commitment"] =
+                window.next_selector_commitment;
+        }
         if (window.legacy_timing) {
-            value["windows"][key]["expires_at_ms"] = window.deadline_ms;
+            value["active_windows"][key]["expires_at_ms"] = window.deadline_ms;
         } else {
-            value["windows"][key]["epoch_at_ms"] = window.epoch_at_ms;
-            value["windows"][key]["deadline_ms"] = window.deadline_ms;
+            value["active_windows"][key]["epoch_at_ms"] = window.epoch_at_ms;
+            value["active_windows"][key]["deadline_ms"] = window.deadline_ms;
         }
     }
     const auto text = value.dump();
@@ -848,19 +1215,37 @@ std::variant<std::monostate, BackendError> SessionState::applySerialized(
     try {
         const std::string text(reinterpret_cast<const char *>(bytes.data()), bytes.size());
         const auto value = Json::parse(text);
-        if (!value.is_object() || !value.contains("replies") || !value.contains("claims") ||
-            !value.contains("generations") || !value.contains("sessions"))
+        if (!value.is_object()) return BackendError{"wal_state_invalid"};
+        const bool schemaV2 = value.contains("schema_version");
+        if (schemaV2) {
+            if (value.at("schema_version").get<std::uint64_t>() != 2 ||
+                value.contains("replies") || value.contains("claims") ||
+                value.contains("raw_registrations") || value.contains("generations") ||
+                value.contains("sessions") || value.contains("windows") ||
+                !value.contains("active_replies") || !value.contains("active_claims") ||
+                !value.contains("active_raw_registrations") ||
+                !value.contains("active_generations") ||
+                !value.contains("active_sessions") || !value.contains("active_windows") ||
+                !value.contains("request_tombstones") ||
+                !value.contains("claim_fences") || !value.contains("retired_sessions"))
+                return BackendError{"wal_state_invalid"};
+        } else if (!value.contains("replies") || !value.contains("claims") ||
+                   !value.contains("generations") || !value.contains("sessions")) {
             return BackendError{"wal_state_invalid"};
-        const auto &replyValue = value.at("replies");
-        const auto &claimValue = value.at("claims");
-        const auto &generationValue = value.at("generations");
-        const auto &sessionValue = value.at("sessions");
+        }
+        const auto &replyValue = value.at(schemaV2 ? "active_replies" : "replies");
+        const auto &claimValue = value.at(schemaV2 ? "active_claims" : "claims");
+        const auto &generationValue =
+            value.at(schemaV2 ? "active_generations" : "generations");
+        const auto &sessionValue = value.at(schemaV2 ? "active_sessions" : "sessions");
         if (!replyValue.is_object() || !claimValue.is_object() ||
             !generationValue.is_object() || !sessionValue.is_object())
             return BackendError{"wal_state_invalid"};
         const Json *rawRegistrationValue = nullptr;
-        if (value.contains("raw_registrations")) {
-            rawRegistrationValue = &value.at("raw_registrations");
+        const auto rawRegistrationName = schemaV2
+            ? "active_raw_registrations" : "raw_registrations";
+        if (value.contains(rawRegistrationName)) {
+            rawRegistrationValue = &value.at(rawRegistrationName);
             if (!rawRegistrationValue->is_object()) return BackendError{"wal_state_invalid"};
         }
         if (replyValue.size() > kMaxReplies || claimValue.size() > kMaxClaims ||
@@ -922,6 +1307,109 @@ std::variant<std::monostate, BackendError> SessionState::applySerialized(
                 !boundedString(claim, kMaxIdentityBytes, true))
                 return BackendError{"wal_state_invalid"};
             claims.emplace(key, claim);
+        }
+        std::unordered_map<std::string, RequestTombstone> requestTombstones;
+        std::unordered_map<std::string, ClaimFence> claimFences;
+        std::unordered_map<std::string, RetiredSessionRecord> retiredSessions;
+        if (schemaV2) {
+            const auto &tombstoneValue = value.at("request_tombstones");
+            const auto &fenceValue = value.at("claim_fences");
+            const auto &retiredValue = value.at("retired_sessions");
+            if (!tombstoneValue.is_object() || !fenceValue.is_object() ||
+                !retiredValue.is_object() ||
+                tombstoneValue.size() > kMaxRequestTombstones ||
+                fenceValue.size() > kMaxClaimFences ||
+                retiredValue.size() > kMaxRetiredSessions)
+                return BackendError{"state_capacity"};
+            for (const auto &[key, item] : tombstoneValue.items()) {
+                RequestTombstone tombstone{
+                    .request_digest = item.at("request_digest").get<std::string>(),
+                    .subject_id = item.at("subject_id").get<std::string>(),
+                    .build_id = item.at("build_id").get<std::string>(),
+                    .software_id = item.at("software_id").get<std::string>(),
+                    .artifact_hash = item.at("artifact_hash").get<std::string>(),
+                    .region_id = item.at("region_id").get<std::string>(),
+                    .request_type = item.at("request_type").get<std::string>(),
+                    .session_id = item.at("session_id").get<std::string>(),
+                    .counter_epoch = item.at("counter_epoch").get<std::string>(),
+                    .generation = item.at("generation").get<std::uint64_t>(),
+                    .window_id = item.at("window_id").get<std::uint64_t>(),
+                    .counter = item.at("counter").get<std::uint64_t>(),
+                    .closed = item.at("closed").get<bool>(),
+                    .legacy_window_identity =
+                        item.at("legacy_window_identity").get<bool>(),
+                    .raw_registration = item.at("raw_registration").get<bool>()};
+                const auto prefix = tombstone.software_id + ":" + tombstone.build_id +
+                    ":" + tombstone.artifact_hash + ":";
+                if (!boundedString(key, kMaxIdentityBytes) ||
+                    !key.starts_with(prefix) || key.size() <= prefix.size() ||
+                    !canonicalHex(tombstone.request_digest, 64) ||
+                    !boundedString(tombstone.subject_id, kMaxIdentityBytes) ||
+                    !boundedString(tombstone.build_id, kMaxIdentityBytes) ||
+                    !boundedString(tombstone.software_id, kMaxIdentityBytes) ||
+                    !boundedString(tombstone.artifact_hash, kMaxIdentityBytes) ||
+                    !boundedString(tombstone.region_id, kMaxIdentityBytes, true) ||
+                    !boundedString(tombstone.request_type, kMaxIdentityBytes) ||
+                    !boundedString(tombstone.session_id, kMaxIdentityBytes, true) ||
+                    !boundedString(tombstone.counter_epoch, kMaxIdentityBytes, true) ||
+                    (tombstone.raw_registration &&
+                     (tombstone.request_type != "session.open" || tombstone.counter == 0 ||
+                      tombstone.generation != 0 || tombstone.window_id != 0 ||
+                      tombstone.closed || tombstone.legacy_window_identity)) ||
+                    replies.contains(key) || !requestTombstones.emplace(
+                        key, std::move(tombstone)).second)
+                    return BackendError{"wal_state_invalid"};
+            }
+            for (const auto &[key, item] : fenceValue.items()) {
+                ClaimFence fence{.build_id = item.at("build_id").get<std::string>(),
+                    .kind = item.at("kind").get<std::string>(),
+                    .value = item.at("value").get<std::string>()};
+                const auto expected = fence.kind + ":" + fence.build_id + ":" + fence.value;
+                if (!boundedString(key, 4 * kMaxIdentityBytes) || key != expected ||
+                    !boundedString(fence.build_id, kMaxIdentityBytes) ||
+                    (fence.kind != "client_nonce" && fence.kind != "client_key" &&
+                     fence.kind != "server_nonce" && fence.kind != "server_key") ||
+                    !boundedString(fence.value, kMaxIdentityBytes) || claims.contains(key) ||
+                    !claimFences.emplace(key, std::move(fence)).second)
+                    return BackendError{"wal_state_invalid"};
+            }
+            for (const auto &[key, item] : retiredValue.items()) {
+                RetiredSessionRecord retired{
+                    .build_id = item.at("build_id").get<std::string>(),
+                    .subject_id = item.at("subject_id").get<std::string>(),
+                    .software_id = item.at("software_id").get<std::string>(),
+                    .artifact_hash = item.at("artifact_hash").get<std::string>(),
+                    .counter_epoch = item.at("counter_epoch").get<std::string>(),
+                    .transport_kind = item.at("transport_kind").get<std::string>(),
+                    .valid_until_ms = item.at("valid_until_ms").get<std::uint64_t>(),
+                    .closed = item.at("closed").get<bool>(),
+                    .raw_chain_started = item.at("raw_chain_started").get<bool>()};
+                const auto &floors = item.at("region_floors");
+                if (!floors.is_object() || floors.size() > kMaxGenerations)
+                    return BackendError{"state_capacity"};
+                for (const auto &[region, floorValue] : floors.items()) {
+                    RetiredRegionFloor floor{
+                        .generation = floorValue.at("generation").get<std::uint64_t>(),
+                        .window_id = floorValue.at("window_id").get<std::uint64_t>()};
+                    if (!boundedString(region, kMaxIdentityBytes) || floor.generation == 0 ||
+                        floor.window_id == UINT64_MAX ||
+                        !retired.region_floors.emplace(region, floor).second)
+                        return BackendError{"wal_state_invalid"};
+                }
+                if (!boundedString(key, kMaxIdentityBytes) ||
+                    !boundedString(retired.build_id, kMaxIdentityBytes) ||
+                    !boundedString(retired.subject_id, kMaxIdentityBytes) ||
+                    !boundedString(retired.software_id, kMaxIdentityBytes) ||
+                    !boundedString(retired.artifact_hash, kMaxIdentityBytes) ||
+                    !boundedString(retired.counter_epoch, kMaxIdentityBytes, true) ||
+                    (!retired.transport_kind.empty() &&
+                     retired.transport_kind != kRawTransportKind) ||
+                    (!retired.closed && retired.valid_until_ms == 0) ||
+                    (retired.transport_kind != kRawTransportKind &&
+                     retired.raw_chain_started) ||
+                    !retiredSessions.emplace(key, std::move(retired)).second)
+                    return BackendError{"wal_state_invalid"};
+            }
         }
         for (auto &[key, reply] : replies) {
             const auto claim = claims.find("request:" + key);
@@ -1018,9 +1506,14 @@ std::variant<std::monostate, BackendError> SessionState::applySerialized(
                 !sessions.emplace(key, std::move(session)).second)
                 return BackendError{"wal_state_invalid"};
         }
+        for (const auto &[key, retired] : retiredSessions) {
+            (void)retired;
+            if (sessions.contains(key)) return BackendError{"wal_state_invalid"};
+        }
         std::unordered_map<std::string, WindowRecord> windows;
-        if (value.contains("windows")) {
-            const auto &windowValue = value.at("windows");
+        const auto windowName = schemaV2 ? "active_windows" : "windows";
+        if (value.contains(windowName)) {
+            const auto &windowValue = value.at(windowName);
             if (!windowValue.is_object() || windowValue.size() > kMaxSessions)
                 return BackendError{"state_capacity"};
             for (const auto &[key, item] : windowValue.items()) {
@@ -1029,6 +1522,17 @@ std::variant<std::monostate, BackendError> SessionState::applySerialized(
                 window.generation = item.at("generation").get<std::uint64_t>();
                 window.window_id = item.at("window_id").get<std::uint64_t>();
                 window.state = item.at("state").get<std::string>();
+                if (item.contains("selector_binding")) {
+                    window.selector_binding =
+                        item.at("selector_binding").get<bool>();
+                    if (!window.selector_binding ||
+                        !item.contains("next_selector_commitment"))
+                        return BackendError{"wal_state_invalid"};
+                    window.next_selector_commitment =
+                        item.at("next_selector_commitment").get<std::string>();
+                } else if (item.contains("next_selector_commitment")) {
+                    return BackendError{"wal_state_invalid"};
+                }
                 bool legacyEncoding = false;
                 if (item.contains("epoch_at_ms") && item.contains("deadline_ms")) {
                     window.epoch_at_ms = item.at("epoch_at_ms").get<std::uint64_t>();
@@ -1048,6 +1552,10 @@ std::variant<std::monostate, BackendError> SessionState::applySerialized(
                     !boundedString(window.region_id, kMaxIdentityBytes) ||
                     window.generation == 0 || window.window_id == 0 ||
                     !boundedString(window.state, kMaxChainStateBytes) ||
+                    (window.selector_binding &&
+                     !window.next_selector_commitment.empty() &&
+                     !canonicalHex(window.next_selector_commitment, 64)) ||
+                    (window.selector_binding && !raw) ||
                     ((!raw || window.legacy_timing) &&
                      window.deadline_ms > session->second.valid_until_ms) ||
                     window.deadline_ms <= window.epoch_at_ms ||
@@ -1088,6 +1596,13 @@ std::variant<std::monostate, BackendError> SessionState::applySerialized(
             constexpr std::string_view requestPrefix = "request:";
             if (key.starts_with(requestPrefix) &&
                 !replies.contains(key.substr(requestPrefix.size())))
+                return BackendError{"wal_state_invalid"};
+        }
+        for (const auto &[key, tombstone] : requestTombstones) {
+            (void)key;
+            if (!tombstone.session_id.empty() &&
+                !sessions.contains(tombstone.session_id) &&
+                !retiredSessions.contains(tombstone.session_id))
                 return BackendError{"wal_state_invalid"};
         }
         for (const auto &[key, generation] : generations) {
@@ -1162,6 +1677,27 @@ std::variant<std::monostate, BackendError> SessionState::applySerialized(
                 !registeredRawSessions.contains(sessionId))
                 return BackendError{"wal_state_invalid"};
         }
+        for (const auto &[key, tombstone] : requestTombstones) {
+            maximumCounter = std::max(maximumCounter, tombstone.counter);
+            if (!tombstone.session_id.empty() && tombstone.request_type == "material.issue" &&
+                tombstone.generation > 0) {
+                const auto retired = retiredSessions.find(tombstone.session_id);
+                if (retired != retiredSessions.end()) {
+                    bool floorValid = false;
+                    for (const auto &[region, floor] : retired->second.region_floors) {
+                        if (region == tombstone.region_id &&
+                            (floor.generation > tombstone.generation ||
+                             (floor.generation == tombstone.generation &&
+                              floor.window_id >= tombstone.window_id))) {
+                            floorValid = true;
+                            break;
+                        }
+                    }
+                    if (!floorValid) return BackendError{"wal_state_invalid"};
+                }
+            }
+            (void)key;
+        }
         const auto nextCounter = value.at("next_counter").get<std::uint64_t>();
         if (nextCounter == 0 ||
             (nextCounter != UINT64_MAX && nextCounter <= maximumCounter) ||
@@ -1170,6 +1706,9 @@ std::variant<std::monostate, BackendError> SessionState::applySerialized(
         SessionState parsed;
         parsed.replies_ = std::move(replies);
         parsed.claims_ = std::move(claims);
+        parsed.request_tombstones_ = std::move(requestTombstones);
+        parsed.claim_fences_ = std::move(claimFences);
+        parsed.retired_sessions_ = std::move(retiredSessions);
         parsed.raw_registrations_ = std::move(rawRegistrations);
         parsed.generations_ = std::move(generations);
         parsed.sessions_ = std::move(sessions);
@@ -1179,6 +1718,9 @@ std::variant<std::monostate, BackendError> SessionState::applySerialized(
 
         replies_.swap(parsed.replies_);
         claims_.swap(parsed.claims_);
+        request_tombstones_.swap(parsed.request_tombstones_);
+        claim_fences_.swap(parsed.claim_fences_);
+        retired_sessions_.swap(parsed.retired_sessions_);
         raw_registrations_.swap(parsed.raw_registrations_);
         generations_.swap(parsed.generations_);
         sessions_.swap(parsed.sessions_);
@@ -1214,6 +1756,9 @@ std::variant<std::monostate, BackendError> SessionState::restore(
 
     replies_.swap(parsed.replies_);
     claims_.swap(parsed.claims_);
+    request_tombstones_.swap(parsed.request_tombstones_);
+    claim_fences_.swap(parsed.claim_fences_);
+    retired_sessions_.swap(parsed.retired_sessions_);
     raw_registrations_.swap(parsed.raw_registrations_);
     generations_.swap(parsed.generations_);
     sessions_.swap(parsed.sessions_);

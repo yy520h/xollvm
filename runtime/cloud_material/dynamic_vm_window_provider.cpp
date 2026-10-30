@@ -14,7 +14,7 @@ namespace {
 constexpr size_t kGcmNonceSize = 12;
 constexpr size_t kGcmTagSize = 16;
 constexpr std::string_view kWindowGrantAadDomain =
-    "xovm/dynamic-vm/window-grant/aad/v1";
+    "xovm/dynamic-vm/window-grant/aad/v3";
 
 bool isZero(std::span<const uint8_t> bytes) {
     return std::all_of(bytes.begin(), bytes.end(),
@@ -43,8 +43,10 @@ void putBytes(std::vector<uint8_t> &out, std::span<const uint8_t> bytes) {
 }
 
 bool validGrantMetadata(const WindowGrant &grant) {
-    return grant.format_version == kDynamicVmFormatVersion &&
+    return grant.format_version == kDynamicVmSelectiveFormatVersionV3 &&
            !isZero(grant.build_id) && !isZero(grant.region_id) &&
+           !isZero(grant.artifact_hash) &&
+           validateDynamicVmWindowSelectorV3(grant.selector) &&
            !isZero(grant.session_id) && grant.generation != 0 &&
            grant.window_id != 0 && !isZero(grant.previous_state_hash) &&
            !isZero(grant.next_state_hash) &&
@@ -57,14 +59,18 @@ bool validGrantMetadata(const WindowGrant &grant) {
 std::vector<uint8_t> windowGrantAad(const WindowGrant &grant) {
     if (!validGrantMetadata(grant)) return {};
 
+    const auto selector = encodeDynamicVmWindowSelectorV3(grant.selector);
+    if (selector.size() != kDynamicVmWindowSelectorV3EncodedSize) return {};
     std::vector<uint8_t> aad;
-    aad.reserve(kWindowGrantAadDomain.size() + 2 + 32 + 32 + 16 + 8 + 8 +
-                32 + 32 + 8 + 8 + 4 + 4);
+    aad.reserve(kWindowGrantAadDomain.size() + 2 + 32 + 32 + 32 +
+                selector.size() + 16 + 8 + 8 + 32 + 32 + 8 + 8 + 4 + 4);
     aad.insert(aad.end(), kWindowGrantAadDomain.begin(),
                kWindowGrantAadDomain.end());
     put16(aad, grant.format_version);
     putBytes(aad, grant.build_id);
     putBytes(aad, grant.region_id);
+    putBytes(aad, grant.artifact_hash);
+    putBytes(aad, selector);
     putBytes(aad, grant.session_id);
     put64(aad, grant.generation);
     put64(aad, grant.window_id);
@@ -79,9 +85,20 @@ std::vector<uint8_t> windowGrantAad(const WindowGrant &grant) {
 
 } // namespace
 
+void secureClear(WindowMaterialProvisionV3 &provision) {
+    provision.artifact_hash.fill(0);
+    provision.selector = {};
+    secureClear(provision.material);
+    provision.entry_selector = {};
+    if (provision.next_selector) *provision.next_selector = {};
+    provision.next_selector.reset();
+}
+
 std::optional<WindowGrant> issueWindowGrant(const WindowIssueInput &input) {
     if (input.generation == 0 || input.window_id == 0 ||
         isZero(input.build_id) || isZero(input.region_id) ||
+        isZero(input.artifact_hash) ||
+        !validateDynamicVmWindowSelectorV3(input.selector) ||
         isZero(input.session_id) || isZero(input.previous_state_hash) ||
         isZero(input.next_state_hash) || input.expires_at_ms <= input.now_ms ||
         input.material.size() != kWindowMaterialSize ||
@@ -91,6 +108,8 @@ std::optional<WindowGrant> issueWindowGrant(const WindowIssueInput &input) {
     WindowGrant grant;
     grant.build_id = input.build_id;
     grant.region_id = input.region_id;
+    grant.artifact_hash = input.artifact_hash;
+    grant.selector = input.selector;
     grant.session_id = input.session_id;
     grant.generation = input.generation;
     grant.window_id = input.window_id;

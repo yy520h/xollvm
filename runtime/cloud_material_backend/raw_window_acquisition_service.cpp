@@ -19,9 +19,9 @@ using xovm::material::DynamicHash;
 using xovm::material::WindowAcquireRequest;
 
 constexpr std::string_view kRequestDigestDomain =
-    "xovm/raw-window-acquire/request/v1";
+    "xovm/raw-window-acquire/request/v3";
 constexpr std::string_view kNextStateDomain =
-    "xovm/raw-window-acquire/next-state/v1";
+    "xovm/raw-window-acquire/next-state/v3";
 
 class SensitiveIssueInput final {
 public:
@@ -39,16 +39,16 @@ public:
     xovm::material::WindowIssueInput value;
 };
 
-class SensitiveMaterial final {
+class SensitiveProvision final {
 public:
-    explicit SensitiveMaterial(xovm::material::WindowMaterial &materialValue)
-        : value(materialValue) {}
-    ~SensitiveMaterial() { xovm::material::secureClear(value); }
+    explicit SensitiveProvision(xovm::material::WindowMaterialProvisionV3 provision)
+        : value(std::move(provision)) {}
+    ~SensitiveProvision() { xovm::material::secureClear(value); }
 
-    SensitiveMaterial(const SensitiveMaterial &) = delete;
-    SensitiveMaterial &operator=(const SensitiveMaterial &) = delete;
+    SensitiveProvision(const SensitiveProvision &) = delete;
+    SensitiveProvision &operator=(const SensitiveProvision &) = delete;
 
-    xovm::material::WindowMaterial &value;
+    xovm::material::WindowMaterialProvisionV3 value;
 };
 
 std::string hex(std::span<const std::uint8_t> bytes) {
@@ -136,6 +136,42 @@ bool allZero(std::span<const std::uint8_t> bytes) {
                        [](const auto byte) { return byte == 0; });
 }
 
+bool sameSelectorGraph(
+    const xovm::material::DynamicVmWindowSelectorV3 &left,
+    const xovm::material::DynamicVmWindowSelectorV3 &right) {
+    return left.format_version == right.format_version &&
+           left.execution_schema_version == right.execution_schema_version &&
+           left.profile == right.profile && left.abi_id == right.abi_id &&
+           left.abi_hash == right.abi_hash &&
+           left.graph_commitment == right.graph_commitment;
+}
+
+bool validProvisionChain(
+    const xovm::material::WindowMaterialProvisionV3 &provision) {
+    if (!sameSelectorGraph(provision.selector, provision.entry_selector))
+        return false;
+    if (provision.selector.status ==
+        xovm::material::ContinuationNodeStatusV2::Return)
+        return !provision.next_selector.has_value();
+    if (!provision.next_selector ||
+        !xovm::material::validateDynamicVmWindowSelectorV3(
+            *provision.next_selector) ||
+        !sameSelectorGraph(provision.selector, *provision.next_selector))
+        return false;
+    return provision.selector.next_node_id ==
+           provision.next_selector->node_id;
+}
+
+std::variant<std::string, BackendError> selectorCommitment(
+    const xovm::material::DynamicVmWindowSelectorV3 &selector) {
+    const auto encoded = xovm::material::encodeDynamicVmWindowSelectorV3(selector);
+    if (encoded.size() != xovm::material::kDynamicVmWindowSelectorV3EncodedSize)
+        return BackendError{"authority_unavailable"};
+    auto digest = sha256("xovm/raw-window-acquire/selector/v3", encoded);
+    if (const auto *error = std::get_if<BackendError>(&digest)) return *error;
+    return hex(std::get<DynamicHash>(digest));
+}
+
 } // namespace
 
 std::variant<std::vector<std::uint8_t>, BackendError>
@@ -161,10 +197,14 @@ RawWindowAcquisitionService::acquire(
 
         const auto buildId = hex(request.build_id);
         const auto regionId = hex(request.region_id);
+        const auto artifactHash = hex(request.artifact_hash);
         const auto sessionId = hex(context.sessionId());
         const auto requestId = hex(request.request_id);
-        if (context.buildId() != buildId || context.softwareId().empty() ||
-            allZero(context.sessionId()))
+        if (request.format_version !=
+                xovm::material::kDynamicVmSelectiveFormatVersionV3 ||
+            !xovm::material::validateDynamicVmWindowSelectorV3(request.selector) ||
+            allZero(request.artifact_hash) || context.buildId() != buildId ||
+            context.softwareId().empty() || allZero(context.sessionId()))
             return BackendError{"unauthorized"};
         auto digestResult = sha256(kRequestDigestDomain, canonicalRequest);
         if (const auto *error = std::get_if<BackendError>(&digestResult)) return *error;
@@ -207,6 +247,8 @@ RawWindowAcquisitionService::acquire(
                 build->registration.verifier_sidecars.end())
             return BackendError{"build_unavailable"};
         facts.final_artifact_hash = build->final_artifact_hash;
+        if (artifactHash != facts.final_artifact_hash)
+            return BackendError{"build_unavailable"};
 
         auto reservationResult = providers_.anonymous_policy->reserve(
             *snapshot, facts, now, providers_.rate_budget);
@@ -240,12 +282,19 @@ RawWindowAcquisitionService::acquire(
         bool callbackFailed = false;
         auto stateResult = providers_.sessions->transact(
             facts, grant, transactNow, [&](SessionState::Transaction &transaction) {
+                const auto selectorResult = selectorCommitment(request.selector);
+                if (const auto *error = std::get_if<BackendError>(&selectorResult)) {
+                    callbackError = *error;
+                    callbackFailed = true;
+                    throw std::runtime_error("raw_window_callback_failed");
+                }
                 WindowPreflightInput preflight;
                 preflight.session_id = sessionId;
                 preflight.region_id = regionId;
                 preflight.generation = request.generation;
                 preflight.window_id = request.window_id;
                 preflight.previous_state = hex(request.previous_state_hash);
+                preflight.selector_commitment = std::get<std::string>(selectorResult);
                 preflight.expires_at_ms = expiresAt;
                 const auto grantExpiry =
                     transaction.preflightWindow(std::move(preflight));
@@ -261,8 +310,21 @@ RawWindowAcquisitionService::acquire(
                     callbackFailed = true;
                     throw std::runtime_error("raw_window_callback_failed");
                 }
-                SensitiveMaterial material(
-                    std::get<xovm::material::WindowMaterial>(materialResult));
+                SensitiveProvision provision(
+                    std::get<xovm::material::WindowMaterialProvisionV3>(
+                        std::move(materialResult)));
+                if (provision.value.artifact_hash != request.artifact_hash ||
+                    provision.value.selector != request.selector ||
+                    !xovm::material::validateDynamicVmWindowSelectorV3(
+                        provision.value.selector) ||
+                    !xovm::material::validateDynamicVmWindowSelectorV3(
+                        provision.value.entry_selector) ||
+                    allZero(provision.value.material.window) ||
+                    !validProvisionChain(provision.value)) {
+                    callbackError = BackendError{"authority_unavailable"};
+                    callbackFailed = true;
+                    throw std::runtime_error("raw_window_callback_failed");
+                }
 
                 auto commitNowResult = providers_.trusted_now();
                 if (const auto *error = std::get_if<BackendError>(&commitNowResult)) {
@@ -303,6 +365,8 @@ RawWindowAcquisitionService::acquire(
                 SensitiveIssueInput input;
                 input.value.build_id = request.build_id;
                 input.value.region_id = request.region_id;
+                input.value.artifact_hash = request.artifact_hash;
+                input.value.selector = request.selector;
                 input.value.session_id = context.sessionId();
                 input.value.session_secret = grantKey;
                 OPENSSL_cleanse(grantKey.data(), grantKey.size());
@@ -313,10 +377,12 @@ RawWindowAcquisitionService::acquire(
                 input.value.now_ms = commitNow;
                 input.value.expires_at_ms = grantExpiry;
                 input.value.key_version = context.keyVersion();
-                static_assert(sizeof(material.value) == xovm::material::kWindowMaterialSize);
+                static_assert(sizeof(provision.value.material) ==
+                              xovm::material::kWindowMaterialSize);
                 const auto materialBytes = std::span<const std::uint8_t>(
-                    reinterpret_cast<const std::uint8_t *>(&material.value),
-                    sizeof(material.value));
+                    reinterpret_cast<const std::uint8_t *>(
+                        &provision.value.material),
+                    sizeof(provision.value.material));
                 input.value.material.assign(materialBytes.begin(), materialBytes.end());
 
                 auto windowGrant = xovm::material::issueWindowGrant(input.value);
@@ -334,6 +400,19 @@ RawWindowAcquisitionService::acquire(
 
                 WindowFinalizeInput finalize;
                 finalize.next_state = hex(next);
+                finalize.selector_is_entry =
+                    provision.value.selector == provision.value.entry_selector;
+                if (provision.value.next_selector) {
+                    const auto successor =
+                        selectorCommitment(*provision.value.next_selector);
+                    if (const auto *error = std::get_if<BackendError>(&successor)) {
+                        callbackError = *error;
+                        callbackFailed = true;
+                        throw std::runtime_error("raw_window_callback_failed");
+                    }
+                    finalize.next_selector_commitment =
+                        std::get<std::string>(successor);
+                }
                 finalize.encoded_response.reserve(encoded.size());
                 for (const auto byte : encoded)
                     finalize.encoded_response.push_back(static_cast<std::byte>(byte));

@@ -5,7 +5,7 @@
 #include "build_snapshot.h"
 #include "raw_session.h"
 #include "session_state.h"
-#include "../cloud_material/dynamic_vm_schema.h"
+#include "../cloud_material/dynamic_vm_window_provider.h"
 
 #include <array>
 #include <cstdint>
@@ -22,7 +22,7 @@ public:
     using TrustedNow =
         std::function<std::variant<std::uint64_t, BackendError>()>;
     using MaterialBuilder = std::function<std::variant<
-        xovm::material::WindowMaterial, BackendError>(
+        xovm::material::WindowMaterialProvisionV3, BackendError>(
         const xovm::material::WindowAcquireRequest &)>;
 
     struct Providers {

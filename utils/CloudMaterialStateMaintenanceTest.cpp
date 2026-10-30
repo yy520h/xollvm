@@ -122,6 +122,10 @@ TEST(one_pass_reclaims_and_rotates_latest_state) {
     if (const auto *value = std::get_if<StateMaintenanceResult>(&result)) {
         EXPECT_TRUE(value->records_retired == 1);
         EXPECT_TRUE(value->response_bytes_reclaimed == 5);
+        EXPECT_TRUE(value->replies_compacted == 1);
+        EXPECT_TRUE(value->raw_registrations_compacted == 0);
+        EXPECT_TRUE(value->sessions_compacted == 1);
+        EXPECT_TRUE(value->claims_compacted == 4);
         EXPECT_TRUE(value->sequence == 2);
         EXPECT_FALSE(value->more_work);
     }
@@ -145,6 +149,79 @@ TEST(one_pass_reclaims_and_rotates_latest_state) {
             });
         const auto *error = std::get_if<BackendError>(&replay);
         EXPECT_TRUE(error && error->code == "request_retired");
+        EXPECT_FALSE(callbackCalled);
+    }
+    std::filesystem::remove_all(directory);
+}
+
+TEST(raw_registration_compacts_to_permanent_replay_evidence) {
+    const auto directory = stateDirectory("raw-registration");
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
+    const auto walPath = directory / "state.wal";
+
+    RequestFacts request;
+    request.request_id = std::string(32, '1');
+    request.request_digest = std::string(64, '2');
+    request.software_id = "test.software";
+    request.build_id = std::string(64, '3');
+    request.final_artifact_hash = std::string(64, '4');
+    request.type = "session.open";
+    RelayAuthenticator authenticator("maintenance-test-relay-secret-value", 100000);
+    const auto grant = std::get<AnonymousGrant>(authenticator.authenticate(
+        "maintenance-test-relay-secret-value", request, 1000));
+    const RawSessionRegistrationInput input{
+        std::string(64, '5'), std::string(64, '6')};
+    {
+        StateWal wal(walPath);
+        SessionState state(&wal);
+        const auto registered = state.registerRawSession(
+            request, grant, 1000, input,
+            [](std::uint64_t counter)
+                -> std::variant<RawSessionMetadata, BackendError> {
+                return RawSessionMetadata{std::string(32, '7'),
+                    std::string(64, '8'), std::string(64, '9'),
+                    std::string(64, 'a'), 1, 5000};
+            });
+        EXPECT_TRUE(std::holds_alternative<RawSessionRegistrationResult>(registered));
+    }
+
+    auto locked = ProcessLock::acquireExistingPrivate(directory);
+    EXPECT_TRUE(std::holds_alternative<ProcessLock>(locked));
+    auto lock = std::get<ProcessLock>(std::move(locked));
+    const auto result = runOfflineStateMaintenance(directory, [] {
+        return std::variant<std::uint64_t, BackendError>(std::uint64_t{5000});
+    }, lock);
+    EXPECT_TRUE(std::holds_alternative<StateMaintenanceResult>(result));
+    if (const auto *value = std::get_if<StateMaintenanceResult>(&result)) {
+        EXPECT_TRUE(value->records_retired == 0);
+        EXPECT_TRUE(value->response_bytes_reclaimed == 0);
+        EXPECT_TRUE(value->replies_compacted == 0);
+        EXPECT_TRUE(value->raw_registrations_compacted == 1);
+        EXPECT_TRUE(value->sessions_compacted == 1);
+        EXPECT_TRUE(value->claims_compacted == 4);
+        EXPECT_TRUE(value->sequence == 2);
+        EXPECT_FALSE(value->more_work);
+    }
+    EXPECT_FALSE(std::filesystem::exists(walPath));
+
+    Checkpoint checkpoint(directory / "checkpoint.bin", walPath);
+    const auto recovered = checkpoint.recover();
+    EXPECT_TRUE(std::holds_alternative<RecoveredState>(recovered));
+    if (const auto *latest = std::get_if<RecoveredState>(&recovered)) {
+        SessionState state;
+        EXPECT_TRUE(std::holds_alternative<std::monostate>(state.restore(*latest)));
+        bool callbackCalled = false;
+        const auto replay = state.registerRawSession(
+            request, grant, 1000, input,
+            [&](std::uint64_t)
+                -> std::variant<RawSessionMetadata, BackendError> {
+                callbackCalled = true;
+                return BackendError{"unexpected_callback"};
+            });
+        const auto *error = std::get_if<BackendError>(&replay);
+        EXPECT_TRUE(error && error->code == "replay_detected");
         EXPECT_FALSE(callbackCalled);
     }
     std::filesystem::remove_all(directory);
@@ -194,9 +271,11 @@ int main() {
         empty_state_does_not_create_checkpoint_or_wal);
     run("one_pass_reclaims_and_rotates_latest_state",
         one_pass_reclaims_and_rotates_latest_state);
+    run("raw_registration_compacts_to_permanent_replay_evidence",
+        raw_registration_compacts_to_permanent_replay_evidence);
     run("zero_reclamation_rotates_existing_wal_without_new_sequence",
         zero_reclamation_rotates_existing_wal_without_new_sequence);
-    std::fprintf(stdout, "3 tests, %u assertions, %u failures\n",
+    std::fprintf(stdout, "4 tests, %u assertions, %u failures\n",
                  testState.assertions, testState.failures);
     return testState.failures == 0 ? 0 : 1;
 }

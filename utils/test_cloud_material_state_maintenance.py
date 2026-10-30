@@ -52,6 +52,8 @@ def main() -> int:
         assert success.returncode == 0
         assert success.stdout == (
             "records_retired=0 response_bytes_reclaimed=0 "
+            "replies_compacted=0 raw_registrations_compacted=0 "
+            "sessions_compacted=0 claims_compacted=0 "
             "sequence=0 more_work=false\n"
         )
         assert success.stderr == ""

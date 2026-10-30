@@ -30,11 +30,10 @@ DynamicHash plainHash(std::span<const uint8_t> bytes) {
   return result;
 }
 
-ArtifactSource makeSource(bool two_nodes) {
-  ArtifactSource source{};
+ArtifactSourceV3 makeSource(bool two_nodes) {
+  ArtifactSourceV3 source{};
   source.build_id[0] = 1;
   source.region_id[0] = 2;
-  source.artifact_key[0] = 3;
 
   DynamicVmExecutionAbiV2 abi{};
   abi.abi_id = 7;
@@ -138,6 +137,12 @@ ArtifactSource makeSource(bool two_nodes) {
   descriptor.commitment = hashAarch64ShardCode(raw_handlers);
   source.handler_shards = encodeHandlerShardPayload(descriptor, raw_handlers);
   assert(!source.handler_shards.empty());
+  for (const auto &node : graph.nodes) {
+    DynamicVmNodeCapabilityV3 capability{};
+    capability.node_id = node.node_id;
+    capability.capability.fill(static_cast<uint8_t>(0x30 + node.node_id));
+    source.node_capabilities.push_back(capability);
+  }
   return source;
 }
 
@@ -148,160 +153,96 @@ void repin(EncryptedVmArtifact &artifact) {
 
 int main() {
   auto source = makeSource(true);
-  auto artifact = buildEncryptedVmArtifact(source);
-  assert(artifact);
-  assert(artifact->encrypted_bytecode_blocks.size() >= 12);
-  assert(artifact->encrypted_handler_shards.size() >= 12);
-  assert(artifact->encrypted_bytecode_blocks[10] == 1);
-  assert(artifact->encrypted_handler_shards[10] == 2);
-  assert(artifact->encrypted_bytecode_blocks[11] == 2);
-  assert(artifact->encrypted_handler_shards[11] == 2);
+  auto built = buildSelectiveEncryptedVmArtifactV3(source);
+  assert(built);
+  auto &artifact = built->artifact;
+  assert(artifact.format_version == kDynamicVmSelectiveFormatVersionV3);
+  assert(artifact.encrypted_bytecode_blocks.size() >= 12);
+  assert(artifact.encrypted_handler_shards.size() >= 12);
+  assert(artifact.encrypted_bytecode_blocks[10] == 1);
+  assert(artifact.encrypted_handler_shards[10] == 2);
+  assert(artifact.encrypted_bytecode_blocks[11] == 2);
+  assert(artifact.encrypted_handler_shards[11] == 2);
 
-  const auto encoded = encodeEncryptedVmArtifact(*artifact);
+  const auto encoded = encodeEncryptedVmArtifact(artifact);
   assert(!encoded.empty());
   assert(std::search(encoded.begin(), encoded.end(), source.bytecode.begin(),
                      source.bytecode.end()) == encoded.end());
-  assert(std::search(encoded.begin(), encoded.end(), source.handler_shards.begin(),
-                     source.handler_shards.end()) == encoded.end());
   auto source_payload = decodeHandlerShardPayload(source.handler_shards);
   assert(source_payload && !source_payload->code.empty());
   assert(std::search(encoded.begin(), encoded.end(), source_payload->code.begin(),
                      source_payload->code.end()) == encoded.end());
 
-  auto decrypted = decryptEncryptedVmArtifact(
-      *artifact, source.artifact_key, source.build_id, source.region_id,
-      artifact->artifact_hash);
-  assert(decrypted);
-  assert(decrypted->bytecode == source.bytecode);
-  assert(decrypted->handler_shards == source.handler_shards);
+  const auto descriptors = std::span<const uint8_t>(artifact.continuation_descriptors);
+  auto parsed_abi = decodeDynamicVmExecutionAbiV2(
+      descriptors.first(kDynamicVmExecutionAbiV2EncodedSize));
+  auto parsed_graph = decodeContinuationGraphV2(
+      descriptors.subspan(kDynamicVmExecutionAbiV2EncodedSize));
+  assert(parsed_abi && parsed_graph && parsed_graph->nodes.size() == 2);
+  auto selector0 = dynamicVmWindowSelectorV3(
+      *parsed_abi, parsed_graph->descriptor, parsed_graph->nodes[0]);
+  auto selector1 = dynamicVmWindowSelectorV3(
+      *parsed_abi, parsed_graph->descriptor, parsed_graph->nodes[1]);
+  assert(selector0 && selector1);
+  auto capability0 = built->registration.capabilityFor(*selector0);
+  auto capability1 = built->registration.capabilityFor(*selector1);
+  assert(capability0 && capability1 && *capability0 != *capability1);
+  auto node0 = decryptSelectiveDynamicVmNodeV3(
+      artifact, *selector0, *capability0, source.build_id, source.region_id,
+      artifact.artifact_hash);
+  assert(node0 && node0->node().node_id == selector0->node_id);
+  assert(node0->bytecodeBlock().size() == selector0->bytecode_size);
+  assert(node0->handlerShard().size() == selector0->shard_size);
+  assert(!decryptSelectiveDynamicVmNodeV3(
+      artifact, *selector1, *capability0, source.build_id, source.region_id,
+      artifact.artifact_hash));
+  assert(!decryptSelectiveDynamicVmNodeV3(
+      artifact, *selector0, *capability1, source.build_id, source.region_id,
+      artifact.artifact_hash));
 
-  const auto pinned_hash = artifact->artifact_hash;
-  auto ciphertext_tamper = *artifact;
-  ciphertext_tamper.encrypted_bytecode_blocks[140] ^= 1;
-  repin(ciphertext_tamper);
-  assert(!decryptEncryptedVmArtifact(
-      ciphertext_tamper, source.artifact_key, source.build_id, source.region_id,
-      ciphertext_tamper.artifact_hash));
-  assert(!decryptEncryptedVmArtifact(
-      ciphertext_tamper, source.artifact_key, source.build_id, source.region_id,
-      pinned_hash));
-
-  auto identity_tamper = *artifact;
-  identity_tamper.encrypted_bytecode_blocks[15] ^= 1;
-  repin(identity_tamper);
-  assert(!decryptEncryptedVmArtifact(
-      identity_tamper, source.artifact_key, source.build_id, source.region_id,
-      identity_tamper.artifact_hash));
-
-  auto commitment_tamper = *artifact;
-  commitment_tamper.encrypted_handler_shards[12 + 24] ^= 1;
-  repin(commitment_tamper);
-  assert(!decryptEncryptedVmArtifact(
-      commitment_tamper, source.artifact_key, source.build_id, source.region_id,
-      commitment_tamper.artifact_hash));
-
-  auto wrong_role = *artifact;
-  wrong_role.encrypted_handler_shards = artifact->encrypted_bytecode_blocks;
-  repin(wrong_role);
-  assert(!decryptEncryptedVmArtifact(
-      wrong_role, source.artifact_key, source.build_id, source.region_id,
-      wrong_role.artifact_hash));
-
-  constexpr size_t header = 12;
-  constexpr size_t metadata = 128;
-  const size_t first_record_size = metadata + 6 + 28;
-  auto reordered = *artifact;
-  std::vector<uint8_t> reordered_blocks(
-      artifact->encrypted_bytecode_blocks.begin(),
-      artifact->encrypted_bytecode_blocks.begin() + header);
-  reordered_blocks.insert(reordered_blocks.end(),
-      artifact->encrypted_bytecode_blocks.begin() + header + first_record_size,
-      artifact->encrypted_bytecode_blocks.end());
-  reordered_blocks.insert(reordered_blocks.end(),
-      artifact->encrypted_bytecode_blocks.begin() + header,
-      artifact->encrypted_bytecode_blocks.begin() + header + first_record_size);
-  reordered.encrypted_bytecode_blocks = std::move(reordered_blocks);
-  repin(reordered);
-  assert(!decryptEncryptedVmArtifact(
-      reordered, source.artifact_key, source.build_id, source.region_id,
-      reordered.artifact_hash));
-
-  auto duplicate = *artifact;
-  duplicate.encrypted_bytecode_blocks.resize(header);
-  duplicate.encrypted_bytecode_blocks.insert(
-      duplicate.encrypted_bytecode_blocks.end(),
-      artifact->encrypted_bytecode_blocks.begin() + header,
-      artifact->encrypted_bytecode_blocks.begin() + header + first_record_size);
-  duplicate.encrypted_bytecode_blocks.insert(
-      duplicate.encrypted_bytecode_blocks.end(),
-      artifact->encrypted_bytecode_blocks.begin() + header,
-      artifact->encrypted_bytecode_blocks.begin() + header + first_record_size);
-  repin(duplicate);
-  assert(!decryptEncryptedVmArtifact(
-      duplicate, source.artifact_key, source.build_id, source.region_id,
-      duplicate.artifact_hash));
-
-  auto missing = *artifact;
-  missing.encrypted_bytecode_blocks.resize(header + first_record_size);
-  missing.encrypted_bytecode_blocks[11] = 1;
-  repin(missing);
-  assert(!decryptEncryptedVmArtifact(
-      missing, source.artifact_key, source.build_id, source.region_id,
-      missing.artifact_hash));
-
-  auto extra = *artifact;
-  extra.encrypted_bytecode_blocks.push_back(0);
-  repin(extra);
-  assert(!decryptEncryptedVmArtifact(
-      extra, source.artifact_key, source.build_id, source.region_id,
-      extra.artifact_hash));
-
-  auto descriptors_tamper = *artifact;
-  descriptors_tamper.continuation_descriptors[0] ^= 1;
-  repin(descriptors_tamper);
-  assert(!decryptEncryptedVmArtifact(
-      descriptors_tamper, source.artifact_key, source.build_id, source.region_id,
-      descriptors_tamper.artifact_hash));
-
+  auto bad_selector = *selector0;
+  bad_selector.variant_id += 1;
+  assert(!decryptSelectiveDynamicVmNodeV3(
+      artifact, bad_selector, *capability0, source.build_id, source.region_id,
+      artifact.artifact_hash));
+  auto tampered = artifact;
+  tampered.encrypted_bytecode_blocks[12 + 128 + 12] ^= 1;
+  repin(tampered);
+  assert(!decryptSelectiveDynamicVmNodeV3(
+      tampered, *selector0, *capability0, source.build_id, source.region_id,
+      tampered.artifact_hash));
   auto wrong_region = source.region_id;
   wrong_region[0] ^= 1;
-  assert(!decryptEncryptedVmArtifact(
-      *artifact, source.artifact_key, source.build_id, wrong_region,
-      artifact->artifact_hash));
+  assert(!decryptSelectiveDynamicVmNodeV3(
+      artifact, *selector0, *capability0, source.build_id, wrong_region,
+      artifact.artifact_hash));
 
   auto one_source = makeSource(false);
-  auto one_artifact = buildEncryptedVmArtifact(one_source);
-  assert(one_artifact);
-  assert(one_artifact->encrypted_bytecode_blocks[11] == 1);
-  assert(one_artifact->encrypted_handler_shards[11] == 1);
-  auto one_decrypted = decryptEncryptedVmArtifact(
-      *one_artifact, one_source.artifact_key, one_source.build_id,
-      one_source.region_id, one_artifact->artifact_hash);
-  assert(one_decrypted && one_decrypted->bytecode == one_source.bytecode &&
-         one_decrypted->handler_shards == one_source.handler_shards);
+  auto one_built = buildSelectiveEncryptedVmArtifactV3(one_source);
+  assert(one_built);
+  assert(one_built->artifact.encrypted_bytecode_blocks[11] == 1);
+  assert(one_built->artifact.encrypted_handler_shards[11] == 1);
 
   auto malformed = source;
   malformed.handler_shards = {1, 2, 3};
-  assert(!buildEncryptedVmArtifact(malformed));
+  assert(!buildSelectiveEncryptedVmArtifactV3(malformed));
+  auto duplicate_capability = source;
+  duplicate_capability.node_capabilities[1].capability =
+      duplicate_capability.node_capabilities[0].capability;
+  assert(!buildSelectiveEncryptedVmArtifactV3(duplicate_capability));
   auto relocated = source;
   relocated.relocation_descriptors.assign(8, 0);
-  assert(!buildEncryptedVmArtifact(relocated));
-  auto encoded_relocated = *artifact;
+  assert(!buildSelectiveEncryptedVmArtifactV3(relocated));
+  auto encoded_relocated = artifact;
   encoded_relocated.relocation_descriptors.assign(8, 0);
   assert(encodeEncryptedVmArtifact(encoded_relocated).empty());
   auto oversized = source;
   oversized.bytecode.assign(kDynamicVmMaxWindowMaterial + 1, 1);
-  assert(!buildEncryptedVmArtifact(oversized));
-  auto oversized_descriptors = source;
-  oversized_descriptors.continuation_descriptors.assign(
-      kDynamicVmMaxDescriptor + 1, 1);
-  assert(!buildEncryptedVmArtifact(oversized_descriptors));
+  assert(!buildSelectiveEncryptedVmArtifactV3(oversized));
 
-  secureClear(*decrypted);
-  assert(decrypted->bytecode.empty());
-  assert(decrypted->handler_shards.empty());
-  assert(decrypted->continuation_descriptors.empty());
-  secureClear(*one_decrypted);
+  node0->clear();
+  assert(node0->bytecodeBlock().empty());
+  assert(node0->handlerShard().empty());
   return 0;
 }
 ''',

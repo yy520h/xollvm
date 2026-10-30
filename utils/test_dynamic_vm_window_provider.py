@@ -18,11 +18,50 @@ def test_window_provider_authenticates_all_grant_metadata(tmp_path):
 #include <utility>
 #include <vector>
 
+using namespace xovm::material;
+
+static DynamicVmWindowSelectorV3 canonicalSelector() {
+  DynamicVmExecutionAbiV2 abi{};
+  abi.abi_id = 0x01020304;
+  abi.i32_register_count = 1;
+  abi.loadi32_opcode = 0xa1;
+  abi.return_i32_opcode = 0xb2;
+  abi.decode_salt = 0x5a;
+
+  DynamicVmExecutionDescriptorV2 descriptor{};
+  descriptor.abi_id = abi.abi_id;
+  descriptor.abi_hash = *hashDynamicVmExecutionAbiV2(abi);
+  descriptor.bytecode_hash[0] = 1;
+  descriptor.bytecode_size = 2;
+  descriptor.handler_shards_size = 1;
+  descriptor.entry_node_id = 10;
+  descriptor.node_count = 1;
+  descriptor.graph_commitment[0] = 2;
+
+  ContinuationNodeV2 node{};
+  node.node_id = descriptor.entry_node_id;
+  node.shard_id = 20;
+  node.bytecode_size = descriptor.bytecode_size;
+  node.shard_size = descriptor.handler_shards_size;
+  node.register_index = 0;
+  node.semantic = ContinuationNodeSemanticV2::ReturnI32;
+  node.status = ContinuationNodeStatusV2::Return;
+  node.variant_id = 30;
+  node.bytecode_block_commitment[0] = 3;
+  node.handler_shard_commitment[0] = 4;
+  node.transition_tail_commitment = *hashDynamicVmTransitionTailV2(node);
+
+  auto selector = dynamicVmWindowSelectorV3(abi, descriptor, node);
+  assert(selector);
+  return *selector;
+}
+
 int main() {
-  using namespace xovm::material;
   WindowIssueInput input{};
   input.build_id[0] = 1;
   input.region_id[0] = 2;
+  input.artifact_hash[0] = 8;
+  input.selector = canonicalSelector();
   input.session_id[0] = 3;
   input.session_secret[0] = 4;
   input.generation = 8;
@@ -56,6 +95,8 @@ int main() {
   rejects_metadata_change([](WindowGrant &value) { ++value.format_version; });
   rejects_metadata_change([](WindowGrant &value) { value.build_id[0] ^= 1; });
   rejects_metadata_change([](WindowGrant &value) { value.region_id[0] ^= 1; });
+  rejects_metadata_change([](WindowGrant &value) { value.artifact_hash[0] ^= 1; });
+  rejects_metadata_change([](WindowGrant &value) { value.selector.node_id ^= 1; });
   rejects_metadata_change([](WindowGrant &value) { value.session_id[0] ^= 1; });
   rejects_metadata_change([](WindowGrant &value) { ++value.generation; });
   rejects_metadata_change([](WindowGrant &value) { ++value.window_id; });
@@ -102,6 +143,8 @@ int main() {
   };
   rejects_issue([](WindowIssueInput &value) { value.build_id = {}; });
   rejects_issue([](WindowIssueInput &value) { value.region_id = {}; });
+  rejects_issue([](WindowIssueInput &value) { value.artifact_hash = {}; });
+  rejects_issue([](WindowIssueInput &value) { value.selector = {}; });
   rejects_issue([](WindowIssueInput &value) { value.session_id = {}; });
   rejects_issue([](WindowIssueInput &value) { value.session_secret = {}; });
   rejects_issue([](WindowIssueInput &value) { value.generation = 0; });
