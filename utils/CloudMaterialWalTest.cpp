@@ -1445,6 +1445,40 @@ TEST(raw_session_registration_recovers_fresh_replay_fence_without_secrets) {
     std::filesystem::remove(path);
 }
 
+TEST(wal_quarantine_reconciliation_clears_valid_marker) {
+    const auto path = pathFor("quarantine-clear");
+    std::filesystem::remove(path);
+    StateWal wal(path);
+    const auto response = bytes("response-one");
+    EXPECT_TRUE(std::holds_alternative<std::uint64_t>(
+        wal.appendAndSync(1, delta("delta-one"), response)));
+    std::filesystem::remove(quarantineFor(path));
+    auto reconciled = wal.reconcileQuarantine();
+    EXPECT_TRUE(std::holds_alternative<QuarantineReconciliationResult>(reconciled));
+    if (std::holds_alternative<QuarantineReconciliationResult>(reconciled)) {
+        const auto &result = std::get<QuarantineReconciliationResult>(reconciled);
+        EXPECT_TRUE(result.quarantine_cleared);
+    }
+    std::filesystem::remove(path);
+}
+
+TEST(wal_quarantine_reconciliation_handles_no_marker) {
+    const auto path = pathFor("quarantine-none");
+    std::filesystem::remove(path);
+    StateWal wal(path);
+    const auto response = bytes("response-one");
+    EXPECT_TRUE(std::holds_alternative<std::uint64_t>(
+        wal.appendAndSync(1, delta("delta-one"), response)));
+    auto reconciled = wal.reconcileQuarantine();
+    EXPECT_TRUE(std::holds_alternative<QuarantineReconciliationResult>(reconciled));
+    if (std::holds_alternative<QuarantineReconciliationResult>(reconciled)) {
+        const auto &result = std::get<QuarantineReconciliationResult>(reconciled);
+        EXPECT_TRUE(result.quarantine_cleared);
+        EXPECT_FALSE(result.truncation_performed);
+    }
+    std::filesystem::remove(path);
+}
+
 template <typename Test>
 void run(const char *name, Test test) {
     const unsigned before = state.failures;
@@ -1518,7 +1552,11 @@ int main() {
         session_state_restore_rejects_invalid_sequence_metadata);
     run("raw_session_registration_recovers_fresh_replay_fence_without_secrets",
         raw_session_registration_recovers_fresh_replay_fence_without_secrets);
-    std::fprintf(stdout, "35 tests, %u assertions, %u failures\n",
+    run("wal_quarantine_reconciliation_clears_valid_marker",
+        wal_quarantine_reconciliation_clears_valid_marker);
+    run("wal_quarantine_reconciliation_handles_no_marker",
+        wal_quarantine_reconciliation_handles_no_marker);
+    std::fprintf(stdout, "37 tests, %u assertions, %u failures\n",
                  state.assertions, state.failures);
     return state.failures == 0 ? 0 : 1;
 }

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
@@ -96,6 +97,34 @@ int defaultSync(int fd) {
 
 BackendError ioError(const char *code) {
     return BackendError{code};
+}
+
+std::variant<QuarantineInfo, BackendError> readQuarantineMarker(
+    const std::filesystem::path &markerPath) {
+    QuarantineInfo result;
+    const int fd = ::open(markerPath.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return result;  // No quarantine marker
+        return ioError("wal_quarantine_read_failed");
+    }
+    std::array<char, 256> buffer{};
+    const auto count = ::read(fd, buffer.data(), buffer.size() - 1);
+    ::close(fd);
+    if (count <= 0) return ioError("wal_quarantine_read_failed");
+    buffer[count] = '\0';
+
+    unsigned long long sequence = 0, device = 0, inode = 0;
+    long long offset = 0;
+    const int parsed = std::sscanf(buffer.data(), "%llu %lld %llu %llu",
+                                   &sequence, &offset, &device, &inode);
+    if (parsed != 4 || sequence == 0) return ioError("wal_quarantine_invalid");
+
+    result.sequence = sequence;
+    result.offset = static_cast<off_t>(offset);
+    result.device = static_cast<dev_t>(device);
+    result.inode = static_cast<ino_t>(inode);
+    result.valid = true;
+    return result;
 }
 
 std::filesystem::path normalizedPath(const std::filesystem::path &path) {
@@ -353,6 +382,168 @@ WalRecoveryResult StateWal::recover() {
         return ioError("allocation_failed");
     } catch (...) {
         return ioError("wal_read_failed");
+    }
+}
+
+QuarantineReconciliationOutcome StateWal::reconcileQuarantine() {
+    try {
+        const auto path = normalizedPath(path_);
+        const auto markerPath = quarantinePath(path);
+
+        auto quarantineResult = readQuarantineMarker(markerPath);
+        if (const auto *error = std::get_if<BackendError>(&quarantineResult))
+            return *error;
+
+        const auto info = std::get<QuarantineInfo>(quarantineResult);
+        if (!info.valid) {
+            // No active quarantine marker
+            QuarantineReconciliationResult result;
+            result.quarantine_cleared = true;
+            return result;
+        }
+
+        // Check if WAL file still exists and matches the recorded identity
+        struct stat current{};
+        if (::stat(path.c_str(), &current) != 0 || current.st_dev != info.device ||
+            current.st_ino != info.inode) {
+            // WAL file has been replaced or deleted; clear stale marker
+            if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+                return ioError("wal_quarantine_cleanup_failed");
+            syncParentDirect(markerPath);
+            QuarantineReconciliationResult result;
+            result.abandoned_sequence = info.sequence;
+            result.quarantine_cleared = true;
+            return result;
+        }
+
+        // WAL file exists and matches identity; verify the transaction at info.offset
+        const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+        if (fd < 0) return ioError("wal_open_failed");
+
+        struct stat before{};
+        const bool fstat_ok = ::fstat(fd, &before) == 0 && before.st_size >= 0;
+        if (!fstat_ok) {
+            ::close(fd);
+            return ioError("wal_stat_failed");
+        }
+
+        const auto fileSize = static_cast<std::uint64_t>(before.st_size);
+        if (info.offset < 0 || static_cast<std::uint64_t>(info.offset) > fileSize) {
+            // Offset is out of bounds; truncate to the quarantined offset
+            const bool truncated = ::ftruncate(fd, info.offset) == 0 && hooks_.sync(fd) == 0;
+            ::close(fd);
+            if (!truncated) return ioError("wal_truncate_failed");
+            if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+                return ioError("wal_quarantine_cleanup_failed");
+            if (!syncParentDirect(markerPath)) return ioError("wal_directory_sync_failed");
+            QuarantineReconciliationResult result;
+            result.abandoned_sequence = info.sequence;
+            result.truncation_performed = true;
+            result.quarantine_cleared = true;
+            return result;
+        }
+
+        // Verify frame header at offset is valid
+        if (fileSize - static_cast<std::uint64_t>(info.offset) < kHeaderSize) {
+            // Incomplete frame; truncate
+            const bool truncated = ::ftruncate(fd, info.offset) == 0 && hooks_.sync(fd) == 0;
+            ::close(fd);
+            if (!truncated) return ioError("wal_truncate_failed");
+            if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+                return ioError("wal_quarantine_cleanup_failed");
+            if (!syncParentDirect(markerPath)) return ioError("wal_directory_sync_failed");
+            QuarantineReconciliationResult result;
+            result.abandoned_sequence = info.sequence;
+            result.truncation_performed = true;
+            result.quarantine_cleared = true;
+            return result;
+        }
+
+        // Read frame header to verify sequence number
+        std::vector<std::byte> header(kHeaderSize);
+        if (::lseek(fd, info.offset, SEEK_SET) < 0) {
+            ::close(fd);
+            return ioError("wal_seek_failed");
+        }
+        if (::read(fd, header.data(), kHeaderSize) != static_cast<ssize_t>(kHeaderSize)) {
+            ::close(fd);
+            return ioError("wal_read_failed");
+        }
+
+        std::size_t offset = 0;
+        if (!equal(std::span(header).subspan(offset, kMagic.size()), kMagic)) {
+            // Invalid magic; truncate
+            const bool truncated = ::ftruncate(fd, info.offset) == 0 && hooks_.sync(fd) == 0;
+            ::close(fd);
+            if (!truncated) return ioError("wal_truncate_failed");
+            if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+                return ioError("wal_quarantine_cleanup_failed");
+            if (!syncParentDirect(markerPath)) return ioError("wal_directory_sync_failed");
+            QuarantineReconciliationResult result;
+            result.abandoned_sequence = info.sequence;
+            result.truncation_performed = true;
+            result.quarantine_cleared = true;
+            return result;
+        }
+        offset += kMagic.size();
+
+        const auto version = get32(header, offset);
+        if (version != kVersion) {
+            ::close(fd);
+            return ioError("wal_unknown_version");
+        }
+
+        const auto frameSize = get64(header, offset);
+        const auto sequence = get64(header, offset);
+        if (frameSize < kMinimumFrame || frameSize > kMaxWalFrame || sequence == 0) {
+            // Invalid frame header; truncate
+            const bool truncated = ::ftruncate(fd, info.offset) == 0 && hooks_.sync(fd) == 0;
+            ::close(fd);
+            if (!truncated) return ioError("wal_truncate_failed");
+            if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+                return ioError("wal_quarantine_cleanup_failed");
+            if (!syncParentDirect(markerPath)) return ioError("wal_directory_sync_failed");
+            QuarantineReconciliationResult result;
+            result.abandoned_sequence = info.sequence;
+            result.truncation_performed = true;
+            result.quarantine_cleared = true;
+            return result;
+        }
+
+        // Frame is valid; check if it's complete
+        const auto frameEnd = static_cast<std::uint64_t>(info.offset) + frameSize;
+        if (frameEnd > fileSize) {
+            // Incomplete frame; truncate to start of incomplete frame
+            const bool truncated = ::ftruncate(fd, info.offset) == 0 && hooks_.sync(fd) == 0;
+            ::close(fd);
+            if (!truncated) return ioError("wal_truncate_failed");
+            if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+                return ioError("wal_quarantine_cleanup_failed");
+            if (!syncParentDirect(markerPath)) return ioError("wal_directory_sync_failed");
+            QuarantineReconciliationResult result;
+            result.abandoned_sequence = info.sequence;
+            result.truncation_performed = true;
+            result.quarantine_cleared = true;
+            return result;
+        }
+
+        ::close(fd);
+
+        // Frame is complete; clear the quarantine marker
+        if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+            return ioError("wal_quarantine_cleanup_failed");
+        if (!syncParentDirect(markerPath)) return ioError("wal_directory_sync_failed");
+
+        QuarantineReconciliationResult result;
+        result.abandoned_sequence = 0;  // Transaction completed successfully
+        result.quarantine_cleared = true;
+        return result;
+    } catch (const BackendError &error) {
+        return error;
+    } catch (const std::bad_alloc &) {
+        return ioError("allocation_failed");
+    } catch (...) {
+        return ioError("wal_reconcile_failed");
     }
 }
 

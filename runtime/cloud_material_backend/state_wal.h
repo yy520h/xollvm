@@ -38,8 +38,24 @@ struct RecoveredState {
     std::uint64_t last_sequence = 0;
 };
 
+struct QuarantineInfo {
+    std::uint64_t sequence = 0;
+    off_t offset = 0;
+    dev_t device = 0;
+    ino_t inode = 0;
+    bool valid = false;
+};
+
+struct QuarantineReconciliationResult {
+    std::uint64_t abandoned_sequence = 0;
+    bool truncation_performed = false;
+    bool quarantine_cleared = false;
+};
+
 using WalCommitResult = std::variant<std::uint64_t, BackendError>;
 using WalRecoveryResult = std::variant<RecoveredState, BackendError>;
+using QuarantineReconciliationOutcome =
+    std::variant<QuarantineReconciliationResult, BackendError>;
 
 class StateWal {
 public:
@@ -54,6 +70,7 @@ public:
     WalCommitResult appendAndSync(std::uint64_t sequence, const StateDelta &delta,
                                   std::span<const std::byte> exactResponse);
     WalRecoveryResult recover();
+    QuarantineReconciliationOutcome reconcileQuarantine();
 
 private:
     std::filesystem::path path_;
