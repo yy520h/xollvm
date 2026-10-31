@@ -68,6 +68,11 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_subdirectory(aes_stub)
 add_subdirectory(integrity_stub)
 
+# ---------------------------------------------------------------------------
+# CloudMaterial Runtime (动态 VM 保护运行时)
+# ---------------------------------------------------------------------------
+add_subdirectory(runtime/cloud_material)
+
 
 # ---------------------------------------------------------------------------
 # Sources
@@ -126,7 +131,10 @@ set(OBF_SOURCES
   VMPass_Nested.cpp
   VMPass_Wrapper.cpp
   VMPass_Decoys.cpp
+  VMPass_CloudMaterial.cpp
+  VMPass_CloudConfig.cpp
   AntiDebug.cpp
+  ECC_KeyManager.cpp
   EHUtils.cpp
   TargetCompat.cpp
   FunctionObfContextAnalysis.cpp
