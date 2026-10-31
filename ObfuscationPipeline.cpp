@@ -350,8 +350,20 @@ std::vector<std::string> ObfuscationPipeline::getPassOrder(
 	return topologicalSort(enabledPasses, rules);
 }
 
+void ObfuscationPipeline::validateMaterialConfig(const ObfuscationConfig& Config) {
+	auto PC = Config.getPassConfig("vm");
+	if (!PC || !PC->enabled) return;
+	auto VM = VMPassConfig::fromPassConfig(*PC);
+	if (VM.usesCloudMaterial())
+		for (const auto& Pass : Config.passes)
+			validateCloudMaterialBudgets(Pass);
+	if (Config.isPassEnabled("fmerge"))
+		VM.failCloudMaterial("fmerge not supported with cloudMaterial");
+}
+
 void ObfuscationPipeline::buildPipeline(FunctionPassManager& FPM,
 	const ObfuscationConfig& config) {
+	validateMaterialConfig(config);
 
 	auto enabledPasses = config.getEnabledPasses();
 
@@ -443,6 +455,7 @@ void ObfuscationPipeline::buildPipeline(FunctionPassManager& FPM,
 
 std::vector<ObfPassEntry> ObfuscationPipeline::getPassEntries(
 	const ObfuscationConfig& config) {
+	validateMaterialConfig(config);
 
 	auto enabledPasses = config.getEnabledPasses();
 	if (enabledPasses.empty())

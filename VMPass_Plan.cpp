@@ -1,5 +1,6 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Material.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscator/IRBudget.h"
 #include "llvm/Transforms/Obfuscator/ObfReport.h"
@@ -153,10 +154,12 @@ VMPreparedCandidate* VMPlanCoordinator::addPrepared(std::unique_ptr<VMImpl> Impl
 
 bool VMPlanCoordinator::commit() {
 	if (!Frozen) return false;
+	if (hasCloudMaterial()) verifyRequiredCandidates();
 	for (auto& Candidate : Candidates) {
 		if (!Candidate->Accepted || !Candidate->Impl) continue;
 		const VMEnginePlan* Plan = planFor(Candidate->Key);
 		if (!Plan) {
+			Candidate->Config.failCloudMaterial("no engine plan for candidate");
 			if (Candidate->Required && Candidate->SensitiveStrict)
 				report_fatal_error(Twine("obfuscator: sensitive region '") +
 					Candidate->Region + "': no engine plan for candidate '" +
@@ -189,6 +192,7 @@ bool VMPlanCoordinator::commit() {
 		if (!Candidate->Impl->commit()) {
 			Candidate->SkipReason = Candidate->Impl->FailReason.empty()
 				? "VM commit failed" : Candidate->Impl->FailReason;
+			Candidate->Config.failCloudMaterial(Candidate->SkipReason);
 			if ((Candidate->Required && Candidate->SensitiveStrict) || ObfNoSkips)
 				report_fatal_error(Twine("obfuscator: VM commit failed for '") +
 					Candidate->Fn->getName() + "': " + Candidate->SkipReason, false);
@@ -202,6 +206,7 @@ bool VMPlanCoordinator::commit() {
 		auto Budget = obf::IRBudget::fromConfig(obf::countInstructions(*Snapshot),
 			Cfg.budgetMultiplier, Cfg.budgetHardCap);
 		if (Budget.isEnabled() && Cap && obf::countInstructions(*Candidate->Fn) > Cap) {
+			Candidate->Config.failCloudMaterial("budget rollback: VM wrapper exceeds hard IR budget");
 			if ((Candidate->Required && Candidate->SensitiveStrict) || ObfNoSkips)
 				report_fatal_error("obfuscator: VM wrapper exceeds hard IR budget", false);
 			RestoreCaller();
@@ -223,6 +228,46 @@ bool VMPlanCoordinator::commit() {
 	return true;
 }
 
+Error VMPlanCoordinator::prepareMaterialExports() {
+	std::set<std::string> RegionNames;
+	std::set<std::string> RegionIds;
+	for (auto& Candidate : Candidates) {
+		Candidate->CanonicalRegion.reset();
+		if (!Candidate->Config.usesCloudMaterial()) continue;
+		if (!Candidate->Accepted || !Candidate->Impl || !Candidate->Impl->Prepared)
+			return createStringError(inconvertibleErrorCode(),
+				"material candidate was not prepared");
+		auto Region = exportCanonicalRegion(Candidate->Impl->E,
+			Candidate->Config, Candidate->Impl->OpMap);
+		if (!Region) return Region.takeError();
+		auto Name = Region->getString("region_name");
+		auto Id = Region->getString("region_id");
+		if (!Name || !Id || !RegionNames.insert(Name->str()).second ||
+			!RegionIds.insert(Id->str()).second)
+			return createStringError(inconvertibleErrorCode(),
+				"material region names and identities must be unique per module");
+		Candidate->CanonicalRegion.emplace(std::move(*Region));
+	}
+	return Error::success();
+}
+
+Expected<MaterialCommitResult> VMPlanCoordinator::promotePreparedMaterials(
+	StringRef ExportRoot, StringRef SoftwareId,
+	const MaterialCommitToken& Token) const {
+	SmallVector<json::Object, 8> Regions;
+	for (const auto& Candidate : Candidates) {
+		if (!Candidate->Config.usesCloudMaterial()) continue;
+		if (!Candidate->CanonicalRegion)
+			return createStringError(inconvertibleErrorCode(),
+				"material region was not prepared for promotion");
+		Regions.push_back(*Candidate->CanonicalRegion);
+	}
+	if (Regions.empty())
+		return createStringError(inconvertibleErrorCode(),
+			"no prepared material regions to promote");
+	return commitCanonicalRegions(ExportRoot, SoftwareId, Regions, Token);
+}
+
 void VMPlanCoordinator::finalizeReports(obf::ObfReportSink& Sink) const {
 	for (const auto& Candidate : Candidates) {
 		if (!Candidate->Impl) continue;
@@ -238,7 +283,8 @@ void VMPlanCoordinator::finalizeReports(obf::ObfReportSink& Sink) const {
 			W.ModuleSeed = Impl.MasterSeed; W.Maps = Impl.IsaEnc;
 			W.WrapperFamily = Impl.ActualWrapperFamily;
 			W.BindDisabledReason = Impl.BindDisabledReason;
-			W.Phase = Impl.Committed ? "committed" : "failed";
+			W.Phase = Impl.Committed ? "committed" :
+				(Impl.Prepared && Impl.Cfg.usesCloudMaterial() ? "preflight_only" : "failed");
 			if (Impl.Committed) {
 				auto* SS = VMEngine::getSharedState(Impl.M, Impl.EngineId);
 				W.HandlerVariants = SS->NumVariants; W.Decoys = SS->NumDecoys;
@@ -261,10 +307,11 @@ void VMPlanCoordinator::finalizeReports(obf::ObfReportSink& Sink) const {
 			R.Difficulty = obf::scoreDifficulty(Before, obf::computeDifficultyComponents(*Candidate->Fn));
 			for (auto& P : R.Passes) {
 				if (P.Id != "vm") continue;
-				P.Skipped = !Candidate->Accepted;
-				P.SkipReason = Candidate->SkipReason;
+				bool Staged = Impl.Cfg.usesCloudMaterial() && Impl.Prepared && !Impl.Committed;
+				P.Skipped = Staged || !Candidate->Accepted;
+				P.SkipReason = Staged ? "cloud_material_emission_not_implemented" : Candidate->SkipReason;
 				P.Changed = Candidate->Impl->Committed;
-				P.InstsAfter = Candidate->CommittedInsts;
+				P.InstsAfter = Staged ? obf::countInstructions(*Candidate->Fn) : Candidate->CommittedInsts;
 				P.BudgetUtilAfter = R.BudgetEnabled && R.BudgetLimit
 					? static_cast<double>(P.InstsAfter) / R.BudgetLimit : 0;
 			}
@@ -272,14 +319,19 @@ void VMPlanCoordinator::finalizeReports(obf::ObfReportSink& Sink) const {
 	}
 }
 
+bool VMPlanCoordinator::hasCloudMaterial() const {
+	return llvm::any_of(Candidates, [](const auto& C) { return C->Config.usesCloudMaterial(); });
+}
+
 bool VMPlanCoordinator::verifyRequiredCandidates() const {
 	bool AllOk = true;
 	for (const auto& Candidate : Candidates) {
-		if (!Candidate->Required) continue;
-		bool PreparedOk = Candidate->Accepted && Candidate->Impl != nullptr;
+		if (!Candidate->Required && !Candidate->Config.usesCloudMaterial()) continue;
+		bool PreparedOk = Candidate->Accepted && Candidate->Impl && Candidate->Impl->Prepared;
 		if (PreparedOk) continue;
 		std::string Reason = Candidate->SkipReason.empty()
 			? std::string("not prepared") : Candidate->SkipReason;
+		Candidate->Config.failCloudMaterial(Reason);
 		if (Candidate->SensitiveStrict) {
 			report_fatal_error(Twine("obfuscator: sensitive region '") +
 				Candidate->Region + "': function '" +

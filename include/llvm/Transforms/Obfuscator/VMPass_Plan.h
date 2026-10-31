@@ -3,7 +3,10 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
+#include "llvm/Transforms/Obfuscator/VMPass_Material.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Requirements.h"
 
 #include <memory>
@@ -25,6 +28,7 @@ struct VMPreparedCandidate {
 	VMRequirementSet Requirements;
 	std::unique_ptr<VMImpl> Impl;
 	std::string SkipReason;
+	std::optional<json::Object> CanonicalRegion;
 	bool Accepted = false;
 	unsigned CommittedInsts = 0;
 
@@ -55,6 +59,12 @@ public:
 	VMPreparedCandidate* addPrepared(std::unique_ptr<VMImpl> Impl,
 		const VMPassConfig& Config, const EngineConfigKey& Key);
 	bool commit();
+	// Task 3 只在内存中准备真实 emitter 导出；没有 Task 8 的显式提交
+	// token 时，当前失败编译绝不晋升私有文件。
+	Error prepareMaterialExports();
+	Expected<MaterialCommitResult> promotePreparedMaterials(StringRef ExportRoot,
+		StringRef SoftwareId, const MaterialCommitToken& Token) const;
+	bool hasCloudMaterial() const;
 	void finalizeReports(obf::ObfReportSink& Sink) const;
 	static VMPlanCoordinator* active();
 	static VMPlanCoordinator* setActive(VMPlanCoordinator* Coordinator);

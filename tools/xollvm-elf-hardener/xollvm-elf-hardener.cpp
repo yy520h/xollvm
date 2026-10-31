@@ -31,6 +31,11 @@
 using namespace llvm;
 using namespace llvm::object;
 
+namespace llvm {
+Expected<unsigned> finalizeMaterialManifest(StringRef InputPath,
+	StringRef ManifestPath, StringRef OutputPath);
+}
+
 namespace {
 
 	enum ExitCode { Ok = 0, Malformed = 2, PolicyViolation = 3 };
@@ -44,9 +49,11 @@ namespace {
 	constexpr unsigned kMaxRanges = 8;
 
 	cl::opt<std::string> Command(cl::Positional,
-		cl::desc("<audit|seal|verify|targets>"), cl::Required);
+		cl::desc("<audit|seal|verify|targets|materials>"), cl::Required);
 	cl::opt<std::string> Input("input", cl::desc("ELF input path"), cl::Required);
 	cl::opt<std::string> Output("output", cl::desc("sealed ELF output path"),
+		cl::init(""));
+	cl::opt<std::string> Manifest("manifest", cl::desc("canonical public manifest path"),
 		cl::init(""));
 	cl::opt<uint64_t> ZeroThreshold("zero-threshold",
 		cl::desc("minimum zero-run size to report (inclusive)"), cl::init(512));
@@ -116,10 +123,21 @@ namespace {
 int main(int argc, char** argv) {
 	cl::ParseCommandLineOptions(argc, argv, "xollvm ELF hardener\n");
 
-	if (Command != "audit" && Command != "seal" && Command != "verify" && Command != "targets") {
+	if (Command != "audit" && Command != "seal" && Command != "verify" &&
+		Command != "targets" && Command != "materials") {
 		errs() << "error: unknown command '" << Command
-			<< "' (expected audit|seal|verify|targets)\n";
+			<< "' (expected audit|seal|verify|targets|materials)\n";
 		return Malformed;
+	}
+	if (Command == "materials") {
+		if (Manifest.empty() || Output.empty()) {
+			errs() << "error: materials requires --manifest and --output\n";
+			return Malformed;
+		}
+		auto Count = finalizeMaterialManifest(Input, Manifest, Output);
+		if (!Count) { errs() << toString(Count.takeError()) << "\n"; return Malformed; }
+		errs() << "materials: " << *Count << " descriptor(s)\n";
+		return Ok;
 	}
 
 	auto BufOrErr = MemoryBuffer::getFile(Input);

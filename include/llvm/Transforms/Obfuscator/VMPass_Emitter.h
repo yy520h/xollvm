@@ -137,6 +137,14 @@ namespace llvm {
 		const VMInstructionLayout& getLayout() const { return Layout; }
 		void setRequirements(VMRequirementSet *R) { RequirementSink = R; }
 		const VMRequirementSet &getRequirements() const { return Requirements; }
+		ArrayRef<std::pair<uint32_t, VMOp>> getInstructionRecords() const {
+			return InstructionIPs;
+		}
+		uint8_t getDecodeSalt() const { return Salt; }
+		uint32_t getTargetSalt() const { return SaltFull; }
+		bool hasBlindedTargets() const { return BlindTargets; }
+		uint32_t getKeyedDispatchSalt() const { return KeyedSalt; }
+		bool hasKeyedDispatch() const { return KeyedDispatch; }
 
 		/// Compile F into bytecode.  Salt is the CTSalt byte used to XOR register
 		/// index bytes (0 when obfRegIdx is disabled).

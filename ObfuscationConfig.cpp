@@ -221,6 +221,16 @@ PassConfig AnnotationParser::parsePassConfig(const std::string& passSpec) {
 		// For strenc_stub: the inner content is sub-pass specs, not key=val pairs.
 		// Store the raw inner string for later re-parsing.
 		config.rawInner = spec.substr(start, end - start);
+		// 仅保存严格材料边界所需原文，旧预算解析及覆盖语义保持不变。
+		std::regex BudgetRe(R"((?:^|,)\s*(budget|budgetMax|budgetMultiplier)\s*=\s*([^,]*))");
+		for (auto I = std::sregex_iterator(config.rawInner.begin(), config.rawInner.end(), BudgetRe);
+			I != std::sregex_iterator(); ++I) {
+			std::string Raw = (*I)[2].str();
+			StringRef Value = StringRef(Raw).trim();
+			if (Value.size() >= 2 && Value.front() == '"' && Value.back() == '"')
+				Value = Value.drop_front().drop_back();
+			config.rawBudgetParams.emplace_back((*I)[1].str(), Value.str());
+		}
 	}
 
 	config.enabled = true;
@@ -340,6 +350,8 @@ ObfuscationConfig AnnotationParser::parseAnnotations(Function* F) {
 					for (const auto& kv : pc.params) {
 						existingPc.params[kv.first] = kv.second;
 					}
+					existingPc.rawBudgetParams.insert(existingPc.rawBudgetParams.end(),
+						pc.rawBudgetParams.begin(), pc.rawBudgetParams.end());
 					found = true;
 					break;
 				}

@@ -48,6 +48,9 @@ namespace llvm {
 	// Reporting / artifacts
 	extern llvm::cl::opt<std::string> ObfReportDir;
 	extern llvm::cl::opt<std::string> ObfReportJson;
+	extern llvm::cl::opt<std::string> ObfMaterialExportDir;
+	// 只做目录预检；任务 3 的写入/关闭/原子提交失败仍须 fatal。
+	void validateMaterialExportDirectory();
 	extern llvm::cl::opt<std::string> ObfGraphDir;
 	extern llvm::cl::opt<std::string> ObfGraphMode;
 

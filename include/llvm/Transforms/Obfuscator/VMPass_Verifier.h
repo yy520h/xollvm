@@ -22,12 +22,14 @@
 
 #include <cstdint>
 #include <string>
+#include "llvm/ADT/ArrayRef.h"
 
 namespace llvm {
 
 	struct BytecodeEmitter;
 	struct VMOpcodeMap;
 	struct VMRequirementSet;
+	class VMInstructionLayout;
 
 	/// Verify the bytecode in \p E after a successful BytecodeEmitter::run().
 	///
@@ -48,5 +50,13 @@ namespace llvm {
 		bool                  BlindTargets = false, // P3-B: branch targets are XOR-blinded
 		bool                  KeyedDispatch = false,
 		const VMRequirementSet *Allowed = nullptr);
+
+	bool verifyCanonicalBytecode(ArrayRef<uint8_t> Bytecode,
+		ArrayRef<uint32_t> InstructionOffsets, ArrayRef<uint8_t> LogicalOpcodes,
+		const VMInstructionLayout& Layout, const VMOpcodeMap& OpcodeMap,
+		ArrayRef<uint8_t> CallArities, ArrayRef<uint8_t> CallReturnKinds,
+		uint32_t TargetKey,
+		std::string& OutErr, uint32_t& OutBadIP,
+		uint64_t* OutTargetLookupOperations = nullptr);
 
 } // namespace llvm

@@ -15,7 +15,7 @@ class VMTools:
 
 
 def tools():
-    root = Path(__file__).resolve().parents[2]
+    root = Path(os.environ.get('XOLLVM_PROJECT_ROOT', Path(__file__).resolve().parents[2]))
     build = root / 'build-sensitive/bin'
     ndk = root.parent / 'android-ndk-r30-ollvm-r23-beta3/toolchains/llvm/prebuilt/linux-arm64'
     t = VMTools(Path(os.environ.get('XOLLVM_OPT', build / 'opt')),

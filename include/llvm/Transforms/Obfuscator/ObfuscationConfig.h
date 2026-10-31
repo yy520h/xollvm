@@ -1,4 +1,5 @@
 #pragma once
+#include "llvm/ADT/StringRef.h"
 
 #include <string>
 #include <string_view>
@@ -6,6 +7,7 @@
 #include <cstdint>
 #include <vector>
 #include <optional>
+#include <utility>
 
 namespace llvm {
 	class Function;
@@ -15,8 +17,11 @@ namespace llvm {
 		std::string passName;
 		std::unordered_map<std::string, std::string> params;
 		std::string rawInner;   // raw content between outermost parens, for nested specs
+		// 保留预算原文，避免宽松解析丢弃空值、尾随文本或被覆盖的非法值。
+		std::vector<std::pair<std::string, std::string>> rawBudgetParams;
 		bool enabled = false;
 	};
+	void validateCloudMaterialBudgets(const PassConfig& PC);
 
 	// Complete obfuscation configuration for a function
 	struct ObfuscationConfig {
@@ -341,6 +346,9 @@ namespace llvm {
 		void mergeCompatibility(const struct VMPassConfig& VM);
 	};
 
+	enum class CloudMaterialMode { Off, Session, Lease, Operation };
+	StringRef cloudMaterialModeName(CloudMaterialMode Mode);
+
 	struct VMPassConfig {
 		bool     enable = false;
 		unsigned minBlocks = 1;
@@ -351,7 +359,7 @@ namespace llvm {
 		unsigned handlerVariants = 3;  // K handler-body variants per opcode (P1 polymorphism on; 1 = off)
 		unsigned handlerDecoys   = 0;  // {0,1,2,3} decoy-handler density (0 = off; 1 static, 2 mixed live, 3 aggressive) — see docs/VM.md
 		bool     encBytecode = true;  // LCG-encrypt bytecode stream at load time
-		bool     constInStream = false;  // move int/i64/fp constants into the encrypted bytecode stream instead of plaintext wrapper stores (requires encBytecode)
+		bool     constInStream = false;  // 常量进入字节码；材料模式独立于旧 encBytecode 依赖
 		bool     strongBytecode = true;   // P3: per-position PRF Layer-1 keystream (on; 0 = weak salt^index)
 		bool     blindTargets = true;   // P3: XOR-blind bytecode branch targets (on)
 		bool     hardened = false;    // MBA + opaque predicates on handler blocks
@@ -390,6 +398,12 @@ namespace llvm {
 		// 非法值下索引被推离 handler 表，indirectbr 到非法地址自然崩溃。
 		// 本地无任何 if(valid)/if(expired) 判断。Off = byte-identical。
 		bool     cloudDispatch = false;
+		CloudMaterialMode cloudMaterial = CloudMaterialMode::Off;
+		std::string materialRegion;
+		bool usesCloudMaterial() const { return cloudMaterial != CloudMaterialMode::Off; }
+		// 所有材料失败均为编译错误，不依赖 sensitive 或 obf-no-skips。
+		void failCloudMaterial(StringRef Reason) const;
+		static void validateDeclaration(Function& F);
 
 		// superOps: fuse eligible i32 `mul`+`add` chains (mul result single-use,
 		// consumed directly by the add) into one OP_MULADD opcode instead of two

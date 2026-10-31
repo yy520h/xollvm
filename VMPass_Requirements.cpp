@@ -369,6 +369,8 @@ EngineConfigKey EngineConfigKey::fromConfig(const VMPassConfig &Cfg,
 unsigned EnginePool, unsigned EngineOwner, uint64_t MappingSeed,
 	const AntiDebugConfig* AntiDebug) {
 	EngineConfigKey Key;
+	Key.MaterialMode = Cfg.cloudMaterial;
+	Key.MaterialRegion = Cfg.materialRegion;
 #define VM_BOOL(Name) Key.Fields.emplace_back(#Name, Cfg.Name)
 	VM_BOOL(lazyDecrypt); VM_BOOL(obfRegIdx); VM_BOOL(encDispatch);
 	VM_BOOL(encBytecode); VM_BOOL(constInStream); VM_BOOL(strongBytecode);
@@ -421,7 +423,8 @@ unsigned EnginePool, unsigned EngineOwner, uint64_t MappingSeed,
 }
 
 bool EngineConfigKey::operator==(const EngineConfigKey &Other) const {
-	return BoolFields == Other.BoolFields && Fields == Other.Fields;
+	return BoolFields == Other.BoolFields && Fields == Other.Fields &&
+		MaterialMode == Other.MaterialMode && MaterialRegion == Other.MaterialRegion;
 }
 
 uint64_t EngineConfigKey::stableHash() const {
@@ -433,11 +436,19 @@ uint64_t EngineConfigKey::stableHash() const {
 		Byte(0);
 		for (unsigned I = 0; I < 8; ++I) Byte(static_cast<uint8_t>(Value >> (I * 8)));
 	}
+	// 保留普通模式的历史 hash；材料区域使用完整字符串比较，hash 不作身份。
+	if (MaterialMode != CloudMaterialMode::Off || !MaterialRegion.empty()) {
+		Byte(static_cast<uint8_t>(MaterialMode));
+		for (unsigned char C : MaterialRegion) Byte(C);
+		Byte(0);
+	}
 	return H;
 }
 
 json::Object EngineConfigKey::toJson() const {
 	json::Object O;
+	O["cloudMaterial"] = cloudMaterialModeName(MaterialMode);
+	O["materialRegion"] = MaterialRegion;
 	for (unsigned I = 0; I < Fields.size(); ++I) {
 		const auto &[Name, Value] = Fields[I];
 		if (I < BoolFields) O[Name] = Value != 0;
@@ -458,6 +469,9 @@ json::Object VMEngineWitness::toJson() const {
 	O["caller_requirements"] = CallerRequirements.toJson();
 	O["wrapper_family"] = WrapperFamily;
 	O["phase"] = Phase;
+	O["bytecodeSource"] = Effective.usesCloudMaterial() ? "cloud_material" : "legacy";
+	O["material_dependency_emitted"] = MaterialDependencyEmitted;
+	O["native_fallback_removed"] = NativeFallbackRemoved;
 	O["post_link"] = Effective.encodedTargets ? "pending" : "not_required";
 	O["nested_helpers"] = NestedHelperCount;
 	O["whitebox_instances"] = WhiteboxInstances;
@@ -469,6 +483,10 @@ json::Object VMEngineWitness::toJson() const {
 	if (Requested.constInStream && !Effective.constInStream) Disabled["constInStream"] = "requires_encBytecode";
 	if (Requested.metamorphicEngines && !Effective.metamorphicEngines) Disabled["metamorphicEngines"] = "requires_multiple_engines";
 	if (Requested.nestedVMHardened && !Effective.nestedVMHardened) Disabled["nestedVMHardened"] = "requires_nestedVM";
+	if (Effective.usesCloudMaterial()) {
+		for (StringRef K : {"encBytecode", "strongBytecode", "whiteboxAES", "lazyDecrypt",
+			"encDispatch", "keyedDispatch"}) Disabled[K] = "replaced_by_cloud_material";
+	}
 	O["disabled_reasons"] = std::move(Disabled);
 	O["version"] = 2;
 	O["engine_id"] = EngineId;
