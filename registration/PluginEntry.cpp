@@ -48,7 +48,7 @@ static llvm::cl::opt<bool> EnableObfuscationEP(
     "enable-obfuscation",
     llvm::cl::desc("Auto-run the obfuscation module pass in the compile "
                    "pipeline (annotation-gated; requires obf: annotations)"),
-    llvm::cl::init(false), llvm::cl::Hidden);
+    llvm::cl::init(true), llvm::cl::Hidden);
 
 // Canonical registration. Wires every name in ObfPasses.inc into the
 // PassBuilder via the new-PM callback surface. Shared by both build modes.
