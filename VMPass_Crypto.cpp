@@ -28,6 +28,10 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscator/AESStubBitcode.h"
+
+#include <fstream>
+#include <vector>
+#include <array>
 #include "llvm/Transforms/Obfuscator/VMWhiteBoxAES.h"
 
 #include <functional>
@@ -245,8 +249,300 @@ void VMImpl::buildBytecodeGlobal() {
 	}
 }
 
+//  buildCloudMaterialLoader - Task 4/8: Runtime window loader for cloud material mode
 
-//  buildCalleeGlobal 
+void VMImpl::buildCloudMaterialLoader() {
+	// In cloud material mode, bytecode is not embedded locally.
+	// Instead, we create a runtime loader that fetches windows on demand.
+
+	// Create a runtime buffer to hold fetched windows
+	// Window files are padded to the full window size (4096), and the SHA256
+	// commitment is computed over the padded data, so the runtime buffer must
+	// hold the padded size: numWindows * windowSize (not just E.BC.size()).
+	const uint32_t WindowSize = 4096;
+	size_t PaddedSize = ((E.BC.size() + WindowSize - 1) / WindowSize) * WindowSize;
+	auto* ATy = ArrayType::get(I8Ty, PaddedSize);
+
+	GVBytecodeRT = new GlobalVariable(
+		M, ATy,
+		/*isConst=*/false,
+		GlobalValue::PrivateLinkage,
+		Constant::getNullValue(ATy),
+		(F.getName() + ".vm.bytecode.rt").str());
+	GVBytecodeRT->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+
+	// Create a placeholder GVBytecode for compatibility with wrapper code
+	// In cloud mode, this will not contain actual bytecode data, just a marker
+	GVBytecode = new GlobalVariable(
+		M, ATy,
+		/*isConst=*/true,
+		GlobalValue::PrivateLinkage,
+		Constant::getNullValue(ATy),
+		(F.getName() + ".vm.bytecode.placeholder").str());
+	GVBytecode->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+
+	// Store material metadata for runtime use
+	// Material ID format: {region}__{mangled_function_name}
+	std::string materialID = (Cfg.materialRegion + "__" + F.getName()).str();
+
+	// Create a global string for the material ID
+	auto* MaterialIDConst = ConstantDataArray::getString(Ctx, materialID, true);
+	GlobalVariable* GVMaterialID = new GlobalVariable(
+		M, MaterialIDConst->getType(),
+		/*isConst=*/true,
+		GlobalValue::PrivateLinkage,
+		MaterialIDConst,
+		(F.getName() + ".vm.material.id").str());
+
+	// Store bytecode size for validation
+	auto* BytecodeSizeConst = ConstantInt::get(Type::getInt32Ty(Ctx), E.BC.size());
+	GlobalVariable* GVBytecodeSize = new GlobalVariable(
+		M, Type::getInt32Ty(Ctx),
+		/*isConst=*/true,
+		GlobalValue::PrivateLinkage,
+		BytecodeSizeConst,
+		(F.getName() + ".vm.bytecode.size").str());
+
+	outs() << "[VM] Cloud material loader built: " << materialID
+	       << " (" << E.BC.size() << " bytes)\n";
+}
+
+//  buildCloudMaterialCtor - Task 5/8: Constructor for cloud material window loading
+
+void VMImpl::buildCloudMaterialCtor() {
+	if (!GVBytecodeRT) return;
+	if (E.BC.empty()) return;
+
+	unsigned BCLen = (unsigned)E.BC.size();
+	std::string materialID = (Cfg.materialRegion + "__" + F.getName()).str();
+
+	// Task 7: Load SHA256 commitment from metadata if available
+	uint32_t windowSize = 4096;
+	uint32_t numWindows = (BCLen + windowSize - 1) / windowSize;
+
+	std::vector<std::array<uint8_t, 32>> commitments;
+
+	// Parse metadata.json to extract SHA256 commitments.
+	// The export directory comes from the CLI option -obf-material-export-dir
+	// (llvm::ObfMaterialExportDir); XOLLVM_CLOUD_EXPORT_DIR overrides it for
+	// test setups. No hardcoded default: without either, verification stays off.
+	const char* exportDirEnv = std::getenv("XOLLVM_CLOUD_EXPORT_DIR");
+	std::string metadataPath;
+	if (exportDirEnv && *exportDirEnv) {
+		metadataPath = std::string(exportDirEnv) + "/metadata.json";
+	} else if (!llvm::ObfMaterialExportDir.empty()) {
+		metadataPath = llvm::ObfMaterialExportDir.getValue() + "/metadata.json";
+	}
+
+	std::ifstream metaFile(metadataPath);
+	if (metaFile.is_open()) {
+		std::string line;
+		bool foundMaterial = false;
+		while (std::getline(metaFile, line)) {
+			// Simple string search for our material ID
+			if (line.find("\"" + materialID + "\"") != std::string::npos) {
+				foundMaterial = true;
+			}
+			// Look for commitment line within our material block
+			if (foundMaterial && line.find("\"commitment\"") != std::string::npos) {
+				// Extract hex string from: "commitment": "sha256:hexstring"
+				size_t hexStart = line.find("sha256:");
+				if (hexStart != std::string::npos) {
+					hexStart += 7; // Skip "sha256:"
+					std::string hexStr;
+					for (size_t i = hexStart; i < line.length() && hexStr.length() < 64; ++i) {
+						char c = line[i];
+						if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+							hexStr += c;
+						}
+					}
+					// Convert hex string to bytes
+					if (hexStr.length() == 64) {
+						std::array<uint8_t, 32> hash;
+						for (int i = 0; i < 32; ++i) {
+							std::string byteStr = hexStr.substr(i * 2, 2);
+							hash[i] = (uint8_t)std::strtol(byteStr.c_str(), nullptr, 16);
+						}
+						commitments.push_back(hash);
+						outs() << "[VM] Loaded SHA256 commitment: " << hexStr << "\n";
+					}
+				}
+				break;
+			}
+		}
+		metaFile.close();
+	} else {
+		outs() << "[VM] Warning: Could not open " << metadataPath
+		       << " - commitments will not be verified\n";
+	}
+
+	// Task 7: Create global array for SHA256 commitments if we loaded any
+	GlobalVariable* GVCommitments = nullptr;
+	if (!commitments.empty() && commitments.size() >= numWindows) {
+		// Create array of [numWindows x [32 x i8]] - one 32-byte hash per window
+		SmallVector<Constant*, 8> CommitmentArrays;
+		for (uint32_t i = 0; i < numWindows; ++i) {
+			SmallVector<Constant*, 32> HashBytes;
+			for (int j = 0; j < 32; ++j) {
+				HashBytes.push_back(ConstantInt::get(I8Ty, commitments[i][j]));
+			}
+			auto* HashArrayTy = ArrayType::get(I8Ty, 32);
+			CommitmentArrays.push_back(ConstantArray::get(HashArrayTy, HashBytes));
+		}
+		auto* CommitmentsTy = ArrayType::get(ArrayType::get(I8Ty, 32), numWindows);
+		GVCommitments = new GlobalVariable(
+			M, CommitmentsTy,
+			/*isConst=*/true,
+			GlobalValue::PrivateLinkage,
+			ConstantArray::get(CommitmentsTy, CommitmentArrays),
+			(F.getName() + ".vm.commitments").str());
+		outs() << "[VM] Embedded " << numWindows << " SHA256 commitments in IR\n";
+	} else if (!commitments.empty()) {
+		outs() << "[VM] Warning: Found " << commitments.size()
+		       << " commitments but need " << numWindows << " - verification disabled\n";
+	}
+
+	// Task 6/8: Create global dispatch offset variable for cloudDispatch mode
+	// When material is invalid, this will be set to non-zero to poison opcodes
+	GlobalVariable* GVDispatchOffset = new GlobalVariable(
+		M, I32Ty,
+		/*isConst=*/false,
+		GlobalValue::PrivateLinkage,
+		ConstantInt::get(I32Ty, 0),
+		(F.getName() + ".vm.dispatch.offset").str());
+
+	// Create constructor function that loads windows from cloud
+	std::string FnName = (F.getName() + ".vm.cloud_ctor").str();
+	FunctionType* CtorTy = FunctionType::get(Type::getVoidTy(Ctx), false);
+	Function* CtorFn = Function::Create(CtorTy, GlobalValue::InternalLinkage, FnName, M);
+
+	BasicBlock* Entry = BasicBlock::Create(Ctx, "entry", CtorFn);
+	IRBuilder<> B(Entry);
+
+	// Declare runtime API functions
+	// int __zone_check_material(const char* material_id)
+	FunctionType* CheckMaterialTy = FunctionType::get(
+		I32Ty, {PointerType::getUnqual(Ctx)}, false);
+	FunctionCallee CheckMaterialFn = M.getOrInsertFunction(
+		"__zone_check_material", CheckMaterialTy);
+
+	// int __zone_fetch_window(const char* material_id, uint32_t window_index,
+	//                         uint8_t* out_buffer, uint32_t window_size,
+	//                         const uint8_t* commitment)
+	FunctionType* FetchWindowTy = FunctionType::get(
+		I32Ty, {PointerType::getUnqual(Ctx), I32Ty, PointerType::getUnqual(Ctx),
+		        I32Ty, PointerType::getUnqual(Ctx)}, false);
+	FunctionCallee FetchWindowFn = M.getOrInsertFunction(
+		"__zone_fetch_window", FetchWindowTy);
+
+	// Create global string for material ID
+	auto* MaterialIDConst = ConstantDataArray::getString(Ctx, materialID, true);
+	GlobalVariable* GVMaterialIDStr = new GlobalVariable(
+		M, MaterialIDConst->getType(),
+		/*isConst=*/true,
+		GlobalValue::PrivateLinkage,
+		MaterialIDConst,
+		(F.getName() + ".vm.material.id.str").str());
+
+	// Step 1: Check if material is valid
+	Value* MaterialIDPtr = B.CreateBitCast(GVMaterialIDStr, PointerType::getUnqual(Ctx));
+	Value* CheckResult = B.CreateCall(CheckMaterialFn, {MaterialIDPtr});
+
+	// Create basic blocks for control flow
+	BasicBlock* MaterialValid = BasicBlock::Create(Ctx, "material.valid", CtorFn);
+	BasicBlock* MaterialInvalid = BasicBlock::Create(Ctx, "material.invalid", CtorFn);
+	BasicBlock* FetchLoop = BasicBlock::Create(Ctx, "fetch.loop", CtorFn);
+	BasicBlock* FetchBody = BasicBlock::Create(Ctx, "fetch.body", CtorFn);
+	BasicBlock* FetchDone = BasicBlock::Create(Ctx, "fetch.done", CtorFn);
+
+	// Branch based on check result
+	Value* IsValid = B.CreateICmpEQ(CheckResult, B.getInt32(0));
+	B.CreateCondBr(IsValid, MaterialValid, MaterialInvalid);
+
+	// Material invalid path: fail closed before any VM bytecode executes.
+	B.SetInsertPoint(MaterialInvalid);
+	B.CreateStore(B.getInt32(200), GVDispatchOffset);
+	B.CreateCall(Intrinsic::getOrInsertDeclaration(&M, Intrinsic::trap));
+	B.CreateUnreachable();
+
+	// Material valid path - fetch windows
+	B.SetInsertPoint(MaterialValid);
+
+	// Store window count as constant
+	Value* NumWindows = B.getInt32(numWindows);
+	B.CreateBr(FetchLoop);
+
+	// Fetch loop header
+	B.SetInsertPoint(FetchLoop);
+	PHINode* WindowIdx = B.CreatePHI(I32Ty, 2, "window.idx");
+	WindowIdx->addIncoming(B.getInt32(0), MaterialValid);
+
+	// Check if more windows to fetch
+	Value* HasMore = B.CreateICmpULT(WindowIdx, NumWindows);
+	B.CreateCondBr(HasMore, FetchBody, FetchDone);
+
+	// Fetch body - load one window
+	B.SetInsertPoint(FetchBody);
+
+	// Calculate buffer offset for this window
+	Value* BufferOffset = B.CreateMul(WindowIdx, B.getInt32(windowSize));
+	Value* BufferPtr = B.CreateGEP(I8Ty, GVBytecodeRT, BufferOffset);
+
+	// Task 7: Get commitment pointer for this window
+	Value* CommitmentPtr;
+	if (GVCommitments) {
+		// GEP into commitments array: commitments[window_idx][0]
+		Value* Zero = B.getInt32(0);
+		CommitmentPtr = B.CreateGEP(GVCommitments->getValueType(), GVCommitments,
+		                            {Zero, WindowIdx, Zero});
+	} else {
+		// No commitments available - pass NULL (verification skipped at runtime)
+		CommitmentPtr = ConstantPointerNull::get(PointerType::getUnqual(Ctx));
+	}
+
+	// Call __zone_fetch_window
+	Value* FetchResult = B.CreateCall(FetchWindowFn, {
+		MaterialIDPtr,
+		WindowIdx,
+		BufferPtr,
+		B.getInt32(windowSize),
+		CommitmentPtr
+	});
+
+	// Task 6/8: Check fetch result, set dispatch offset if failed
+	BasicBlock* FetchSuccess = BasicBlock::Create(Ctx, "fetch.success", CtorFn);
+	BasicBlock* FetchFailed = BasicBlock::Create(Ctx, "fetch.failed", CtorFn);
+	Value* FetchOK = B.CreateICmpEQ(FetchResult, B.getInt32(0));
+	B.CreateCondBr(FetchOK, FetchSuccess, FetchFailed);
+
+	// Fetch failed: fail closed before the wrapper can consume incomplete data.
+	B.SetInsertPoint(FetchFailed);
+	B.CreateStore(B.getInt32(200), GVDispatchOffset);
+	B.CreateCall(Intrinsic::getOrInsertDeclaration(&M, Intrinsic::trap));
+	B.CreateUnreachable();
+
+	// Fetch success - continue to next window
+	B.SetInsertPoint(FetchSuccess);
+	Value* NextIdx = B.CreateAdd(WindowIdx, B.getInt32(1));
+	WindowIdx->addIncoming(NextIdx, FetchSuccess);
+	B.CreateBr(FetchLoop);
+
+	// Done fetching all windows
+	B.SetInsertPoint(FetchDone);
+	B.CreateRetVoid();
+
+	// Register constructor to run before main
+	appendToGlobalCtors(M, CtorFn, 65535, nullptr);
+
+	outs() << "[VM] Cloud material constructor built: " << numWindows
+	       << " windows for " << materialID << "\n";
+	if (Cfg.cloudDispatch) {
+		outs() << "[VM] Cloud dispatch mode enabled - invalid materials will poison opcodes\n";
+	}
+}
+
+
+//  buildCalleeGlobal
 
 void VMImpl::buildCalleeGlobal() {
 	if (E.CalleeTab.empty()) return;
@@ -313,6 +609,12 @@ void VMImpl::buildCalleeGlobal() {
 // linked from the strenc pass — the dedup check prevents double-linking.
 
 void VMImpl::buildEncryptCtor() {
+	// Task 5/8: In cloud material mode, build window loader constructor
+	if (Cfg.usesCloudMaterial()) {
+		buildCloudMaterialCtor();
+		return;
+	}
+
 	if (!EncBytecode) return;
 	if (!GVBytecodeRT) return;
 	if (E.BC.empty()) return;

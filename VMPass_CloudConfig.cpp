@@ -12,6 +12,8 @@ using namespace llvm;
 // 命令行选项定义
 // ============================================================================
 
+namespace llvm {
+
 cl::opt<bool> CloudProtection(
     "cloud-protection",
     cl::desc("Enable CloudMaterial protection"),
@@ -84,25 +86,29 @@ cl::opt<unsigned> CloudShardCount(
     cl::init(2),
     cl::Hidden);
 
+} // namespace llvm
+
 // ============================================================================
 // 配置构建函数
 // ============================================================================
 
+namespace llvm {
+
 CloudMaterialConfig getCloudMaterialConfig() {
     CloudMaterialConfig config;
 
-    config.enable = CloudProtection;
-    config.app_id = CloudAppID;
-    config.app_version = CloudAppVersion;
-    config.backend_mode = CloudBackendMode;
-    config.output_dir = CloudOutputDir;
-    config.hmac_secret = CloudHMACSecret;
-    config.enable_tls = CloudEnableTLS;
-    config.enable_backend_package = CloudEnableBackendPackage;
-    config.ndk_path = CloudNDKPath;
-    config.window_size = CloudWindowSize;
-    config.chaff_percentage = CloudChaffPercentage;
-    config.shard_count = CloudShardCount;
+    config.enable = static_cast<bool>(CloudProtection);
+    config.app_id = static_cast<std::string>(CloudAppID);
+    config.app_version = static_cast<std::string>(CloudAppVersion);
+    config.backend_mode = static_cast<std::string>(CloudBackendMode);
+    config.output_dir = static_cast<std::string>(CloudOutputDir);
+    config.hmac_secret = static_cast<std::string>(CloudHMACSecret);
+    config.enable_tls = static_cast<bool>(CloudEnableTLS);
+    config.enable_backend_package = static_cast<bool>(CloudEnableBackendPackage);
+    config.ndk_path = static_cast<std::string>(CloudNDKPath);
+    config.window_size = static_cast<unsigned>(CloudWindowSize);
+    config.chaff_percentage = static_cast<unsigned>(CloudChaffPercentage);
+    config.shard_count = static_cast<unsigned>(CloudShardCount);
 
     // 尝试从环境变量获取 NDK 路径
     if (config.ndk_path.empty()) {
@@ -131,3 +137,5 @@ CloudMaterialConfig getCloudMaterialConfig() {
 
     return config;
 }
+
+} // namespace llvm

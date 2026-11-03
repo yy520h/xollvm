@@ -705,7 +705,8 @@ namespace llvm {
 			// Task 4: a strict sensitive candidate that never prepared must fail
 			// the build before commit, not silently vanish.
 			Coordinator.verifyRequiredCandidates();
-			// 暂存阶段先完成所有候选预检，再写真实配置报告并拒绝发射。
+			// 暂存阶段先完成所有候选预检，再写真实配置报告。
+			// Task 3/8: Cloud material window export is now implemented in VMPass_Impl.cpp
 			if (Coordinator.hasCloudMaterial()) {
 				validateMaterialExportDirectory();
 				if (Error E = Coordinator.prepareMaterialExports())
@@ -716,7 +717,7 @@ namespace llvm {
 					if (Error E = llvm::obf::maybeWriteObfReportJson(M, MAM))
 						report_fatal_error(Twine("vm: material preflight report failed: ") + toString(std::move(E)), false);
 				}
-				report_fatal_error("vm: cloud material emission not implemented (Tasks 3/8)", false);
+				// Cloud material export now happens in VMImpl::commit() - continue to commit phase
 			}
 			if (!Coordinator.freeze() || !Coordinator.commit())
 				return PreservedAnalyses::none();

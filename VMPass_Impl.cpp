@@ -27,6 +27,7 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Verifier.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
 #include "llvm/Transforms/Obfuscator/AntiDebug.h"
+#include "llvm/Transforms/Obfuscator/VMPass_CloudExport.h"
 
 #include <functional>
 using namespace llvm;
@@ -328,8 +329,48 @@ bool VMImpl::prepare() {
 
 bool VMImpl::commit() {
 	if (!Prepared || Committed) return false;
-	// 任务 3/8 接管此处前禁止进入静态全局、解密 ctor 和旧 wrapper。
-	Cfg.failCloudMaterial("cloud material emission not implemented (Tasks 3/8)");
+
+	// Task 3/8: Cloud material window export
+	if (Cfg.usesCloudMaterial()) {
+		// Validate export directory is configured
+		if (ObfMaterialExportDir.empty()) {
+			report_fatal_error("vm: cloudMaterial requires -obf-material-export-dir", false);
+		}
+
+		// Export bytecode as cloud windows instead of embedding locally
+		ArrayRef<uint8_t> bytecode(E.BC);
+
+		// Use default window size of 4KB
+		uint32_t windowSize = 4096;
+
+		// App ID from module metadata or default
+		StringRef appID = "com.xollvm.protected";
+		if (auto* AppIDMD = M.getModuleFlag("xollvm.app_id")) {
+			if (auto* MDS = dyn_cast<MDString>(AppIDMD)) {
+				appID = MDS->getString();
+			}
+		}
+
+		// Export the bytecode
+		bool exported = CloudMaterialExporter::exportBytecode(
+			bytecode,
+			F.getName(),
+			Cfg.materialRegion,
+			windowSize,
+			ObfMaterialExportDir,
+			appID
+		);
+
+		if (!exported) {
+			Cfg.failCloudMaterial("failed to export bytecode windows");
+		}
+
+		// For cloud material mode, we still need to build a wrapper that
+		// fetches windows at runtime. Continue with wrapper generation but
+		// skip the local bytecode global.
+		outs() << "[VM] Cloud material mode: bytecode exported, building runtime loader\n";
+	}
+
 	if (Cfg.encodedTargets) {
 		Triple T(M.getTargetTriple());
 		if (!T.isAArch64() || !T.isLittleEndian() || !T.isOSBinFormatELF())
@@ -343,7 +384,12 @@ bool VMImpl::commit() {
 	stripBody();
 
 	// Emit globals
-	buildBytecodeGlobal();
+	// Task 4/8: In cloud material mode, build runtime window loader instead of local bytecode global
+	if (Cfg.usesCloudMaterial()) {
+		buildCloudMaterialLoader();
+	} else {
+		buildBytecodeGlobal();
+	}
 	buildCalleeGlobal();
 
 	// Nested-VM: each eligible opcode's helper Function* must exist before

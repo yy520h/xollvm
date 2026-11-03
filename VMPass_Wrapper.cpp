@@ -581,8 +581,9 @@ void VMImpl::buildWrapper() {
 	// call-site xref from wrappers to @__vm_engine, breaking static
 	// cross-reference analysis in IDA/Ghidra.
 
-	// Bytecode base: use runtime copy if encryption is enabled
-	Value* BCBase = (EncBytecode && GVBytecodeRT) ? (Value*)GVBytecodeRT : (Value*)GVBytecode;
+	// Cloud windows and encrypted bytecode are loaded into the runtime buffer.
+	Value* BCBase = ((EncBytecode || Cfg.usesCloudMaterial()) && GVBytecodeRT)
+		? (Value*)GVBytecodeRT : (Value*)GVBytecode;
 
 	SmallVector<Value*, VMEngine::kNumParams + 1> Args = {
 		BCBase,                                                          // bc

@@ -256,13 +256,15 @@ bool CloudMaterialEmitter::integrateWithVMPass(
   LLVMContext& Ctx = M->getContext();
 
   // 1. 分割为窗口
-  uint32_t window_size = config.cloud_window_size;
-  uint32_t chaff_pct = config.cloud_chaff_percentage;
+  // TODO: 从云端材料配置中获取这些参数
+  uint32_t window_size = 2048;  // 默认窗口大小
+  uint32_t chaff_pct = 20;      // 默认混淆百分比
 
   auto windows = splitIntoWindows(vmBytecode, window_size, chaff_pct);
 
   // 2. 生成配置文件
-  std::string configPath = config.cloud_config_output;
+  // TODO: 配置文件路径应从编译选项获取
+  std::string configPath = "";
   if (!configPath.empty()) {
     generateRuntimeConfig(windows, configPath);
   }

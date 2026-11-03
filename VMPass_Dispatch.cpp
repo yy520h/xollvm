@@ -498,7 +498,8 @@ namespace llvm {
 
 void VMImpl::setupEffLocal() {
 	HFn = &F;
-	EffBC = (EncBytecode && GVBytecodeRT) ? (Value*)GVBytecodeRT : (Value*)GVBytecode;
+	EffBC = ((EncBytecode || Cfg.usesCloudMaterial()) && GVBytecodeRT)
+		? (Value*)GVBytecodeRT : (Value*)GVBytecode;
 	EffBCLen = nullptr;
 	EffSalt = VMSalt;
 	EffRegs = VMRegs;

@@ -134,6 +134,9 @@ set(OBF_SOURCES
   VMPass_Decoys.cpp
   VMPass_CloudMaterial.cpp
   VMPass_CloudConfig.cpp
+  VMPass_CloudExport.cpp
+  VMRuntime_CloudMaterial.cpp
+  VMRuntime_SHA256.cpp
   AntiDebug.cpp
   ECC_KeyManager.cpp
   EHUtils.cpp
@@ -193,9 +196,51 @@ endif()
 #     VMPass). There is only ONE LLVM copy here (the tool's), so no double
 #     global state -- these edges just fix ordering, they don't add a 2nd LLVM.
 if(LLVM_OBFUSCATOR_LINK_INTO_TOOLS)
-  set(_OBF_LINK_COMPONENTS LINK_COMPONENTS Linker)
+  # When statically linking into tools, declare all LLVM components used by obfuscator
+  set(_OBF_LINK_COMPONENTS LINK_COMPONENTS
+    Core
+    Support
+    Linker
+    TransformUtils
+    Analysis
+    IRReader
+    Passes
+    Scalar
+    InstCombine
+    AggressiveInstCombine
+    IPO
+    Vectorize
+    ObjCARCOpts
+    Coroutines
+    BitWriter
+    BitReader
+    TargetParser
+    MC
+  )
 else()
-  set(_OBF_LINK_COMPONENTS "")
+  # For shared library builds, link against necessary LLVM components
+  if(BUILD_SHARED_LIBS)
+    set(_OBF_LINK_COMPONENTS LINK_COMPONENTS
+      Core
+      Support
+      Linker
+      TransformUtils
+      Analysis
+      IRReader
+      Passes
+      Scalar
+      InstCombine
+      AggressiveInstCombine
+      IPO
+      Vectorize
+      ObjCARCOpts
+      Coroutines
+      BitWriter
+      BitReader
+    )
+  else()
+    set(_OBF_LINK_COMPONENTS "")
+  endif()
 endif()
 
 add_llvm_pass_plugin(Obfuscator
@@ -204,6 +249,21 @@ add_llvm_pass_plugin(Obfuscator
   ${_OBF_DEPENDS}
   ${_OBF_LINK_COMPONENTS}
 )
+
+# For shared library builds, link only available shared LLVM libraries
+# Note: Some LLVM components (Passes, ScalarOpts, etc.) may only be built as static
+if(BUILD_SHARED_LIBS AND NOT LLVM_OBFUSCATOR_LINK_INTO_TOOLS)
+  target_link_libraries(Obfuscator PRIVATE
+    LLVMCore
+    LLVMSupport
+    LLVMTransformUtils
+    LLVMAnalysis
+    LLVMIRReader
+  )
+endif()
+
+# Link OpenSSL for ECC_KeyManager
+target_link_libraries(Obfuscator PRIVATE crypto ssl)
 
 # The AES stub .inc must be generated before any obfuscator source that
 # includes it is compiled. Under LINK_INTO_TOOLS add_llvm_pass_plugin compiles

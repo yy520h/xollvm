@@ -969,6 +969,7 @@ namespace llvm {
 
 		void stripBody();
 		void buildBytecodeGlobal();
+		void buildCloudMaterialLoader(); // Task 4/8: Build runtime window loader for cloud material mode
 		void buildCalleeGlobal();
 		void buildVMEntry();
 
@@ -1039,6 +1040,7 @@ namespace llvm {
 		// !ThreadedDispatch, inlined threaded tail otherwise.
 		void nextInsn(IRBuilder<>& B);
 		void buildEncryptCtor();    // optional encryption constructor (AES-CTR)
+		void buildCloudMaterialCtor(); // Task 5/8: cloud material window loader constructor
 
 		// Step 06: shared engine setup
 		void setupEffLocal();         // point Eff* at per-function state
