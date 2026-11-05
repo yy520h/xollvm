@@ -40,8 +40,6 @@ endif()
 
 find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
 
-add_subdirectory(runtime/cloud_material)
-
 
 # ---------------------------------------------------------------------------
 # AES stub prerequisites (both modes)
