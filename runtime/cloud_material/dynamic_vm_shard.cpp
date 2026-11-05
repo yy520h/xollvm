@@ -87,6 +87,25 @@ std::optional<std::vector<uint8_t>> emitReturnInt(uint32_t source, uint32_t next
     return code;
 }
 
+std::optional<std::vector<uint8_t>> emitLoadAndReturnInt(
+    uint32_t destination, uint32_t immediate, uint32_t source, uint32_t next_ip) {
+    if (!validRegister(destination) || !validRegister(source))
+        return std::nullopt;
+    std::vector<uint8_t> code;
+    putInstruction(code, loadPointer(1, 0,
+        offsetof(XovmDynamicVmExecutionContext, registers)));
+    putImmediate(code, 2, immediate);
+    putInstruction(code, storeRegister(2, 1, destination * sizeof(uint32_t)));
+    putInstruction(code, loadPointer(2, 0,
+        offsetof(XovmDynamicVmExecutionContext, return_storage)));
+    putInstruction(code, loadRegister(3, 1, source * sizeof(uint32_t)));
+    putInstruction(code, storeRegister(3, 2, 0));
+    putAdvance(code, next_ip);
+    putImmediate(code, 0, XOVM_SHARD_RETURN);
+    putInstruction(code, kRet);
+    return code;
+}
+
 std::optional<std::vector<uint8_t>> emitMoveRegister(
     uint32_t destination, uint32_t source, uint32_t next_ip) {
     if (!validRegister(destination) || !validRegister(source))
@@ -422,11 +441,6 @@ bool validateAarch64SubtractImmediateShard(std::span<const uint8_t> code,
                                            uint32_t immediate,
                                            uint32_t next_ip) {
     return validateAarch64ShardTemplate(code, Aarch64ShardTemplate::SubtractImmediate,
-        {destination, immediate, source, next_ip});
-}
-                                          uint32_t next_ip) {
-    return validateAarch64ShardTemplate(
-        code, Aarch64ShardTemplate::LoadAndReturnInt,
         {destination, immediate, source, next_ip});
 }
 
