@@ -15,10 +15,14 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Verifier.h"
+#include "runtime/cloud_material/dynamic_vm_artifact.h"
+#include "runtime/cloud_material/dynamic_vm_schema.h"
+#include "runtime/cloud_material/dynamic_vm_shard.h"
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <openssl/crypto.h>
 #include <cstdint>
 #include <dirent.h>
 #include <fcntl.h>
@@ -131,8 +135,9 @@ Error encodeCanonical(const json::Value& Value, std::string& Out, unsigned Depth
 	}
 	case json::Value::String: {
 		auto Text = Value.getAsString();
-		size_t Limit = Owner == "canonical_bc" &&
-			Profile != MaterialCodecProfile::PublicManifest ? kMaxBase64Bytes : 256;
+		size_t Limit = ((Owner == "canonical_bc" &&
+			Profile != MaterialCodecProfile::PublicManifest) ||
+			Owner == "encrypted_artifact_b64") ? kMaxBase64Bytes : 256;
 		if (!Text || !validASCII(*Text, Limit))
 			return materialError("material JSON string is not ASCII");
 		appendEscaped(Out, *Text);
@@ -145,7 +150,7 @@ Error encodeCanonical(const json::Value& Value, std::string& Out, unsigned Depth
 		Out.push_back('[');
 		for (unsigned I = 0; I < Array->size(); ++I) {
 			if (I) Out.push_back(',');
-			if (Error E = encodeCanonical((*Array)[I], Out, Depth + 1, Profile)) return E;
+			if (Error E = encodeCanonical((*Array)[I], Out, Depth + 1, Profile, Owner)) return E;
 		}
 		Out.push_back(']');
 		return Error::success();
@@ -189,6 +194,242 @@ std::string frameHash(StringRef Label, StringRef Part) {
 	for (int Shift : {24, 16, 8, 0}) Bytes.push_back(static_cast<char>(Size >> Shift));
 	Bytes.append(Part);
 	return hashBytes(Bytes);
+}
+
+xovm::material::DynamicHash dynamicHash(StringRef Label, StringRef Part) {
+	std::string Framed = Label.str();
+	Framed.push_back('\0');
+	uint32_t Size = Part.size();
+	for (int Shift : {24, 16, 8, 0}) Framed.push_back(static_cast<char>(Size >> Shift));
+	Framed.append(Part);
+	auto Digest = SHA256::hash(arrayRefFromStringRef(Framed));
+	xovm::material::DynamicHash Result{};
+	std::copy(Digest.begin(), Digest.end(), Result.begin());
+	return Result;
+}
+
+std::string dynamicHashHex(const xovm::material::DynamicHash& Hash) {
+	return toHex(ArrayRef<uint8_t>(Hash), true);
+}
+
+std::optional<xovm::material::DynamicHash> parseDynamicHash(StringRef Text) {
+	if (Text.size() != 64) return std::nullopt;
+	auto HexValue = [](char C) -> int {
+		if (C >= '0' && C <= '9') return C - '0';
+		if (C >= 'a' && C <= 'f') return C - 'a' + 10;
+		if (C >= 'A' && C <= 'F') return C - 'A' + 10;
+		return -1;
+	};
+	xovm::material::DynamicHash Result{};
+	for (unsigned I = 0; I < Result.size(); ++I) {
+		int High = HexValue(Text[I * 2]);
+		int Low = HexValue(Text[I * 2 + 1]);
+		if (High < 0 || Low < 0) return std::nullopt;
+		Result[I] = static_cast<uint8_t>((High << 4) | Low);
+	}
+	return Result;
+}
+
+xovm::material::DynamicHash sha256(ArrayRef<uint8_t> Bytes) {
+	auto Digest = SHA256::hash(Bytes);
+	xovm::material::DynamicHash Result{};
+	std::copy(Digest.begin(), Digest.end(), Result.begin());
+	return Result;
+}
+
+struct DynamicExecutionMaterial {
+	xovm::material::DynamicVmExecutionAbiV2 Abi;
+	xovm::material::ContinuationGraphV2 Graph;
+	std::vector<uint8_t> HandlerCode;
+};
+
+Expected<DynamicExecutionMaterial> buildDynamicExecutionMaterial(
+	const BytecodeEmitter& Emitter, const VMOpcodeMap& Opcodes) {
+	using namespace xovm::material;
+	const auto Records = Emitter.getInstructionRecords();
+	if (Emitter.hasKeyedDispatch())
+		return materialError("dynamic artifact keyed dispatch is unsupported");
+	if (Records.size() != 2 || Records[0].first != 0 || Records[0].second != OP_LOADI ||
+		Records[1].first != kDynamicVmLoadI32InstructionSizeV2 ||
+		Records[1].second != OP_RET_INT ||
+		Emitter.BC.size() != kDynamicVmLoadI32InstructionSizeV2 +
+			kDynamicVmReturnI32InstructionSizeV2)
+		return materialError("dynamic artifact supports exactly compiler-emitted LOADI to RET_INT");
+	if (!Emitter.getLayout().validate())
+		return materialError("dynamic artifact layout invalid");
+	const uint8_t LoadOpcode = Opcodes.encode(OP_LOADI);
+	const uint8_t ReturnOpcode = Opcodes.encode(OP_RET_INT);
+	if (LoadOpcode == ReturnOpcode || Emitter.BC[Records[0].first] != LoadOpcode ||
+		Emitter.BC[Records[1].first] != ReturnOpcode)
+		return materialError("dynamic artifact physical opcode mismatch");
+	if (Emitter.NVR == 0 || Emitter.NVR > kDynamicVmMaxI32RegistersV2 ||
+		Emitter.NVR64 != 0 || Emitter.NPR != 0 || Emitter.NFR != 0)
+		return materialError("dynamic artifact register classes unsupported");
+
+	const auto& Layout = Emitter.getLayout();
+	const unsigned LoadDestinationOffset = Layout.offset(OP_LOADI, VMFieldRole::Dst);
+	const unsigned LoadImmediateOffset = Layout.offset(OP_LOADI, VMFieldRole::Immediate);
+	const unsigned ReturnSourceOffset = Layout.offset(OP_RET_INT, VMFieldRole::SrcA);
+	if (Layout.size(OP_LOADI) != kDynamicVmLoadI32InstructionSizeV2 ||
+		Layout.size(OP_RET_INT) != kDynamicVmReturnI32InstructionSizeV2 ||
+		LoadDestinationOffset != 1 || LoadImmediateOffset != 2 ||
+		ReturnSourceOffset != 1)
+		return materialError("dynamic artifact operand layout unsupported");
+
+	const uint8_t DecodeSalt = Emitter.getDecodeSalt();
+	const uint8_t PhysicalDestination = Emitter.BC[Records[0].first + LoadDestinationOffset];
+	const uint8_t PhysicalSource = Emitter.BC[Records[1].first + ReturnSourceOffset];
+	const uint8_t Destination = PhysicalDestination ^ DecodeSalt;
+	const uint8_t Source = PhysicalSource ^ DecodeSalt;
+	if (Destination != Source || Destination >= Emitter.NVR)
+		return materialError("dynamic artifact decoded register mismatch");
+
+	const size_t ImmediateAt = Records[0].first + LoadImmediateOffset;
+	uint32_t Immediate = static_cast<uint32_t>(Emitter.BC[ImmediateAt]) |
+		(static_cast<uint32_t>(Emitter.BC[ImmediateAt + 1]) << 8) |
+		(static_cast<uint32_t>(Emitter.BC[ImmediateAt + 2]) << 16) |
+		(static_cast<uint32_t>(Emitter.BC[ImmediateAt + 3]) << 24);
+	auto LoadShard = buildAarch64LoadImmediateShard(Destination, Immediate,
+		Records[1].first);
+	auto ReturnShard = buildAarch64ReturnIntShard(Source, Emitter.BC.size());
+	if (!LoadShard || !ReturnShard)
+		return materialError("dynamic AArch64 handler shard unavailable");
+	if (LoadShard->size() > UINT32_MAX || ReturnShard->size() > UINT32_MAX ||
+		LoadShard->size() + ReturnShard->size() > UINT32_MAX)
+		return materialError("dynamic artifact handler shard bounds invalid");
+
+	DynamicExecutionMaterial Result;
+	Result.HandlerCode.reserve(LoadShard->size() + ReturnShard->size());
+	Result.HandlerCode.insert(Result.HandlerCode.end(), LoadShard->begin(), LoadShard->end());
+	Result.HandlerCode.insert(Result.HandlerCode.end(), ReturnShard->begin(), ReturnShard->end());
+
+	Result.Abi.abi_id = 1;
+	Result.Abi.i32_register_count = Emitter.NVR;
+	Result.Abi.i64_register_count = Emitter.NVR64;
+	Result.Abi.pointer_register_count = Emitter.NPR;
+	Result.Abi.f64_register_count = Emitter.NFR;
+	Result.Abi.loadi32_instruction_size = Layout.size(OP_LOADI);
+	Result.Abi.return_i32_instruction_size = Layout.size(OP_RET_INT);
+	Result.Abi.loadi32_opcode = LoadOpcode;
+	Result.Abi.return_i32_opcode = ReturnOpcode;
+	Result.Abi.loadi32_destination_offset = LoadDestinationOffset;
+	Result.Abi.loadi32_immediate_offset = LoadImmediateOffset;
+	Result.Abi.return_i32_source_offset = ReturnSourceOffset;
+	Result.Abi.decode_salt = DecodeSalt;
+	if (validateDynamicVmExecutionAbiV2(Result.Abi) != DynamicVmSchemaStatusV2::Valid)
+		return materialError("dynamic artifact execution ABI unsupported");
+	auto AbiHash = hashDynamicVmExecutionAbiV2(Result.Abi);
+	if (!AbiHash) return materialError("dynamic artifact execution ABI hash failed");
+
+	Result.Graph.descriptor.abi_id = Result.Abi.abi_id;
+	Result.Graph.descriptor.abi_hash = *AbiHash;
+	Result.Graph.descriptor.bytecode_hash = sha256(Emitter.BC);
+	Result.Graph.descriptor.bytecode_size = Emitter.BC.size();
+	Result.Graph.descriptor.handler_shards_size = Result.HandlerCode.size();
+	Result.Graph.descriptor.entry_node_id = 1;
+	Result.Graph.descriptor.node_count = 2;
+
+	xovm::material::ContinuationNodeV2 LoadNode;
+	LoadNode.node_id = 1;
+	LoadNode.shard_id = 1;
+	LoadNode.bytecode_offset = Records[0].first;
+	LoadNode.bytecode_size = Records[1].first - Records[0].first;
+	LoadNode.shard_offset = 0;
+	LoadNode.shard_size = LoadShard->size();
+	LoadNode.next_node_id = 2;
+	LoadNode.register_index = Destination;
+	LoadNode.semantic = ContinuationNodeSemanticV2::LoadI32;
+	LoadNode.status = ContinuationNodeStatusV2::Continue;
+	LoadNode.variant_id = 1;
+	LoadNode.bytecode_block_commitment = hashDynamicVmBytecodeBlockV2(
+		ArrayRef<uint8_t>(Emitter.BC).slice(LoadNode.bytecode_offset, LoadNode.bytecode_size));
+	LoadNode.handler_shard_commitment = hashDynamicVmHandlerShardV2(*LoadShard);
+	auto LoadTail = hashDynamicVmTransitionTailV2(LoadNode);
+	if (!LoadTail) return materialError("dynamic artifact LOADI transition hash failed");
+	LoadNode.transition_tail_commitment = *LoadTail;
+
+	xovm::material::ContinuationNodeV2 ReturnNode;
+	ReturnNode.node_id = 2;
+	ReturnNode.shard_id = 2;
+	ReturnNode.bytecode_offset = Records[1].first;
+	ReturnNode.bytecode_size = Emitter.BC.size() - Records[1].first;
+	ReturnNode.shard_offset = LoadShard->size();
+	ReturnNode.shard_size = ReturnShard->size();
+	ReturnNode.register_index = Source;
+	ReturnNode.semantic = ContinuationNodeSemanticV2::ReturnI32;
+	ReturnNode.status = ContinuationNodeStatusV2::Return;
+	ReturnNode.variant_id = 1;
+	ReturnNode.bytecode_block_commitment = hashDynamicVmBytecodeBlockV2(
+		ArrayRef<uint8_t>(Emitter.BC).slice(ReturnNode.bytecode_offset,
+			ReturnNode.bytecode_size));
+	ReturnNode.handler_shard_commitment = hashDynamicVmHandlerShardV2(*ReturnShard);
+	auto ReturnTail = hashDynamicVmTransitionTailV2(ReturnNode);
+	if (!ReturnTail) return materialError("dynamic artifact RET_INT transition hash failed");
+	ReturnNode.transition_tail_commitment = *ReturnTail;
+
+	Result.Graph.nodes = {LoadNode, ReturnNode};
+	auto GraphHash = hashDynamicVmContinuationGraphV2(Result.Graph);
+	if (!GraphHash) return materialError("dynamic artifact graph hash failed");
+	Result.Graph.descriptor.graph_commitment = *GraphHash;
+	if (validateContinuationGraphV2(Result.Abi, Result.Graph, Emitter.BC,
+		Result.HandlerCode) != DynamicVmSchemaStatusV2::Valid)
+		return materialError("dynamic artifact graph validation failed");
+	return Result;
+}
+
+std::vector<uint8_t> encodeDynamicExecutionDescriptor(
+	const DynamicExecutionMaterial& Material) {
+	auto Abi = xovm::material::encodeDynamicVmExecutionAbiV2(Material.Abi);
+	auto Graph = xovm::material::encodeContinuationGraphV2(Material.Graph);
+	if (Abi.empty() || Graph.empty()) return {};
+	Abi.insert(Abi.end(), Graph.begin(), Graph.end());
+	return Abi;
+}
+
+Error validateDynamicExecutionDescriptor(
+	const xovm::material::DecryptedVmArtifact& Artifact) {
+	using namespace xovm::material;
+	if (!Artifact.relocation_descriptors.empty() ||
+		Artifact.continuation_descriptors.size() <= kDynamicVmExecutionAbiV2EncodedSize)
+		return materialError("dynamic artifact v2 descriptor missing");
+	auto Descriptor = ArrayRef<uint8_t>(Artifact.continuation_descriptors);
+	auto Abi = decodeDynamicVmExecutionAbiV2(
+		Descriptor.take_front(kDynamicVmExecutionAbiV2EncodedSize));
+	auto Graph = decodeContinuationGraphV2(
+		Descriptor.drop_front(kDynamicVmExecutionAbiV2EncodedSize));
+	auto HandlerPayload = decodeHandlerShardPayload(Artifact.handler_shards);
+	if (!Abi || !Graph || !HandlerPayload || Graph->nodes.size() != 2 ||
+		HandlerPayload->descriptor.shard_id != Graph->nodes.front().shard_id ||
+		HandlerPayload->descriptor.code_size != HandlerPayload->code.size() ||
+		validateContinuationGraphV2(*Abi, *Graph, Artifact.bytecode,
+			HandlerPayload->code) != DynamicVmSchemaStatusV2::Valid) {
+		if (HandlerPayload) secureClear(HandlerPayload->code);
+		return materialError("dynamic artifact v2 descriptor invalid");
+	}
+	const auto& LoadNode = Graph->nodes[0];
+	const auto& ReturnNode = Graph->nodes[1];
+	std::span<const uint8_t> Bytecode(Artifact.bytecode);
+	std::span<const uint8_t> HandlerCode(HandlerPayload->code);
+	const auto LoadBlock = Bytecode.subspan(LoadNode.bytecode_offset,
+		LoadNode.bytecode_size);
+	const auto LoadShard = HandlerCode.subspan(LoadNode.shard_offset,
+		LoadNode.shard_size);
+	const auto ReturnShard = HandlerCode.subspan(ReturnNode.shard_offset,
+		ReturnNode.shard_size);
+	const size_t ImmediateOffset = Abi->loadi32_immediate_offset;
+	const uint32_t Immediate = static_cast<uint32_t>(LoadBlock[ImmediateOffset]) |
+		(static_cast<uint32_t>(LoadBlock[ImmediateOffset + 1]) << 8) |
+		(static_cast<uint32_t>(LoadBlock[ImmediateOffset + 2]) << 16) |
+		(static_cast<uint32_t>(LoadBlock[ImmediateOffset + 3]) << 24);
+	if (!validateAarch64LoadImmediateShard(LoadShard, LoadNode.register_index,
+			Immediate, ReturnNode.bytecode_offset) ||
+		!validateAarch64ReturnIntShard(ReturnShard, ReturnNode.register_index,
+			Artifact.bytecode.size())) {
+		secureClear(HandlerPayload->code);
+		return materialError("dynamic artifact handler semantics invalid");
+	}
+	secureClear(HandlerPayload->code);
+	return Error::success();
 }
 
 std::string stableType(Type* Ty) {
@@ -630,6 +871,90 @@ Error validateCanonicalRegion(const json::Object& Region,
 	return Error::success();
 }
 
+Error validateDynamicArtifactExport(const DynamicArtifactExport& Export) {
+	static const StringRef PublicFields[] = {
+		"format_version", "material_source", "region_name", "build_id", "region_id",
+		"artifact_hash", "encrypted_artifact_b64", "artifact_size",
+	};
+	static const StringRef PrivateFields[] = {
+		"format_version", "material_source", "region_name", "build_id", "region_id",
+		"artifact_hash", "artifact_key_b64",
+	};
+	if (!hasExactFields(Export.PublicManifest, PublicFields) ||
+		!hasExactFields(Export.PrivateRegistration, PrivateFields))
+		return materialError("dynamic artifact manifest schema mismatch");
+	auto PublicVersion = Export.PublicManifest.getInteger("format_version");
+	auto PrivateVersion = Export.PrivateRegistration.getInteger("format_version");
+	auto PublicSource = Export.PublicManifest.getString("material_source");
+	auto PrivateSource = Export.PrivateRegistration.getString("material_source");
+	auto PublicName = Export.PublicManifest.getString("region_name");
+	auto PrivateName = Export.PrivateRegistration.getString("region_name");
+	auto PublicBuild = Export.PublicManifest.getString("build_id");
+	auto PrivateBuild = Export.PrivateRegistration.getString("build_id");
+	auto PublicRegion = Export.PublicManifest.getString("region_id");
+	auto PrivateRegion = Export.PrivateRegistration.getString("region_id");
+	auto PublicHash = Export.PublicManifest.getString("artifact_hash");
+	auto PrivateHash = Export.PrivateRegistration.getString("artifact_hash");
+	auto Ciphertext = Export.PublicManifest.getString("encrypted_artifact_b64");
+	auto ArtifactSize = Export.PublicManifest.getInteger("artifact_size");
+	auto Key = Export.PrivateRegistration.getString("artifact_key_b64");
+	if (!PublicVersion || *PublicVersion != 2 || !PrivateVersion || *PrivateVersion != 2 ||
+		!PublicSource || *PublicSource != "dynamic_vm" || !PrivateSource ||
+		*PrivateSource != "dynamic_vm" || !PublicName || !PrivateName ||
+		*PublicName != *PrivateName || !validName(*PublicName) || !PublicBuild ||
+		!PrivateBuild || *PublicBuild != *PrivateBuild || !validHash(*PublicBuild) ||
+		!PublicRegion || !PrivateRegion || *PublicRegion != *PrivateRegion ||
+		!validHash(*PublicRegion) || !PublicHash || !PrivateHash ||
+		*PublicHash != *PrivateHash || !validHash(*PublicHash) || !Ciphertext ||
+		Ciphertext->empty() || Ciphertext->size() > kMaxBase64Bytes ||
+		Ciphertext->size() % 4 != 0 || !ArtifactSize || *ArtifactSize < 1 ||
+		static_cast<uint64_t>(*ArtifactSize) > kMaxBytecodeBytes * 64 || !Key ||
+		Key->empty() || Key->size() > 128 || Key->size() % 4 != 0)
+		return materialError("dynamic artifact manifest field invalid");
+	std::vector<char> Encoded;
+	if (Error E = decodeBase64(*Ciphertext, Encoded)) {
+		consumeError(std::move(E));
+		return materialError("dynamic artifact encoding invalid");
+	}
+	if (Encoded.size() != static_cast<size_t>(*ArtifactSize) ||
+		encodeBase64(Encoded) != *Ciphertext)
+		return materialError("dynamic artifact size mismatch");
+	std::vector<char> DecodedKey;
+	if (Error E = decodeBase64(*Key, DecodedKey)) {
+		consumeError(std::move(E));
+		return materialError("dynamic artifact key encoding invalid");
+	}
+	auto ClearDecodedKey = make_scope_exit([&] {
+		if (!DecodedKey.empty()) OPENSSL_cleanse(DecodedKey.data(), DecodedKey.size());
+	});
+	if (DecodedKey.size() != 32 || encodeBase64(DecodedKey) != *Key)
+		return materialError("dynamic artifact key size mismatch");
+	auto BuildId = parseDynamicHash(*PublicBuild);
+	auto RegionId = parseDynamicHash(*PublicRegion);
+	auto ArtifactHash = parseDynamicHash(*PublicHash);
+	if (!BuildId || !RegionId || !ArtifactHash)
+		return materialError("dynamic artifact identity encoding invalid");
+	ArrayRef<uint8_t> EncodedBytes(reinterpret_cast<const uint8_t*>(Encoded.data()), Encoded.size());
+	auto Artifact = xovm::material::decodeEncryptedVmArtifact(EncodedBytes);
+	if (!Artifact || Artifact->build_id != *BuildId || Artifact->region_id != *RegionId ||
+		Artifact->artifact_hash != *ArtifactHash)
+		return materialError("dynamic artifact identity commitment mismatch");
+	std::array<uint8_t, 32> ArtifactKey{};
+	std::copy(DecodedKey.begin(), DecodedKey.end(), ArtifactKey.begin());
+	auto ClearArtifactKey = make_scope_exit([&] {
+		OPENSSL_cleanse(ArtifactKey.data(), ArtifactKey.size());
+	});
+	auto Decrypted = xovm::material::decryptEncryptedVmArtifact(*Artifact, ArtifactKey,
+		*BuildId, *RegionId, *ArtifactHash);
+	if (!Decrypted) return materialError("dynamic artifact decryption failed");
+	if (Error E = validateDynamicExecutionDescriptor(*Decrypted)) {
+		xovm::material::secureClear(*Decrypted);
+		return E;
+	}
+	xovm::material::secureClear(*Decrypted);
+	return Error::success();
+}
+
 bool sameStatIdentity(const struct stat& A, const struct stat& B) {
 	return A.st_dev == B.st_dev && A.st_ino == B.st_ino && A.st_size == B.st_size &&
 		A.st_mode == B.st_mode && A.st_uid == B.st_uid && A.st_nlink == B.st_nlink &&
@@ -748,6 +1073,90 @@ bool sameBundleContents(int RootFD, StringRef FinalName, StringRef SoftwareId,
 		::fstatat(RootFD, FinalName.str().c_str(), &Named, AT_SYMLINK_NOFOLLOW) == 0 &&
 		S_ISDIR(Named.st_mode) && Named.st_dev == Directory.st_dev &&
 		Named.st_ino == Directory.st_ino && sameStatIdentity(DirectoryAfter, Named);
+}
+
+Expected<std::string> readBundleMember(int DirectoryFD, StringRef Name, size_t Maximum) {
+	int FD = ::openat(DirectoryFD, Name.str().c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (FD < 0) return materialError("dynamic existing bundle member open failed");
+	auto Close = make_scope_exit([&] { ::close(FD); });
+	struct stat St{};
+	if (::fstat(FD, &St) != 0 || !S_ISREG(St.st_mode) || (St.st_mode & 0777u) != 0600u ||
+		St.st_uid != ::geteuid() || St.st_nlink != 1 || St.st_size < 0 ||
+		static_cast<uint64_t>(St.st_size) > Maximum)
+		return materialError("dynamic existing bundle member invalid");
+	std::string Bytes(static_cast<size_t>(St.st_size), '\0');
+	size_t Offset = 0;
+	while (Offset < Bytes.size()) {
+		ssize_t Count = ::read(FD, Bytes.data() + Offset, Bytes.size() - Offset);
+		if (Count < 0 && errno == EINTR) continue;
+		if (Count <= 0) return materialError("dynamic existing bundle member read failed");
+		Offset += static_cast<size_t>(Count);
+	}
+	char Extra;
+	if (::read(FD, &Extra, 1) != 0) return materialError("dynamic existing bundle member grew");
+	return Bytes;
+}
+
+Error rejectExistingDynamicConflicts(int RootFD, StringRef FinalName,
+		ArrayRef<std::pair<std::string, std::string>> Files) {
+	std::set<std::string> RegionNames;
+	std::set<std::string> RegionIds;
+	for (const auto& [Name, Bytes] : Files) {
+		if (Name != "public-manifest.json") continue;
+		auto Parsed = json::parse(Bytes);
+		if (!Parsed) return materialError("dynamic public manifest parse failed");
+		auto* Object = Parsed->getAsObject();
+		if (!Object || Object->getInteger("format_version") != 2 ||
+			Object->getString("material_source") != "dynamic_vm")
+			return materialError("dynamic public manifest schema invalid");
+		auto* Regions = Object->getArray("regions");
+		if (!Regions || Regions->empty()) return materialError("dynamic public manifest regions missing");
+		for (const json::Value& Value : *Regions) {
+			auto* Region = Value.getAsObject();
+			auto NameValue = Region ? Region->getString("region_name") : std::nullopt;
+			auto IdValue = Region ? Region->getString("region_id") : std::nullopt;
+			if (!NameValue || !IdValue || !validName(*NameValue) || !validHash(*IdValue))
+				return materialError("dynamic public manifest region identity invalid");
+			RegionNames.insert(NameValue->str());
+			RegionIds.insert(IdValue->str());
+		}
+	}
+	if (RegionNames.empty() || RegionIds.empty())
+		return materialError("dynamic public manifest identities missing");
+	DIR* RootDir = ::fdopendir(::dup(RootFD));
+	if (!RootDir) return materialError("dynamic export root enumeration failed");
+	auto CloseRootDir = make_scope_exit([&] { ::closedir(RootDir); });
+	while (dirent* Entry = ::readdir(RootDir)) {
+		StringRef ExistingName(Entry->d_name);
+		if (!ExistingName.ends_with(".dynamic") || ExistingName == FinalName) continue;
+		int ExistingFD = ::openat(RootFD, Entry->d_name,
+			O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+		if (ExistingFD < 0) return materialError("dynamic existing bundle open failed");
+		auto CloseExisting = make_scope_exit([&] { ::close(ExistingFD); });
+		struct stat St{};
+		if (::fstat(ExistingFD, &St) != 0 || !S_ISDIR(St.st_mode) ||
+			(St.st_mode & 0777u) != 0700u || St.st_uid != ::geteuid())
+			return materialError("dynamic existing bundle permissions invalid");
+		auto Manifest = readBundleMember(ExistingFD, "public-manifest.json", kMaxManifestBytes);
+		if (!Manifest) return Manifest.takeError();
+		auto Parsed = json::parse(*Manifest);
+		if (!Parsed) return materialError("dynamic existing public manifest parse failed");
+		auto* Object = Parsed->getAsObject();
+		auto* Regions = Object ? Object->getArray("regions") : nullptr;
+		if (!Object || Object->getInteger("format_version") != 2 ||
+			Object->getString("material_source") != "dynamic_vm" || !Regions)
+			return materialError("dynamic existing public manifest invalid");
+		for (const json::Value& Value : *Regions) {
+			auto* Region = Value.getAsObject();
+			auto NameValue = Region ? Region->getString("region_name") : std::nullopt;
+			auto IdValue = Region ? Region->getString("region_id") : std::nullopt;
+			if (!NameValue || !IdValue || !validName(*NameValue) || !validHash(*IdValue))
+				return materialError("dynamic existing public manifest region identity invalid");
+			if (RegionNames.count(NameValue->str()) || RegionIds.count(IdValue->str()))
+				return materialError("dynamic material region identity conflict");
+		}
+	}
+	return Error::success();
 }
 
 int renameNoReplace(int OldDir, const char* OldName, int NewDir, const char* NewName) {
@@ -876,6 +1285,75 @@ Expected<json::Object> llvm::exportCanonicalRegion(const BytecodeEmitter& Emitte
 	Core["region_id"] = frameHash("XOVM2/region-id", *IdentityBytes);
 	if (Error E = validateCanonicalRegion(Core)) return std::move(E);
 	return Core;
+}
+
+Expected<DynamicArtifactExport> llvm::exportDynamicArtifact(
+	const BytecodeEmitter& Emitter, const VMPassConfig& Config,
+	const VMOpcodeMap& Opcodes) {
+	if (!Config.usesCloudMaterial() || Config.cloudMaterial == CloudMaterialMode::Operation)
+		return materialError("dynamic artifact requires session or lease material mode");
+	if (!validName(Config.materialRegion) || Emitter.BC.empty() ||
+		Emitter.BC.size() > kMaxBytecodeBytes)
+		return materialError("dynamic artifact bounds invalid");
+
+	auto Canonical = exportCanonicalRegion(Emitter, Config, Opcodes);
+	if (!Canonical) return Canonical.takeError();
+	auto CanonicalRegionId = Canonical->getString("region_id");
+	if (!CanonicalRegionId) return materialError("dynamic canonical region identity missing");
+	auto CanonicalBytes = canonicalMaterialJSON(json::Value(std::move(*Canonical)),
+		MaterialCodecProfile::CanonicalRegion);
+	if (!CanonicalBytes) return CanonicalBytes.takeError();
+
+	xovm::material::ArtifactSource Source;
+	Source.build_id = dynamicHash("XOVM2/dynamic-build", *CanonicalBytes);
+	auto ParsedRegionId = parseDynamicHash(*CanonicalRegionId);
+	if (!ParsedRegionId) return materialError("dynamic canonical region identity invalid");
+	Source.region_id = *ParsedRegionId;
+	if (std::error_code EC = getRandomBytes(Source.artifact_key.data(),
+		Source.artifact_key.size()))
+		return materialError("dynamic artifact key generation failed");
+	Source.bytecode.assign(Emitter.BC.begin(), Emitter.BC.end());
+	auto ExecutionMaterial = buildDynamicExecutionMaterial(Emitter, Opcodes);
+	if (!ExecutionMaterial) return ExecutionMaterial.takeError();
+	xovm::material::HandlerShardDescriptor HandlerDescriptor;
+	HandlerDescriptor.shard_id = 1;
+	HandlerDescriptor.code_size = static_cast<uint32_t>(ExecutionMaterial->HandlerCode.size());
+	HandlerDescriptor.relocation_count = 0;
+	HandlerDescriptor.commitment =
+		xovm::material::hashAarch64ShardCode(ExecutionMaterial->HandlerCode);
+	Source.handler_shards = xovm::material::encodeHandlerShardPayload(
+		HandlerDescriptor, ExecutionMaterial->HandlerCode);
+	Source.continuation_descriptors =
+		encodeDynamicExecutionDescriptor(*ExecutionMaterial);
+	if (Source.handler_shards.empty() || Source.continuation_descriptors.empty())
+		return materialError("dynamic artifact v2 material encoding failed");
+
+	auto Artifact = xovm::material::buildEncryptedVmArtifact(Source);
+	if (!Artifact) return materialError("dynamic artifact encryption failed");
+	auto Encoded = xovm::material::encodeEncryptedVmArtifact(*Artifact);
+	if (Encoded.empty()) return materialError("dynamic artifact encoding failed");
+
+	DynamicArtifactExport Result;
+	Result.PublicManifest = json::Object{
+		{"format_version", 2},
+		{"material_source", "dynamic_vm"},
+		{"region_name", Config.materialRegion},
+		{"build_id", dynamicHashHex(Source.build_id)},
+		{"region_id", dynamicHashHex(Source.region_id)},
+		{"artifact_hash", dynamicHashHex(Artifact->artifact_hash)},
+		{"encrypted_artifact_b64", encodeBase64(Encoded)},
+		{"artifact_size", static_cast<unsigned>(Encoded.size())},
+	};
+	Result.PrivateRegistration = json::Object{
+		{"format_version", 2},
+		{"material_source", "dynamic_vm"},
+		{"region_name", Config.materialRegion},
+		{"build_id", dynamicHashHex(Source.build_id)},
+		{"region_id", dynamicHashHex(Source.region_id)},
+		{"artifact_hash", dynamicHashHex(Artifact->artifact_hash)},
+		{"artifact_key_b64", encodeBase64(ArrayRef<uint8_t>(Source.artifact_key))},
+	};
+	return Result;
 }
 
 #ifdef OBF_TEST_VM_IMPL
@@ -1085,4 +1563,131 @@ Expected<MaterialCommitResult> llvm::commitCanonicalRegions(StringRef ExportRoot
 	if (Token.Fault == MaterialExportFault::RootSync || ::fsync(RootFD) != 0)
 		return MaterialCommitResult{std::move(Path), MaterialCommitDurability::Unknown};
 	return MaterialCommitResult{std::move(Path), MaterialCommitDurability::Durable};
+}
+
+Expected<MaterialCommitResult> llvm::commitDynamicArtifacts(StringRef ExportRoot,
+	StringRef SoftwareId, ArrayRef<DynamicArtifactExport> Artifacts,
+	const MaterialCommitToken& Token) {
+	if (Token.Value != kCommitToken || !sys::path::is_absolute(ExportRoot) ||
+		!validId(SoftwareId) || Artifacts.empty() || Artifacts.size() > 4096)
+		return materialError("invalid dynamic material export request");
+	std::set<std::string> RegionNames;
+	std::set<std::string> RegionIds;
+	for (const DynamicArtifactExport& Artifact : Artifacts)
+		if (Error E = validateDynamicArtifactExport(Artifact)) return std::move(E);
+		else {
+			auto Name = Artifact.PublicManifest.getString("region_name");
+			auto Id = Artifact.PublicManifest.getString("region_id");
+			if (!Name || !Id || !RegionNames.insert(Name->str()).second ||
+				!RegionIds.insert(Id->str()).second)
+				return materialError("duplicate dynamic artifact region identity");
+		}
+	SmallString<256> RealRoot;
+	if (std::error_code EC = sys::fs::real_path(ExportRoot, RealRoot, true))
+		return materialError("dynamic material export root resolution failed");
+	if (RealRoot != ExportRoot) return materialError("dynamic material export root may not traverse symlinks");
+	struct stat RootStat{};
+	if (::lstat(ExportRoot.str().c_str(), &RootStat) != 0 || !S_ISDIR(RootStat.st_mode) ||
+		RootStat.st_uid != ::geteuid() || (RootStat.st_mode & 0077u) != 0)
+		return materialError("dynamic material export root permissions invalid");
+	int RootFD = ::open(ExportRoot.str().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (RootFD < 0) return materialError("dynamic material export root open failed");
+	auto CloseRoot = make_scope_exit([&] { ::close(RootFD); });
+	struct stat OpenedRootStat{};
+	if (::fstat(RootFD, &OpenedRootStat) != 0 ||
+		!sameStatIdentity(RootStat, OpenedRootStat))
+		return materialError("dynamic material export root changed during validation");
+	auto LockOr = lockMaterialRoot(RootFD);
+	if (!LockOr) return LockOr.takeError();
+	int LockFD = *LockOr;
+	auto CloseLock = make_scope_exit([&] { ::close(LockFD); });
+
+	json::Array PublicRegions;
+	json::Array PrivateRegions;
+	for (const DynamicArtifactExport& Artifact : Artifacts) {
+		json::Object Public = Artifact.PublicManifest;
+		json::Object Private = Artifact.PrivateRegistration;
+		PublicRegions.push_back(json::Value(std::move(Public)));
+		PrivateRegions.push_back(json::Value(std::move(Private)));
+	}
+	json::Object PublicBundle{{"format_version", 2}, {"material_source", "dynamic_vm"},
+		{"regions", std::move(PublicRegions)}};
+	json::Object PrivateBundle{{"format_version", 2}, {"material_source", "dynamic_vm"},
+		{"regions", std::move(PrivateRegions)}};
+	auto PublicBytes = objectBytes(PublicBundle, MaterialCodecProfile::PublicManifest);
+	if (!PublicBytes) return PublicBytes.takeError();
+	auto PrivateBytes = objectBytes(PrivateBundle, MaterialCodecProfile::PrivateRegistration);
+	if (!PrivateBytes) return PrivateBytes.takeError();
+	SmallVector<std::pair<std::string, std::string>, 3> Files;
+	Files.push_back({"software-id", SoftwareId.str()});
+	std::string ModuleInput = "xovm-dynamic-private-v1|software=" + SoftwareId.str();
+	ModuleInput += "|public|" + hashBytes(*PublicBytes) + "|private|" + hashBytes(*PrivateBytes);
+	Files.push_back({"public-manifest.json", std::move(*PublicBytes)});
+	Files.push_back({"registration.private.json", std::move(*PrivateBytes)});
+	std::string FinalName = hashBytes(ModuleInput) + ".dynamic";
+	if (Error E = rejectExistingDynamicConflicts(RootFD, FinalName, Files))
+		return std::move(E);
+	std::array<uint8_t, 16> Random{};
+	if (std::error_code EC = getRandomBytes(Random.data(), Random.size()))
+		return materialError("dynamic material staging randomness unavailable");
+	std::string StageName = ".staging-dynamic-" + toHex(ArrayRef<uint8_t>(Random), true);
+	if (::mkdirat(RootFD, StageName.c_str(), 0700) != 0)
+		return materialError("dynamic material staging directory creation failed");
+	SmallString<256> StagePath(ExportRoot); sys::path::append(StagePath, StageName);
+	bool Published = false;
+	auto Cleanup = make_scope_exit([&] { if (!Published) sys::fs::remove_directories(StagePath); });
+	int StageFD = ::openat(RootFD, StageName.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (StageFD < 0) return materialError("dynamic material staging directory open failed");
+	auto CloseStage = make_scope_exit([&] { ::close(StageFD); });
+	if (::fchmod(StageFD, 0700) != 0)
+		return materialError("dynamic material staging directory permissions failed");
+	for (const auto& [Name, Bytes] : Files) {
+		if (Token.Fault == MaterialExportFault::Create)
+			return materialError("dynamic material file creation failed");
+		int FD = ::openat(StageFD, Name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+		if (FD < 0) return materialError("dynamic material file creation failed");
+		if (::fchmod(FD, 0600) != 0) {
+			::close(FD);
+			return materialError("dynamic material file permissions failed");
+		}
+		if (Error E = writeAll(FD, Bytes, Token.Fault)) { ::close(FD); return E; }
+		if (::close(FD) != 0 || Token.Fault == MaterialExportFault::Close)
+			return materialError("dynamic material file close failed");
+	}
+	if (!sameBundleContents(RootFD, StageName, SoftwareId, ArrayRef(Files).drop_front()))
+		return materialError("dynamic material staging validation failed");
+	if (Token.Fault == MaterialExportFault::DirectorySync || ::fsync(StageFD) != 0)
+		return materialError("dynamic material staging directory fsync failed");
+	if (!lockStillNamed(RootFD, LockFD) || ::fsync(RootFD) != 0)
+		return materialError("dynamic material staging sync failed");
+	if (Token.Fault == MaterialExportFault::Rename) {
+		errno = EIO;
+		return materialError("dynamic material publish rename failed");
+	}
+	if (renameNoReplace(RootFD, StageName.c_str(), RootFD, FinalName.c_str()) != 0) {
+		if (errno != EEXIST || !sameBundleContents(RootFD, FinalName, SoftwareId,
+			ArrayRef(Files).drop_front(), Token.Fault))
+			return materialError("dynamic material publish conflict");
+		if (!lockStillNamed(RootFD, LockFD) || ::fsync(RootFD) != 0)
+			return MaterialCommitResult{(Twine(ExportRoot) + "/" + FinalName).str(),
+				MaterialCommitDurability::Unknown, MaterialCommitIntegrity::Unknown};
+		return MaterialCommitResult{(Twine(ExportRoot) + "/" + FinalName).str(),
+			MaterialCommitDurability::Durable};
+	}
+	Published = true;
+	struct stat FinalStat{}, StageStat{};
+	if (::fstat(StageFD, &StageStat) != 0 ||
+		::fstatat(RootFD, StageName.c_str(), &FinalStat, AT_SYMLINK_NOFOLLOW) == 0 ||
+		errno != ENOENT || ::fstatat(RootFD, FinalName.c_str(), &FinalStat,
+			AT_SYMLINK_NOFOLLOW) != 0 || FinalStat.st_dev != StageStat.st_dev ||
+		FinalStat.st_ino != StageStat.st_ino ||
+		!sameBundleContents(RootFD, FinalName, SoftwareId, ArrayRef(Files).drop_front()) ||
+		!lockStillNamed(RootFD, LockFD))
+		return MaterialCommitResult{(Twine(ExportRoot) + "/" + FinalName).str(),
+			MaterialCommitDurability::Unknown, MaterialCommitIntegrity::Unknown};
+	if (Token.Fault == MaterialExportFault::RootSync || ::fsync(RootFD) != 0)
+		return MaterialCommitResult{(Twine(ExportRoot) + "/" + FinalName).str(),
+			MaterialCommitDurability::Unknown, MaterialCommitIntegrity::Unknown};
+	return MaterialCommitResult{(Twine(ExportRoot) + "/" + FinalName).str(),
+		MaterialCommitDurability::Durable};
 }

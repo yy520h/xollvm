@@ -12,6 +12,8 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Requirements.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Plan.h"
 #include "llvm/Transforms/Obfuscator/SensitiveDecision.h"
@@ -1292,6 +1294,53 @@ TEST(VMCloudMaterial, DirectEmissionIsGuardedBeforeLegacyGlobals) {
 	EXPECT_FALSE(Impl.Committed);
 	EXPECT_TRUE(Impl.E.getRequirements().NeedsConstStream);
 	expectMaterialFatal([&] { Impl.commit(); }, "cloud material emission not implemented");
+}
+
+TEST(VMCloudMaterial, CoordinatorPreparesAndPromotesDynamicArtifactWithoutLegacyEmission) {
+	LLVMContext C; SMDiagnostic D;
+	auto M = parseAssemblyString("target triple = \"aarch64-unknown-linux-android26\"\n"
+		"define i32 @f() { ret i32 7 }", D, C);
+	ASSERT_NE(M, nullptr) << D.getMessage().str();
+	auto Config = materialConfig("cloudMaterial=lease,materialRegion=auth");
+	obf::Rng R(42);
+	auto Impl = std::make_unique<VMImpl>(*M->getFunction("f"), Config, R, 42);
+	ASSERT_TRUE(Impl->prepare()) << Impl->FailReason;
+	VMImpl* Raw = Impl.get();
+	auto Key = EngineConfigKey::fromConfig(Config, 0, Raw->EngineId, 42, &Raw->AntiDebug);
+	VMPlanCoordinator Coordinator;
+	auto* Candidate = Coordinator.addPrepared(std::move(Impl), Config, Key);
+	ASSERT_NE(Candidate, nullptr);
+	EXPECT_TRUE(M->global_empty());
+	EXPECT_FALSE(Raw->Committed);
+	EXPECT_TRUE(Raw->Prepared);
+	EXPECT_FALSE(M->getFunction("f")->empty());
+
+	if (Error E = Coordinator.prepareMaterialExports())
+		FAIL() << toString(std::move(E));
+	ASSERT_TRUE(Candidate->DynamicArtifact.has_value());
+	const auto& Public = Candidate->DynamicArtifact->PublicManifest;
+	const auto& Private = Candidate->DynamicArtifact->PrivateRegistration;
+	EXPECT_EQ(Public.getInteger("format_version"), 2);
+	EXPECT_EQ(Public.getString("material_source"), "dynamic_vm");
+	EXPECT_TRUE(Public.getString("encrypted_artifact_b64").has_value());
+	EXPECT_EQ(Public.getString("artifact_key_b64"), std::nullopt);
+	EXPECT_TRUE(Private.getString("artifact_key_b64").has_value());
+	EXPECT_FALSE(Raw->Committed);
+	EXPECT_TRUE(M->global_empty());
+
+	SmallString<256> Root;
+	ASSERT_FALSE(sys::fs::createUniqueDirectory("xovm-plan-material-test", Root));
+	auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+	auto Result = Coordinator.promotePreparedDynamicArtifacts(Root, "test.app",
+		MaterialCommitToken::forExportOnlyTest());
+	ASSERT_TRUE(static_cast<bool>(Result)) << toString(Result.takeError());
+	EXPECT_TRUE(StringRef(Result->Path).ends_with(".dynamic"));
+	EXPECT_TRUE(sys::fs::exists(Result->Path + "/public-manifest.json"));
+	EXPECT_TRUE(sys::fs::exists(Result->Path + "/registration.private.json"));
+	EXPECT_FALSE(Raw->Committed);
+	EXPECT_TRUE(M->global_empty());
+	EXPECT_EQ(M->getFunction("__vm_engine"), nullptr);
+	EXPECT_FALSE(M->getFunction("f")->empty());
 }
 
 TEST(VMCallVariants, IncrementalTypesReachEveryVariant) {

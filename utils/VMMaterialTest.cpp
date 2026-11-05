@@ -1,4 +1,7 @@
 #include "llvm/Transforms/Obfuscator/VMPass_Material.h"
+#include "runtime/cloud_material/dynamic_vm_artifact.h"
+#include "runtime/cloud_material/dynamic_vm_schema.h"
+#include "runtime/cloud_material/dynamic_vm_shard.h"
 #ifdef XOLLVM_MATERIAL_PACKAGE_TEST_BRIDGE
 #include "runtime/cloud_material/material_package.h"
 #endif
@@ -39,6 +42,14 @@ struct ExportFixture {
 	VMPassConfig Config;
 };
 
+static void swapLoadAndReturnOpcodes(VMOpcodeMap& Opcodes) {
+	uint8_t Saved = Opcodes.L2P[OP_LOADI];
+	Opcodes.L2P[OP_LOADI] = Opcodes.L2P[OP_RET_INT];
+	Opcodes.L2P[OP_RET_INT] = Saved;
+	for (unsigned I = 0; I < OP_COUNT; ++I)
+		Opcodes.P2L[Opcodes.L2P[I]] = static_cast<uint8_t>(I);
+}
+
 static ExportFixture makeFixture(StringRef Region = "auth/payment", int Constant = 7) {
 	ExportFixture F;
 	F.Context = std::make_unique<LLVMContext>();
@@ -63,11 +74,7 @@ other:
 	IR.replace(Pos, 5, std::to_string(Constant));
 	F.M = parseAssemblyString(IR, Diagnostic, *F.Context);
 	EXPECT_NE(F.M, nullptr);
-	uint8_t Saved = F.Opcodes.L2P[OP_LOADI];
-	F.Opcodes.L2P[OP_LOADI] = F.Opcodes.L2P[OP_RET_INT];
-	F.Opcodes.L2P[OP_RET_INT] = Saved;
-	for (unsigned I = 0; I < OP_COUNT; ++I)
-		F.Opcodes.P2L[F.Opcodes.L2P[I]] = static_cast<uint8_t>(I);
+	swapLoadAndReturnOpcodes(F.Opcodes);
 	F.Emitter.setOpcodeMap(&F.Opcodes);
 	F.Emitter.setTargetBlind(0x12345678u, true);
 	F.Emitter.setConstInStream(true);
@@ -79,10 +86,88 @@ other:
 	return F;
 }
 
+static ExportFixture makeDynamicFixture(StringRef Region = "auth/payment", int Constant = 7,
+	uint8_t DecodeSalt = 0x2a, bool KeyedDispatch = false, bool ShuffledLayout = false,
+	bool I64Argument = false) {
+	ExportFixture F;
+	F.Context = std::make_unique<LLVMContext>();
+	SMDiagnostic Diagnostic;
+	std::string IR = I64Argument
+		? "target triple = \"aarch64-linux-android26\"\n"
+		  "define i32 @target(i64 %unused) { ret i32 CONST }\n"
+		: "target triple = \"aarch64-linux-android26\"\n"
+		  "define i32 @target() { ret i32 CONST }\n";
+	size_t Pos = IR.find("CONST");
+	IR.replace(Pos, 5, std::to_string(Constant));
+	F.M = parseAssemblyString(IR, Diagnostic, *F.Context);
+	EXPECT_NE(F.M, nullptr);
+	swapLoadAndReturnOpcodes(F.Opcodes);
+	F.Emitter.setOpcodeMap(&F.Opcodes);
+	F.Emitter.setConstInStream(true);
+	if (KeyedDispatch) F.Emitter.setKeyedDispatch(0x12345678u, true);
+	if (ShuffledLayout) F.Emitter.setLayout(VMInstructionLayout::forSeed(42));
+	EXPECT_TRUE(F.Emitter.run(*F.M->getFunction("target"), DecodeSalt,
+		F.M->getDataLayout()));
+	F.Config.cloudMaterial = CloudMaterialMode::Lease;
+	F.Config.materialRegion = Region.str();
+	F.Config.constInStream = true;
+	return F;
+}
+
 static std::string temporaryRoot() {
 	SmallString<256> Root;
 	EXPECT_FALSE(sys::fs::createUniqueDirectory("xovm-material-test", Root));
 	return Root.str().str();
+}
+
+static std::optional<xovm::material::DynamicHash> parseDynamicHash(StringRef Text) {
+	if (Text.size() != 64) return std::nullopt;
+	auto HexValue = [](char C) -> int {
+		if (C >= '0' && C <= '9') return C - '0';
+		if (C >= 'a' && C <= 'f') return C - 'a' + 10;
+		return -1;
+	};
+	xovm::material::DynamicHash Result{};
+	for (size_t I = 0; I < Result.size(); ++I) {
+		int High = HexValue(Text[I * 2]);
+		int Low = HexValue(Text[I * 2 + 1]);
+		if (High < 0 || Low < 0) return std::nullopt;
+		Result[I] = static_cast<uint8_t>((High << 4) | Low);
+	}
+	return Result;
+}
+
+static std::optional<xovm::material::DecryptedVmArtifact> decryptDynamicExport(
+	const DynamicArtifactExport& Export) {
+	auto Ciphertext = Export.PublicManifest.getString("encrypted_artifact_b64");
+	auto KeyText = Export.PrivateRegistration.getString("artifact_key_b64");
+	auto BuildText = Export.PublicManifest.getString("build_id");
+	auto RegionText = Export.PublicManifest.getString("region_id");
+	auto ArtifactText = Export.PublicManifest.getString("artifact_hash");
+	if (!Ciphertext || !KeyText || !BuildText || !RegionText || !ArtifactText)
+		return std::nullopt;
+	std::vector<char> Encoded;
+	std::vector<char> KeyBytes;
+	if (Error E = decodeBase64(*Ciphertext, Encoded)) {
+		consumeError(std::move(E));
+		return std::nullopt;
+	}
+	if (Error E = decodeBase64(*KeyText, KeyBytes)) {
+		consumeError(std::move(E));
+		return std::nullopt;
+	}
+	if (KeyBytes.size() != 32) return std::nullopt;
+	auto Build = parseDynamicHash(*BuildText);
+	auto Region = parseDynamicHash(*RegionText);
+	auto ArtifactHash = parseDynamicHash(*ArtifactText);
+	if (!Build || !Region || !ArtifactHash) return std::nullopt;
+	auto Artifact = xovm::material::decodeEncryptedVmArtifact(ArrayRef<uint8_t>(
+		reinterpret_cast<const uint8_t*>(Encoded.data()), Encoded.size()));
+	if (!Artifact) return std::nullopt;
+	std::array<uint8_t, 32> Key{};
+	std::copy(KeyBytes.begin(), KeyBytes.end(), Key.begin());
+	return xovm::material::decryptEncryptedVmArtifact(*Artifact, Key,
+		*Build, *Region, *ArtifactHash);
 }
 
 static const json::Array& arrayField(const json::Object& Object, StringRef Name) {
@@ -185,6 +270,360 @@ TEST(VMMaterial, ExportsEmitterRecordsAfterConstPrologue) {
 		MaterialCodecProfile::CanonicalRegion);
 	ASSERT_TRUE(static_cast<bool>(Bytes)) << toString(Bytes.takeError());
 	EXPECT_FALSE(Bytes->empty());
+}
+
+TEST(VMMaterial, DynamicArtifactExportSealsCanonicalV2ExecutionMaterial) {
+	using namespace xovm::material;
+	auto Fixture = makeDynamicFixture();
+	const auto Records = Fixture.Emitter.getInstructionRecords();
+	ASSERT_EQ(Records.size(), 2u);
+	EXPECT_EQ(Records[0], std::make_pair(0u, OP_LOADI));
+	EXPECT_EQ(Records[1], std::make_pair(6u, OP_RET_INT));
+	auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+	const json::Object& Public = Export->PublicManifest;
+	const json::Object& Private = Export->PrivateRegistration;
+	ASSERT_EQ(Public.getInteger("format_version"), 2);
+	ASSERT_EQ(Public.getString("material_source"), "dynamic_vm");
+	EXPECT_TRUE(Public.getString("artifact_hash").has_value());
+	EXPECT_TRUE(Public.getString("encrypted_artifact_b64").has_value());
+	EXPECT_EQ(Public.getString("artifact_key_b64"), std::nullopt);
+	EXPECT_FALSE(Public.getString("canonical_bc").has_value());
+	EXPECT_EQ(Public.getArray("decode_map"), nullptr);
+	EXPECT_TRUE(Private.getString("artifact_key_b64").has_value());
+	EXPECT_FALSE(Private.getString("canonical_bc").has_value());
+	EXPECT_EQ(Private.getArray("decode_map"), nullptr);
+	EXPECT_NE(*Public.getString("encrypted_artifact_b64"),
+		encodeBase64(Fixture.Emitter.BC));
+	EXPECT_EQ(Public.getString("encrypted_artifact_b64")->find("XOVM-DYNAMIC"),
+		StringRef::npos);
+
+	auto Decrypted = decryptDynamicExport(*Export);
+	ASSERT_TRUE(Decrypted.has_value());
+	EXPECT_EQ(Decrypted->bytecode,
+		std::vector<uint8_t>(Fixture.Emitter.BC.begin(), Fixture.Emitter.BC.end()));
+	ASSERT_GT(Decrypted->continuation_descriptors.size(),
+		kDynamicVmExecutionAbiV2EncodedSize);
+	auto Descriptor = ArrayRef<uint8_t>(Decrypted->continuation_descriptors);
+	auto Abi = decodeDynamicVmExecutionAbiV2(
+		Descriptor.take_front(kDynamicVmExecutionAbiV2EncodedSize));
+	auto Graph = decodeContinuationGraphV2(
+		Descriptor.drop_front(kDynamicVmExecutionAbiV2EncodedSize));
+	auto HandlerPayload = decodeHandlerShardPayload(Decrypted->handler_shards);
+	ASSERT_TRUE(Abi.has_value());
+	ASSERT_TRUE(Graph.has_value());
+	ASSERT_TRUE(HandlerPayload.has_value());
+	EXPECT_EQ(Abi->i32_register_count, Fixture.Emitter.NVR);
+	EXPECT_EQ(Abi->i64_register_count, Fixture.Emitter.NVR64);
+	EXPECT_EQ(Abi->pointer_register_count, Fixture.Emitter.NPR);
+	EXPECT_EQ(Abi->f64_register_count, Fixture.Emitter.NFR);
+	EXPECT_EQ(Abi->decode_salt, Fixture.Emitter.getDecodeSalt());
+	EXPECT_EQ(Abi->loadi32_opcode, Fixture.Opcodes.encode(OP_LOADI));
+	EXPECT_EQ(Abi->return_i32_opcode, Fixture.Opcodes.encode(OP_RET_INT));
+	EXPECT_EQ(Abi->loadi32_destination_offset,
+		Fixture.Emitter.getLayout().offset(OP_LOADI, VMFieldRole::Dst));
+	EXPECT_EQ(Abi->loadi32_immediate_offset,
+		Fixture.Emitter.getLayout().offset(OP_LOADI, VMFieldRole::Immediate));
+	EXPECT_EQ(Abi->return_i32_source_offset,
+		Fixture.Emitter.getLayout().offset(OP_RET_INT, VMFieldRole::SrcA));
+	ASSERT_EQ(Graph->nodes.size(), 2u);
+	EXPECT_EQ(Graph->nodes[0].semantic, ContinuationNodeSemanticV2::LoadI32);
+	EXPECT_EQ(Graph->nodes[0].status, ContinuationNodeStatusV2::Continue);
+	EXPECT_EQ(Graph->nodes[0].next_node_id, Graph->nodes[1].node_id);
+	EXPECT_EQ(Graph->nodes[1].semantic, ContinuationNodeSemanticV2::ReturnI32);
+	EXPECT_EQ(Graph->nodes[1].status, ContinuationNodeStatusV2::Return);
+	EXPECT_EQ(Graph->nodes[1].next_node_id, 0u);
+	EXPECT_EQ(Graph->nodes[0].register_index, Graph->nodes[1].register_index);
+	EXPECT_EQ(static_cast<uint8_t>(Decrypted->bytecode[
+		Abi->loadi32_destination_offset] ^ Abi->decode_salt),
+		Graph->nodes[0].register_index);
+	EXPECT_EQ(static_cast<uint8_t>(Decrypted->bytecode[Records[1].first +
+		Abi->return_i32_source_offset] ^ Abi->decode_salt),
+		Graph->nodes[1].register_index);
+	EXPECT_EQ(validateContinuationGraphV2(*Abi, *Graph, Decrypted->bytecode,
+		HandlerPayload->code), DynamicVmSchemaStatusV2::Valid);
+	secureClear(*Decrypted);
+}
+
+TEST(VMMaterial, DynamicArtifactUsesCanonicalRegionIdentity) {
+	auto Fixture = makeDynamicFixture();
+	auto Canonical = exportCanonicalRegion(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(Canonical)) << toString(Canonical.takeError());
+	auto Dynamic = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(Dynamic)) << toString(Dynamic.takeError());
+	EXPECT_EQ(Dynamic->PublicManifest.getString("region_id"),
+		Canonical->getString("region_id"));
+}
+
+TEST(VMMaterial, DynamicArtifactFailsClosedOutsideExactCompilerSubset) {
+	auto ExpectRejected = [](ExportFixture&& Fixture) {
+		auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+		if (Export) return false;
+		consumeError(Export.takeError());
+		return true;
+	};
+	EXPECT_TRUE(ExpectRejected(makeFixture()));
+	EXPECT_TRUE(ExpectRejected(makeDynamicFixture("keyed", 7, 0x2a, true)));
+	EXPECT_TRUE(ExpectRejected(makeDynamicFixture("layout", 7, 0x2a, false, true)));
+	EXPECT_TRUE(ExpectRejected(makeDynamicFixture("i64", 7, 0x2a, false, false, true)));
+
+	auto Mismatched = makeDynamicFixture("mismatched");
+	const uint32_t ReturnIP = Mismatched.Emitter.getInstructionRecords()[1].first;
+	const unsigned ReturnRegister = Mismatched.Emitter.getLayout().offset(
+		OP_RET_INT, VMFieldRole::SrcA);
+	Mismatched.Emitter.BC[ReturnIP + ReturnRegister] ^= 1;
+	EXPECT_TRUE(ExpectRejected(std::move(Mismatched)));
+
+	auto OutOfRange = makeDynamicFixture("out-of-range");
+	const uint8_t EncodedOutOfRange =
+		OutOfRange.Emitter.NVR ^ OutOfRange.Emitter.getDecodeSalt();
+	const unsigned LoadRegister = OutOfRange.Emitter.getLayout().offset(
+		OP_LOADI, VMFieldRole::Dst);
+	const uint32_t OutOfRangeReturnIP = OutOfRange.Emitter.getInstructionRecords()[1].first;
+	const unsigned OutOfRangeReturnRegister = OutOfRange.Emitter.getLayout().offset(
+		OP_RET_INT, VMFieldRole::SrcA);
+	OutOfRange.Emitter.BC[LoadRegister] = EncodedOutOfRange;
+	OutOfRange.Emitter.BC[OutOfRangeReturnIP + OutOfRangeReturnRegister] =
+		EncodedOutOfRange;
+	EXPECT_TRUE(ExpectRejected(std::move(OutOfRange)));
+}
+
+TEST(VMMaterial, DynamicCommitRejectsAuthenticatedHandlerSemanticMismatch) {
+	using namespace xovm::material;
+	auto Fixture = makeDynamicFixture();
+	auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+	auto Decrypted = decryptDynamicExport(*Export);
+	ASSERT_TRUE(Decrypted.has_value());
+	auto Descriptor = ArrayRef<uint8_t>(Decrypted->continuation_descriptors);
+	auto Abi = decodeDynamicVmExecutionAbiV2(
+		Descriptor.take_front(kDynamicVmExecutionAbiV2EncodedSize));
+	auto Graph = decodeContinuationGraphV2(
+		Descriptor.drop_front(kDynamicVmExecutionAbiV2EncodedSize));
+	auto Payload = decodeHandlerShardPayload(Decrypted->handler_shards);
+	ASSERT_TRUE(Abi.has_value());
+	ASSERT_TRUE(Graph.has_value());
+	ASSERT_TRUE(Payload.has_value());
+	ASSERT_EQ(Graph->nodes.size(), 2u);
+
+	auto& LoadNode = Graph->nodes[0];
+	auto& ReturnNode = Graph->nodes[1];
+	auto WrongLoad = buildAarch64LoadImmediateShard(LoadNode.register_index, 9,
+		ReturnNode.bytecode_offset);
+	ASSERT_TRUE(WrongLoad.has_value());
+	ASSERT_EQ(WrongLoad->size(), LoadNode.shard_size);
+	std::copy(WrongLoad->begin(), WrongLoad->end(),
+		Payload->code.begin() + LoadNode.shard_offset);
+	LoadNode.handler_shard_commitment = hashDynamicVmHandlerShardV2(*WrongLoad);
+	auto LoadTail = hashDynamicVmTransitionTailV2(LoadNode);
+	ASSERT_TRUE(LoadTail.has_value());
+	LoadNode.transition_tail_commitment = *LoadTail;
+	auto GraphHash = hashDynamicVmContinuationGraphV2(*Graph);
+	ASSERT_TRUE(GraphHash.has_value());
+	Graph->descriptor.graph_commitment = *GraphHash;
+	EXPECT_EQ(validateContinuationGraphV2(*Abi, *Graph, Decrypted->bytecode,
+		Payload->code), DynamicVmSchemaStatusV2::Valid);
+
+	auto AbiBytes = encodeDynamicVmExecutionAbiV2(*Abi);
+	auto GraphBytes = encodeContinuationGraphV2(*Graph);
+	ASSERT_FALSE(AbiBytes.empty());
+	ASSERT_FALSE(GraphBytes.empty());
+	AbiBytes.insert(AbiBytes.end(), GraphBytes.begin(), GraphBytes.end());
+	Payload->descriptor.commitment = hashAarch64ShardCode(Payload->code);
+	auto HandlerBytes = encodeHandlerShardPayload(Payload->descriptor, Payload->code);
+	ASSERT_FALSE(HandlerBytes.empty());
+
+	auto Build = parseDynamicHash(*Export->PublicManifest.getString("build_id"));
+	auto Region = parseDynamicHash(*Export->PublicManifest.getString("region_id"));
+	ASSERT_TRUE(Build.has_value());
+	ASSERT_TRUE(Region.has_value());
+	std::vector<char> DecodedKey;
+	ASSERT_FALSE(decodeBase64(*Export->PrivateRegistration.getString("artifact_key_b64"),
+		DecodedKey));
+	ASSERT_EQ(DecodedKey.size(), 32u);
+	ArtifactSource Source;
+	Source.build_id = *Build;
+	Source.region_id = *Region;
+	std::copy(DecodedKey.begin(), DecodedKey.end(), Source.artifact_key.begin());
+	Source.bytecode = Decrypted->bytecode;
+	Source.handler_shards = std::move(HandlerBytes);
+	Source.continuation_descriptors = std::move(AbiBytes);
+	// The artifact boundary independently binds exact native semantics to the
+	// authenticated bytecode operands, so a self-consistent graph/code mutation
+	// is rejected before encryption or publication.
+	auto Rebuilt = buildEncryptedVmArtifact(Source);
+	EXPECT_FALSE(Rebuilt.has_value());
+	secureClear(*Decrypted);
+}
+
+TEST(VMMaterial, DynamicArtifactCommitPublishesSeparatePublicAndPrivateFiles) {
+	std::string Root = temporaryRoot();
+	auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+	auto Fixture = makeDynamicFixture();
+	auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+	SmallVector<DynamicArtifactExport, 1> Artifacts;
+	Artifacts.push_back(std::move(*Export));
+	auto First = commitDynamicArtifacts(Root, "test.app", Artifacts,
+		MaterialCommitToken::forExportOnlyTest());
+	ASSERT_TRUE(static_cast<bool>(First)) << toString(First.takeError());
+	EXPECT_TRUE(StringRef(First->Path).ends_with(".dynamic"));
+	EXPECT_TRUE(sys::fs::exists(First->Path + "/public-manifest.json"));
+	EXPECT_TRUE(sys::fs::exists(First->Path + "/registration.private.json"));
+	auto Again = commitDynamicArtifacts(Root, "test.app", Artifacts,
+		MaterialCommitToken::forExportOnlyTest());
+	ASSERT_TRUE(static_cast<bool>(Again)) << toString(Again.takeError());
+	EXPECT_EQ(Again->Path, First->Path);
+}
+
+TEST(VMMaterial, DynamicArtifactCommitAggregatesMultipleRegions) {
+	std::string Root = temporaryRoot();
+	auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+	SmallVector<DynamicArtifactExport, 2> Artifacts;
+	for (StringRef Region : {"auth/payment", "auth/profile"}) {
+		auto Fixture = makeDynamicFixture(Region);
+		auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+		ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+		Artifacts.push_back(std::move(*Export));
+	}
+	auto Result = commitDynamicArtifacts(Root, "test.app", Artifacts,
+		MaterialCommitToken::forExportOnlyTest());
+	ASSERT_TRUE(static_cast<bool>(Result)) << toString(Result.takeError());
+	EXPECT_TRUE(sys::fs::exists(Result->Path + "/public-manifest.json"));
+	EXPECT_TRUE(sys::fs::exists(Result->Path + "/registration.private.json"));
+}
+
+TEST(VMMaterial, FailedDynamicCommitNeverPublishesBundle) {
+	for (MaterialExportFault Fault : {MaterialExportFault::Create,
+		MaterialExportFault::Write, MaterialExportFault::FileSync,
+		MaterialExportFault::Close, MaterialExportFault::DirectorySync,
+		MaterialExportFault::Rename}) {
+		std::string Root = temporaryRoot();
+		auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+		auto Fixture = makeDynamicFixture();
+		auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+		ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+		SmallVector<DynamicArtifactExport, 1> Artifacts;
+		Artifacts.push_back(std::move(*Export));
+		auto Result = commitDynamicArtifacts(Root, "test.app", Artifacts,
+			MaterialCommitToken::forExportOnlyTest(Fault));
+		ASSERT_FALSE(static_cast<bool>(Result));
+		consumeError(Result.takeError());
+		std::error_code EC;
+		sys::fs::directory_iterator It(Root, EC), End;
+		ASSERT_FALSE(EC);
+		if (It != End) {
+			EXPECT_TRUE(StringRef(It->path()).ends_with(".xovm-publish.lock"));
+			It.increment(EC);
+		}
+		EXPECT_EQ(It, End);
+	}
+}
+
+TEST(VMMaterial, DynamicParentSyncFailureReportsUnknownDurability) {
+	std::string Root = temporaryRoot();
+	auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+	auto Fixture = makeDynamicFixture();
+	auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+	SmallVector<DynamicArtifactExport, 1> Artifacts;
+	Artifacts.push_back(std::move(*Export));
+	auto Result = commitDynamicArtifacts(Root, "test.app", Artifacts,
+		MaterialCommitToken::forExportOnlyTest(MaterialExportFault::RootSync));
+	ASSERT_TRUE(static_cast<bool>(Result)) << toString(Result.takeError());
+	EXPECT_EQ(Result->Durability, MaterialCommitDurability::Unknown);
+	struct stat St {};
+	EXPECT_EQ(::stat(Result->Path.c_str(), &St), 0);
+}
+
+TEST(VMMaterial, DynamicCommitRejectsMismatchedOrMalformedRegistration) {
+	for (unsigned Case : {0u, 1u, 2u}) {
+		std::string Root = temporaryRoot();
+		auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+		auto Fixture = makeDynamicFixture();
+		auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+		ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+		if (Case == 0)
+			Export->PrivateRegistration["artifact_hash"] = std::string(64, '0');
+		else if (Case == 1)
+			Export->PublicManifest["artifact_size"] = 1;
+		else
+			Export->PublicManifest.erase("encrypted_artifact_b64");
+		SmallVector<DynamicArtifactExport, 1> Artifacts;
+		Artifacts.push_back(std::move(*Export));
+		auto Result = commitDynamicArtifacts(Root, "test.app", Artifacts,
+			MaterialCommitToken::forExportOnlyTest());
+		ASSERT_FALSE(static_cast<bool>(Result)) << Case;
+		consumeError(Result.takeError());
+	}
+}
+
+TEST(VMMaterial, DynamicCommitRejectsDuplicateRegionIdentity) {
+	std::string Root = temporaryRoot();
+	auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+	auto Fixture = makeDynamicFixture();
+	auto First = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(First)) << toString(First.takeError());
+	auto Second = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(Second)) << toString(Second.takeError());
+	SmallVector<DynamicArtifactExport, 2> Artifacts;
+	Artifacts.push_back(std::move(*First));
+	Artifacts.push_back(std::move(*Second));
+	auto Result = commitDynamicArtifacts(Root, "test.app", Artifacts,
+		MaterialCommitToken::forExportOnlyTest());
+	ASSERT_FALSE(static_cast<bool>(Result));
+	consumeError(Result.takeError());
+}
+
+TEST(VMMaterial, DynamicCommitRejectsCrossBundleRegionConflict) {
+	std::string Root = temporaryRoot();
+	auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+	auto FirstFixture = makeDynamicFixture("auth/payment", 7);
+	auto FirstExport = exportDynamicArtifact(FirstFixture.Emitter, FirstFixture.Config,
+		FirstFixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(FirstExport)) << toString(FirstExport.takeError());
+	SmallVector<DynamicArtifactExport, 1> FirstArtifacts;
+	FirstArtifacts.push_back(std::move(*FirstExport));
+	ASSERT_TRUE(static_cast<bool>(commitDynamicArtifacts(Root, "test.app", FirstArtifacts,
+		MaterialCommitToken::forExportOnlyTest())));
+	auto SecondFixture = makeDynamicFixture("auth/payment", 9);
+	auto SecondExport = exportDynamicArtifact(SecondFixture.Emitter, SecondFixture.Config,
+		SecondFixture.Opcodes);
+	ASSERT_TRUE(static_cast<bool>(SecondExport)) << toString(SecondExport.takeError());
+	SmallVector<DynamicArtifactExport, 1> SecondArtifacts;
+	SecondArtifacts.push_back(std::move(*SecondExport));
+	auto Result = commitDynamicArtifacts(Root, "test.app", SecondArtifacts,
+		MaterialCommitToken::forExportOnlyTest());
+	ASSERT_FALSE(static_cast<bool>(Result));
+	consumeError(Result.takeError());
+}
+
+TEST(VMMaterial, DynamicCommitRejectsUndecryptableArtifact) {
+	for (unsigned Case : {0u, 1u, 2u}) {
+		std::string Root = temporaryRoot();
+		auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+		auto Fixture = makeDynamicFixture();
+		auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+		ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+		if (Case == 0) {
+			std::vector<char> Encoded;
+			ASSERT_FALSE(decodeBase64(*Export->PublicManifest.getString("encrypted_artifact_b64"), Encoded));
+			Encoded.back() ^= 1;
+			Export->PublicManifest["encrypted_artifact_b64"] = encodeBase64(Encoded);
+		} else if (Case == 1) {
+			Export->PublicManifest["artifact_hash"] = std::string(64, '0');
+			Export->PrivateRegistration["artifact_hash"] = std::string(64, '0');
+		} else {
+			Export->PrivateRegistration["artifact_key_b64"] = encodeBase64(
+				ArrayRef<uint8_t>(std::array<uint8_t, 32>{}));
+		}
+		SmallVector<DynamicArtifactExport, 1> Artifacts;
+		Artifacts.push_back(std::move(*Export));
+		auto Result = commitDynamicArtifacts(Root, "test.app", Artifacts,
+			MaterialCommitToken::forExportOnlyTest());
+		ASSERT_FALSE(static_cast<bool>(Result)) << Case;
+		consumeError(Result.takeError());
+	}
 }
 
 TEST(VMMaterial, FailedPrivateCommitNeverPromotesInvocation) {

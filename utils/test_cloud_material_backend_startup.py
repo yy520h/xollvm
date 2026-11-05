@@ -15,7 +15,9 @@ def free_port():
 
 def main():
     executable = Path(sys.argv[1])
-    migration = executable.parent.parent.parent / "runtime" / "cloud_material_backend" / "migrations" / "001_build_registry.sql"
+    source_root = os.environ.get("XOLLVM_CLOUD_MATERIAL_SOURCE_ROOT")
+    migration = (Path(source_root) / "runtime" / "cloud_material_backend" / "migrations" /
+                 "001_build_registry.sql") if source_root else executable.parent.parent.parent / "runtime" / "cloud_material_backend" / "migrations" / "001_build_registry.sql"
     with tempfile.TemporaryDirectory(prefix="xovm-backend-startup-") as temporary:
         root = Path(temporary)
         database = root / "registry.sqlite"

@@ -1,6 +1,8 @@
 #include "runtime_providers.h"
+#include "dynamic_vm_artifact.h"
 
 #include <openssl/evp.h>
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -20,6 +22,120 @@ std::string hex(std::span<const std::uint8_t> bytes) {
         result.push_back(digits[byte & 15]);
     }
     return result;
+}
+
+using xovm::material::DynamicHash;
+using xovm::material::DynamicVmPrivateCapabilityV3;
+using xovm::material::DynamicVmWindowSelectorV3;
+
+// Immutable fixture analogue of DynamicVmPrivateRegistrationV3. Keeping the
+// canonical selectors beside their capabilities makes the request only a lookup
+// key; it is never an authority for graph identity or material.
+struct FixtureDynamicVmRegistrationV3 {
+    DynamicHash artifact_hash{};
+    std::vector<DynamicVmPrivateCapabilityV3> capabilities;
+};
+
+DynamicVmWindowSelectorV3 fixtureSelector(std::uint32_t nodeId) {
+    DynamicVmWindowSelectorV3 selector;
+    selector.abi_id = 7;
+    selector.abi_hash.fill(0xa1);
+    selector.graph_commitment.fill(0xa2);
+    selector.node_id = nodeId;
+    selector.shard_id = nodeId;
+    selector.variant_id = nodeId;
+    selector.semantic = nodeId == 1
+        ? xovm::material::ContinuationNodeSemanticV2::LoadI32
+        : xovm::material::ContinuationNodeSemanticV2::ReturnI32;
+    selector.status = nodeId == 1
+        ? xovm::material::ContinuationNodeStatusV2::Continue
+        : xovm::material::ContinuationNodeStatusV2::Return;
+    selector.bytecode_offset = (nodeId - 1) * 6;
+    selector.bytecode_size = nodeId == 1 ? 6 : 2;
+    selector.bytecode_block_commitment.fill(
+        static_cast<std::uint8_t>(0xb0 + nodeId));
+    selector.shard_offset = (nodeId - 1) * 16;
+    selector.shard_size = 16;
+    selector.handler_shard_commitment.fill(
+        static_cast<std::uint8_t>(0xc0 + nodeId));
+    selector.next_node_id = nodeId == 1 ? 2 : 0;
+    selector.transition_tail_commitment.fill(
+        static_cast<std::uint8_t>(0xd0 + nodeId));
+    return selector;
+}
+
+const FixtureDynamicVmRegistrationV3 &fixtureRegistration() {
+    static const FixtureDynamicVmRegistrationV3 registration = [] {
+        FixtureDynamicVmRegistrationV3 value;
+        value.artifact_hash.fill(0x22);
+        for (std::uint32_t nodeId = 1; nodeId <= 2; ++nodeId) {
+            DynamicVmPrivateCapabilityV3 capability;
+            capability.selector = fixtureSelector(nodeId);
+            capability.capability.fill(
+                static_cast<std::uint8_t>(0x40 + nodeId));
+            value.capabilities.push_back(capability);
+        }
+        return value;
+    }();
+    return registration;
+}
+
+std::variant<xovm::material::WindowMaterialProvisionV3, BackendError>
+buildWindowMaterial(const xovm::material::WindowAcquireRequest &request) {
+    const auto &registration = fixtureRegistration();
+    if (request.artifact_hash != registration.artifact_hash ||
+        registration.capabilities.empty())
+        return BackendError{"build_unavailable"};
+    const auto current = std::find_if(
+        registration.capabilities.begin(), registration.capabilities.end(),
+        [&](const auto &entry) { return entry.selector == request.selector; });
+    if (current == registration.capabilities.end())
+        return BackendError{"build_unavailable"};
+
+    const auto encoded = xovm::material::encodeWindowAcquireRequest(request);
+    if (encoded.empty()) return BackendError{"window_material_unavailable"};
+
+    auto derive = [&encoded](std::uint8_t domain)
+        -> std::variant<std::array<std::uint8_t, 32>, BackendError> {
+        constexpr std::string_view label = "XOVM2/fixture-window-material";
+        std::vector<std::uint8_t> input(label.begin(), label.end());
+        input.push_back(0);
+        input.push_back(domain);
+        input.insert(input.end(), encoded.begin(), encoded.end());
+        std::array<std::uint8_t, 32> digest{};
+        unsigned digestSize = 0;
+        if (EVP_Digest(input.data(), input.size(), digest.data(), &digestSize,
+                       EVP_sha256(), nullptr) != 1 ||
+            digestSize != digest.size())
+            return BackendError{"window_material_unavailable"};
+        return digest;
+    };
+
+    xovm::material::WindowMaterialProvisionV3 provision{};
+    provision.artifact_hash = registration.artifact_hash;
+    provision.selector = current->selector;
+    provision.entry_selector = registration.capabilities.front().selector;
+    if (current->selector.next_node_id != 0) {
+        const auto successor = std::find_if(
+            registration.capabilities.begin(), registration.capabilities.end(),
+            [&](const auto &entry) {
+                return entry.selector.node_id == current->selector.next_node_id;
+            });
+        if (successor == registration.capabilities.end())
+            return BackendError{"build_unavailable"};
+        provision.next_selector = successor->selector;
+    }
+    provision.material.window = current->capability;
+    std::array<std::array<std::uint8_t, 32> *, 5> fields = {
+        &provision.material.permutation, &provision.material.decode,
+        &provision.material.chaff, &provision.material.integrity,
+        &provision.material.jit};
+    for (std::uint8_t domain = 0; domain < fields.size(); ++domain) {
+        auto value = derive(static_cast<std::uint8_t>(domain + 1));
+        if (const auto *error = std::get_if<BackendError>(&value)) return *error;
+        *fields[domain] = std::get<std::array<std::uint8_t, 32>>(std::move(value));
+    }
+    return provision;
 }
 
 std::string packageHash(nlohmann::json package) {
@@ -173,7 +289,52 @@ RuntimeProviderBundle provider(ProviderRole role) {
         result.authorize_admin = [](std::string_view, std::string_view, std::string_view,
                                    const std::string &) {
             return std::variant<AdminPrincipal, BackendError>(
-                AdminPrincipal{"fixture.software", {"build.publish", "build.revoke"}});
+                 AdminPrincipal{"fixture.software", {"build.publish", "build.revoke"}});
+        };
+        result.raw_api.announcement = [] {
+            AnnouncementResponse response;
+            response.announcement_id = "fixture-announcement";
+            response.version = 1;
+            response.priority = 1;
+            response.issued_at_ms = 1000;
+            response.expires_at_ms = 900000;
+            response.content = "fixture";
+            response.signature = {0x01};
+            return std::variant<AnnouncementResponse, CloudApiError>(std::move(response));
+        };
+        result.raw_api.update = [](std::string_view version) {
+            UpdateResponse response;
+            response.version = std::string(version);
+            response.artifact_hash.fill(0x22);
+            response.size = 4;
+            response.chunk_count = 1;
+            response.signature = {0x02};
+            return std::variant<UpdateResponse, CloudApiError>(std::move(response));
+        };
+        result.build_window_material = buildWindowMaterial;
+        result.raw_api.variables = [](std::string_view) {
+            RemoteVariablesResponse response;
+            response.version = 1;
+            response.expires_at_ms = 900000;
+            response.canonical_variables = {'f', 'i', 'x', 't', 'u', 'r', 'e'};
+            response.signature = {0x03};
+            return std::variant<RemoteVariablesResponse, CloudApiError>(std::move(response));
+        };
+        result.raw_api.account_login = [](std::string_view, std::span<const uint8_t>) {
+            LoginResponse response;
+            response.session_id.fill(0x44);
+            response.expires_at_ms = 900000;
+            response.generation = 1;
+            response.allowed_regions = {std::string(64, '2')};
+            return std::variant<LoginResponse, CloudApiError>(std::move(response));
+        };
+        result.raw_api.card_login = [](std::span<const uint8_t>, std::span<const uint8_t>) {
+            LoginResponse response;
+            response.session_id.fill(0x55);
+            response.expires_at_ms = 900000;
+            response.generation = 1;
+            response.allowed_regions = {std::string(64, '2')};
+            return std::variant<LoginResponse, CloudApiError>(std::move(response));
         };
         result.build_payload = [](const Request &request, const RequestFacts &facts,
                                   const BuildSnapshot &snapshot, SessionState::Transaction &tx) {

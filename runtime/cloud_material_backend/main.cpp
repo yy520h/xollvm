@@ -6,6 +6,9 @@
 #include "http_server.h"
 #include "process_lock.h"
 #include "protocol_service.h"
+#include "raw_api_dispatch.h"
+#include "raw_server.h"
+#include "raw_window_acquisition_service.h"
 #include "runtime_providers.h"
 #include "runtime_admin.h"
 #include "session_state.h"
@@ -16,7 +19,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <memory>
+#include <optional>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
 #include <csignal>
 #include <thread>
 
@@ -28,6 +35,41 @@ std::atomic<bool> stop_requested{false};
 
 void requestStop(int) {
     stop_requested.store(true);
+}
+
+std::string hex(std::span<const std::uint8_t> bytes) {
+    constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(bytes.size() * 2);
+    for (const auto byte : bytes) {
+        result.push_back(digits[byte >> 4]);
+        result.push_back(digits[byte & 15]);
+    }
+    return result;
+}
+
+std::optional<std::array<std::uint8_t, 32>> rawHelloDigest(
+    const xovm::material::RawHello &hello) {
+    constexpr std::string_view domain = "xovm/raw-session/open/v1";
+    const auto canonical = xovm::material::encodeRawHello(hello);
+    if (canonical.empty()) return std::nullopt;
+    std::vector<std::uint8_t> framed;
+    framed.reserve(domain.size() + sizeof(std::uint32_t) + canonical.size());
+    framed.insert(framed.end(), domain.begin(), domain.end());
+    const auto size = static_cast<std::uint32_t>(canonical.size());
+    framed.push_back(static_cast<std::uint8_t>(size >> 24));
+    framed.push_back(static_cast<std::uint8_t>(size >> 16));
+    framed.push_back(static_cast<std::uint8_t>(size >> 8));
+    framed.push_back(static_cast<std::uint8_t>(size));
+    framed.insert(framed.end(), canonical.begin(), canonical.end());
+    std::array<std::uint8_t, 32> result{};
+    unsigned int resultSize = 0;
+    const bool ok = EVP_Digest(framed.data(), framed.size(), result.data(),
+                               &resultSize, EVP_sha256(), nullptr) == 1 &&
+                    resultSize == result.size();
+    OPENSSL_cleanse(framed.data(), framed.size());
+    if (!ok) return std::nullopt;
+    return result;
 }
 
 struct RuntimeResources {
@@ -45,6 +87,9 @@ struct RuntimeResources {
     std::unique_ptr<ProtocolService> service;
     std::unique_ptr<RuntimeAdminHandlers> admin;
     std::unique_ptr<HttpServer> server;
+    std::unique_ptr<RawWindowAcquisitionService> raw_window_acquisition;
+    std::unique_ptr<RawApiDispatch> raw_dispatch;
+    std::unique_ptr<RawServer> raw_server;
 };
 
 int run() {
@@ -76,10 +121,13 @@ int run() {
         auto recovered = resources.checkpoint->recover();
         if (const auto *error = std::get_if<BackendError>(&recovered)) return *error;
         const auto &state = std::get<RecoveredState>(recovered);
+        SessionState validated;
+        auto restored = validated.restore(state);
+        if (const auto *error = std::get_if<BackendError>(&restored)) return *error;
         resources.wal = std::make_unique<StateWal>(stateDir / "state.wal", StateWal::IoHooks{},
                                                    state.last_sequence);
         resources.state = std::make_unique<SessionState>(resources.wal.get());
-        auto restored = resources.state->restore(state);
+        restored = resources.state->restore(state);
         if (const auto *error = std::get_if<BackendError>(&restored)) return *error;
         return std::variant<std::monostate, BackendError>{std::monostate{}};
     };
@@ -156,8 +204,193 @@ int run() {
             return resources.admin->handle(path, body, credential);
         });
         resources.server->setTrustHandler(resources.providers.trust_handler);
+        if (resources.config.raw_port != 0) {
+            auto raw = resources.providers.raw_api;
+            if (!raw.announcement || !raw.update || !raw.variables ||
+                !raw.account_login || !raw.card_login ||
+                !resources.providers.random_bytes || !resources.providers.sign ||
+                !resources.providers.trusted_now ||
+                !resources.providers.build_window_material || !resources.snapshots ||
+                !resources.anonymous_policy || !resources.state)
+                return BackendError{"raw_provider_unavailable"};
+            RawWindowAcquisitionService::Providers acquisitionProviders;
+            acquisitionProviders.snapshots = resources.snapshots.get();
+            acquisitionProviders.anonymous_policy = resources.anonymous_policy.get();
+            acquisitionProviders.sessions = resources.state.get();
+            acquisitionProviders.trusted_now = resources.providers.trusted_now;
+            acquisitionProviders.build_material =
+                resources.providers.build_window_material;
+            resources.raw_window_acquisition =
+                std::make_unique<RawWindowAcquisitionService>(
+                    std::move(acquisitionProviders));
+            raw.algorithm = [&resources](
+                const AuthenticatedRawContext &context,
+                const xovm::material::WindowAcquireRequest &request)
+                -> std::variant<xovm::material::WindowGrant, CloudApiError> {
+                if (!resources.raw_window_acquisition)
+                    return CloudApiError{"authority_unavailable"};
+                auto result = resources.raw_window_acquisition->acquire(context, request);
+                if (const auto *error = std::get_if<BackendError>(&result))
+                    return CloudApiError{error->code};
+                const auto &committed = std::get<std::vector<std::uint8_t>>(result);
+                auto grant = xovm::material::decodeWindowGrant(committed);
+                if (!grant || xovm::material::encodeWindowGrant(*grant) != committed)
+                    return CloudApiError{"authority_unavailable"};
+                return std::move(*grant);
+            };
+            resources.raw_dispatch = std::make_unique<RawApiDispatch>(CloudApi(std::move(raw)));
+            RawServerConfig rawConfig;
+            rawConfig.bind_address = resources.config.bind_address;
+            rawConfig.port = resources.config.raw_port;
+            resources.raw_server = std::make_unique<RawServer>(std::move(rawConfig));
+            resources.raw_server->setSessionFactory([&resources](
+                const xovm::material::RawHello &hello)
+                -> std::variant<RawSession, RawServerError> {
+                try {
+                    const auto digest = rawHelloDigest(hello);
+                    if (!digest) return RawServerError{"invalid_hello"};
+                    auto nowResult = resources.providers.trusted_now();
+                    if (const auto *error = std::get_if<BackendError>(&nowResult))
+                        return RawServerError{error->code};
+                    const auto now = std::get<std::uint64_t>(nowResult);
+
+                    auto snapshot = resources.snapshots->acquire();
+                    if (!snapshot || !resources.snapshots->ready())
+                        return RawServerError{"authority_unavailable"};
+                    const auto *build = snapshot->find(hello.build_id);
+                    if (!build || build->registration.build_id != hello.build_id ||
+                        build->registration.software_id != hello.software_id)
+                        return RawServerError{"build_unavailable"};
+
+                    RequestFacts facts;
+                    facts.request_id = hex(hello.request_id);
+                    facts.request_digest = hex(*digest);
+                    facts.software_id = hello.software_id;
+                    facts.build_id = hello.build_id;
+                    facts.final_artifact_hash = build->final_artifact_hash;
+                    facts.type = "session.open";
+                    auto reserved = resources.anonymous_policy->reserve(
+                        *snapshot, facts, now, 1);
+                    if (const auto *error = std::get_if<BackendError>(&reserved))
+                        return RawServerError{error->code};
+                    auto reservation = std::get<AnonymousPolicy::Reservation>(
+                        std::move(reserved));
+                    auto issuance = resources.snapshots->beginIssuance(
+                        snapshot, hello.build_id);
+                    if (!issuance) return RawServerError{"build_unavailable"};
+
+                    auto registrationNowResult = resources.providers.trusted_now();
+                    if (const auto *error =
+                            std::get_if<BackendError>(&registrationNowResult))
+                        return RawServerError{error->code};
+                    const auto registrationNow =
+                        std::get<std::uint64_t>(registrationNowResult);
+                    if (registrationNow < now ||
+                        registrationNow >= reservation.grant().validUntilMs())
+                        return RawServerError{"authority_unavailable"};
+                    RawSessionRegistrationInput registration{
+                        .client_nonce = hex(hello.client_nonce),
+                        .client_ephemeral_key = hex(hello.client_ephemeral_public)};
+                    std::optional<RawSession> liveSession;
+                    const auto registered = resources.state->registerRawSession(
+                        facts, reservation.grant(), registrationNow, registration,
+                        [&resources, &hello, &liveSession, registrationNow,
+                         validUntil = reservation.grant().validUntilMs()](
+                            std::uint64_t counter)
+                            -> std::variant<RawSessionMetadata, BackendError> {
+                            constexpr std::uint64_t sessionLifetimeMs = 120000;
+                            if (registrationNow >
+                                std::numeric_limits<std::uint64_t>::max() -
+                                    sessionLifetimeMs)
+                                return BackendError{"session_expiry_overflow"};
+                            RawSessionConfig sessionConfig;
+                            sessionConfig.random_bytes = [&resources](size_t size)
+                                -> std::variant<std::vector<uint8_t>, RawSessionError> {
+                                auto result = resources.providers.random_bytes(size);
+                                if (const auto *error = std::get_if<BackendError>(&result))
+                                    return RawSessionError{error->code};
+                                const auto &bytes = std::get<Bytes>(result);
+                                std::vector<uint8_t> converted;
+                                converted.reserve(bytes.size());
+                                for (const auto byte : bytes)
+                                    converted.push_back(static_cast<uint8_t>(byte));
+                                return converted;
+                            };
+                            sessionConfig.sign = [&resources](
+                                std::span<const uint8_t> input)
+                                -> std::variant<std::array<uint8_t, 64>, RawSessionError> {
+                                auto result = resources.providers.sign(input);
+                                if (const auto *error = std::get_if<BackendError>(&result))
+                                    return RawSessionError{error->code};
+                                return std::get<std::array<uint8_t, 64>>(result);
+                            };
+                            sessionConfig.trusted_now = [&resources]()
+                                -> std::variant<uint64_t, RawSessionError> {
+                                auto result = resources.providers.trusted_now();
+                                if (const auto *error = std::get_if<BackendError>(&result))
+                                    return RawSessionError{error->code};
+                                return std::get<uint64_t>(result);
+                            };
+                            sessionConfig.counter = counter;
+                            sessionConfig.expires_at_ms = std::min(
+                                registrationNow + sessionLifetimeMs, validUntil);
+                            auto accepted = RawSession::accept(hello, sessionConfig);
+                            if (const auto *error = std::get_if<RawSessionError>(&accepted))
+                                return BackendError{error->code};
+                            liveSession.emplace(std::get<RawSession>(std::move(accepted)));
+                            auto commitNowResult = resources.providers.trusted_now();
+                            if (const auto *error =
+                                    std::get_if<BackendError>(&commitNowResult))
+                                return *error;
+                            const auto commitNow =
+                                std::get<std::uint64_t>(commitNowResult);
+                            if (commitNow < registrationNow ||
+                                commitNow >= sessionConfig.expires_at_ms)
+                                return BackendError{"authority_unavailable"};
+                            const auto &server = liveSession->serverHello();
+                            const auto &context = liveSession->authenticatedContext();
+                            return RawSessionMetadata{
+                                .session_id = hex(server.session_id),
+                                .server_nonce = hex(server.server_nonce),
+                                .server_ephemeral_key = hex(server.server_ephemeral_public),
+                                .initial_state_commitment =
+                                    hex(context.initialStateCommitment()),
+                                .key_version = server.key_version,
+                                .valid_until_ms = server.expires_at_ms};
+                        });
+                    if (const auto *error =
+                            std::get_if<BackendError>(&registered))
+                        return RawServerError{error->code};
+                    if (!liveSession || !reservation.commit())
+                        return RawServerError{"authority_unavailable"};
+                    issuance.finishCommit();
+                    return std::move(*liveSession);
+                } catch (...) {
+                    return RawServerError{"authority_unavailable"};
+                }
+            });
+            resources.raw_server->setFrameHandler([&resources](
+                const AuthenticatedRawContext &context,
+                const xovm::material::RawFrameHeader &header,
+                std::span<const uint8_t> payload)
+                -> std::variant<std::vector<uint8_t>, RawSessionError> {
+                auto result = resources.raw_dispatch->handle(context, header, payload);
+                if (const auto *error = std::get_if<RawApiDispatchError>(&result))
+                    return RawSessionError{error->code};
+                return std::get<std::vector<uint8_t>>(std::move(result));
+            });
+            auto rawResult = resources.raw_server->start();
+            if (const auto *error = std::get_if<RawServerError>(&rawResult))
+                return BackendError{error->code};
+        }
         auto result = resources.server->start();
-        if (const auto *error = std::get_if<BackendError>(&result)) return *error;
+        if (const auto *error = std::get_if<BackendError>(&result)) {
+            if (resources.raw_server) {
+                resources.raw_server->stop();
+                resources.raw_server.reset();
+            }
+            return *error;
+        }
         resources.server->setReady(true);
         return std::variant<std::monostate, BackendError>{std::monostate{}};
     };
@@ -169,7 +402,12 @@ int run() {
         return 1;
     }
     while (!stop_requested.load()) std::this_thread::sleep_for(std::chrono::seconds(1));
+    resources.server->setReady(false);
     resources.server->stop();
+    if (resources.raw_server) {
+        resources.raw_server->stop();
+        resources.raw_server.reset();
+    }
     return 0;
 }
 

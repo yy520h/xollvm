@@ -4,12 +4,20 @@
 #include "build_snapshot.h"
 #include "canonical_json.h"
 
+#include <cstdint>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <set>
+#include <string>
+#include <tuple>
+#include <variant>
 
 namespace xovm::cloud_material {
 
 struct RequestFacts {
+    using Identity = std::tuple<std::string, std::string, std::string, std::string>;
+
     std::string request_id;
     std::string request_digest;
     std::string software_id;
@@ -18,6 +26,10 @@ struct RequestFacts {
     std::string region_id;
     std::string mode;
     std::string type;
+
+    Identity requestIdentity() const {
+        return {software_id, build_id, final_artifact_hash, request_id};
+    }
 };
 
 class AnonymousGrant {
@@ -53,7 +65,48 @@ private:
 };
 
 class AnonymousPolicy {
+private:
+    struct Core;
+    struct AuthorizationRecord;
+
 public:
+    static constexpr std::size_t kDefaultAuthorizationCacheCapacity = 4096;
+
+    class Reservation {
+    public:
+        Reservation(const Reservation &) = delete;
+        Reservation &operator=(const Reservation &) = delete;
+        Reservation(Reservation &&other) noexcept;
+        Reservation &operator=(Reservation &&other) noexcept;
+        ~Reservation() noexcept;
+
+        const AnonymousGrant &grant() const noexcept { return grant_; }
+
+        // Commits this request's budget slot. A live reservation always commits;
+        // moved-from reservations return false.
+        bool commit() noexcept;
+
+    private:
+        friend class AnonymousPolicy;
+        Reservation(std::shared_ptr<Core> core,
+                    std::shared_ptr<AuthorizationRecord> record,
+                    AnonymousGrant grant, bool pendingHolder) noexcept;
+        void releasePending() noexcept;
+
+        std::shared_ptr<Core> core_;
+        std::shared_ptr<AuthorizationRecord> record_;
+        AnonymousGrant grant_;
+        bool pending_holder_ = false;
+        bool committed_ = false;
+    };
+
+    explicit AnonymousPolicy(
+        std::size_t authorizationCacheCapacity = kDefaultAuthorizationCacheCapacity);
+    AnonymousPolicy(const AnonymousPolicy &) = delete;
+    AnonymousPolicy &operator=(const AnonymousPolicy &) = delete;
+    AnonymousPolicy(AnonymousPolicy &&) = delete;
+    AnonymousPolicy &operator=(AnonymousPolicy &&) = delete;
+
     struct BuildRule {
         std::string software_id;
         std::string final_artifact_hash;
@@ -68,14 +121,20 @@ public:
     void setRule(const std::string &buildId, BuildRule rule);
     void clear();
     void replaceWith(AnonymousPolicy &&other);
+    std::variant<Reservation, BackendError> reserve(
+        const BuildSnapshot &snapshot, const RequestFacts &facts,
+        std::uint64_t trustedNow, std::size_t rateBudget);
+
+    // Compatibility wrapper for call sites that do not yet have a durable
+    // operation around which to hold a Reservation.
     std::variant<AnonymousGrant, BackendError> authorize(
         const BuildSnapshot &snapshot, const RequestFacts &facts,
         std::uint64_t trustedNow, std::size_t rateBudget);
 
 private:
-    mutable std::mutex mutex_;
-    std::map<std::string, BuildRule> rules_;
-    std::map<std::string, std::size_t> usage_;
+    std::shared_ptr<Core> loadCore() const;
+    mutable std::mutex core_mutex_;
+    std::shared_ptr<Core> core_;
 };
 
 } // namespace xovm::cloud_material

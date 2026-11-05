@@ -29,6 +29,7 @@ struct VMPreparedCandidate {
 	std::unique_ptr<VMImpl> Impl;
 	std::string SkipReason;
 	std::optional<json::Object> CanonicalRegion;
+	std::optional<DynamicArtifactExport> DynamicArtifact;
 	bool Accepted = false;
 	unsigned CommittedInsts = 0;
 
@@ -63,6 +64,8 @@ public:
 	// token 时，当前失败编译绝不晋升私有文件。
 	Error prepareMaterialExports();
 	Expected<MaterialCommitResult> promotePreparedMaterials(StringRef ExportRoot,
+		StringRef SoftwareId, const MaterialCommitToken& Token) const;
+	Expected<MaterialCommitResult> promotePreparedDynamicArtifacts(StringRef ExportRoot,
 		StringRef SoftwareId, const MaterialCommitToken& Token) const;
 	bool hasCloudMaterial() const;
 	void finalizeReports(obf::ObfReportSink& Sink) const;

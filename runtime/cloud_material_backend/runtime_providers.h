@@ -2,8 +2,10 @@
 #define XOVM_CLOUD_MATERIAL_BACKEND_RUNTIME_PROVIDERS_H
 
 #include "admin_repository.h"
+#include "cloud_api.h"
 #include "config.h"
 #include "protocol_service.h"
+#include "../cloud_material/dynamic_vm_window_provider.h"
 
 #include <array>
 #include <functional>
@@ -19,6 +21,14 @@ enum class ProviderRole {
 };
 
 struct RuntimeProviderBundle {
+    // Builds only the fixed-size secret material for an already authenticated
+    // public request. Grant metadata, identity, time, state, and encryption keys
+    // remain the acquisition service's responsibility. The caller must scrub the
+    // returned material immediately after copying/encrypting it into a grant.
+    using BuildWindowMaterial = std::function<std::variant<
+        xovm::material::WindowMaterialProvisionV3, BackendError>(
+        const xovm::material::WindowAcquireRequest &)>;
+
     std::function<std::variant<std::uint64_t, BackendError>()> trusted_now;
     ProtocolService::RandomBytes random_bytes;
     SignEd25519 sign;
@@ -34,6 +44,8 @@ struct RuntimeProviderBundle {
     ProtocolService::BuildPayload build_payload;
     std::function<bool(const BuildSnapshot &, AnonymousPolicy &, std::string &)> configure_policy;
     std::function<std::variant<Bytes, BackendError>(std::string_view)> trust_handler;
+    CloudApiProviders raw_api;
+    BuildWindowMaterial build_window_material;
 };
 
 class RuntimeProviderFactory {
@@ -45,6 +57,9 @@ public:
     static void registerLinkedProviders();
     static std::variant<RuntimeProviderBundle, BackendError> resolve(
         const BackendConfig &config);
+    static std::variant<std::function<std::variant<std::uint64_t, BackendError>()>,
+                        BackendError>
+    resolveTrustedTime(const StateMaintenanceConfig &config);
     static void clearForTest();
 };
 

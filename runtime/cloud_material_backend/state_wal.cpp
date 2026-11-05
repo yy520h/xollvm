@@ -4,9 +4,11 @@
 
 #include <array>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
+#include <string>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -85,26 +87,130 @@ std::vector<std::byte> frame(std::uint64_t sequence, const StateDelta &delta,
     return result;
 }
 
-int openForAppend(const std::filesystem::path &path) {
-    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-}
-
 ssize_t defaultWrite(int fd, std::span<const std::byte> data) {
     return ::write(fd, data.data(), data.size());
 }
 
 int defaultSync(int fd) {
-    return ::fdatasync(fd);
+    return ::fsync(fd);
 }
 
 BackendError ioError(const char *code) {
     return BackendError{code};
 }
 
+std::variant<QuarantineInfo, BackendError> readQuarantineMarker(
+    const std::filesystem::path &markerPath) {
+    QuarantineInfo result;
+    const int fd = ::open(markerPath.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return result;  // No quarantine marker
+        return ioError("wal_quarantine_read_failed");
+    }
+    std::array<char, 256> buffer{};
+    const auto count = ::read(fd, buffer.data(), buffer.size() - 1);
+    ::close(fd);
+    if (count <= 0) return ioError("wal_quarantine_read_failed");
+    buffer[count] = '\0';
+
+    unsigned long long sequence = 0, device = 0, inode = 0;
+    long long offset = 0;
+    const int parsed = std::sscanf(buffer.data(), "%llu %lld %llu %llu",
+                                   &sequence, &offset, &device, &inode);
+    if (parsed != 4 || sequence == 0) return ioError("wal_quarantine_invalid");
+
+    result.sequence = sequence;
+    result.offset = static_cast<off_t>(offset);
+    result.device = static_cast<dev_t>(device);
+    result.inode = static_cast<ino_t>(inode);
+    result.valid = true;
+    return result;
+}
+
+std::filesystem::path normalizedPath(const std::filesystem::path &path) {
+    std::error_code error;
+    const auto absolute = std::filesystem::absolute(path, error);
+    const auto lexical = (error ? path : absolute).lexically_normal();
+    error.clear();
+    const auto canonical = std::filesystem::weakly_canonical(lexical, error);
+    return error ? lexical : canonical;
+}
+
+std::filesystem::path quarantinePath(const std::filesystem::path &path) {
+    const auto normalized = normalizedPath(path);
+    return normalized.parent_path() / (normalized.filename().string() + ".quarantine");
+}
+
+bool isQuarantined(const std::filesystem::path &path) {
+    std::error_code error;
+    return std::filesystem::exists(quarantinePath(path), error) || error;
+}
+
+class OwnedFd {
+public:
+    explicit OwnedFd(int fd) : fd_(fd) {}
+    ~OwnedFd() { if (fd_ >= 0) ::close(fd_); }
+    OwnedFd(const OwnedFd &) = delete;
+    OwnedFd &operator=(const OwnedFd &) = delete;
+    int get() const { return fd_; }
+private:
+    int fd_;
+};
+
+int openParentDirectory(const std::filesystem::path &path) {
+    auto parent = normalizedPath(path).parent_path();
+    if (parent.empty()) parent = ".";
+    return ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+}
+
+bool matchesPathIdentity(const std::filesystem::path &path, const struct stat &identity) {
+    struct stat current{};
+    return identity.st_nlink > 0 && ::stat(path.c_str(), &current) == 0 &&
+        current.st_dev == identity.st_dev && current.st_ino == identity.st_ino;
+}
+
+bool syncParentDirect(const std::filesystem::path &path) {
+    const int fd = openParentDirectory(path);
+    const bool synced = fd >= 0 && ::fsync(fd) == 0;
+    if (fd >= 0) ::close(fd);
+    return synced;
+}
+
+bool writeAll(int fd, std::string_view text) {
+    std::size_t offset = 0;
+    while (offset < text.size()) {
+        const auto count = ::write(fd, text.data() + offset, text.size() - offset);
+        if (count <= 0) return false;
+        offset += static_cast<std::size_t>(count);
+    }
+    return true;
+}
+
+bool beginQuarantine(const std::filesystem::path &path, std::uint64_t sequence,
+                     off_t offset, const struct stat &identity) {
+    const auto marker = quarantinePath(path);
+    const int fd = ::open(marker.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    const auto text = std::to_string(sequence) + " " + std::to_string(offset) + " " +
+        std::to_string(static_cast<std::uint64_t>(identity.st_dev)) + " " +
+        std::to_string(static_cast<std::uint64_t>(identity.st_ino)) + "\n";
+    const bool durable = writeAll(fd, text) && ::fsync(fd) == 0;
+    ::close(fd);
+    return durable && syncParentDirect(marker);
+}
+
+bool clearQuarantine(const std::filesystem::path &path) {
+    const auto marker = quarantinePath(path);
+    if (::unlink(marker.c_str()) != 0 && errno != ENOENT) return false;
+    return syncParentDirect(marker);
+}
+
 } // namespace
 
-StateWal::StateWal(std::filesystem::path path, IoHooks hooks, std::uint64_t baseSequence)
-    : path_(std::move(path)), hooks_(std::move(hooks)), base_sequence_(baseSequence) {
+StateWal::StateWal(std::filesystem::path path, IoHooks hooks,
+                   std::uint64_t baseSequence, WalAppendMode appendMode)
+    : path_(std::move(path)), hooks_(std::move(hooks)),
+      base_sequence_(baseSequence), append_mode_(appendMode) {
     if (!hooks_.write) hooks_.write = defaultWrite;
     if (!hooks_.sync) hooks_.sync = defaultSync;
 }
@@ -113,35 +219,69 @@ WalCommitResult StateWal::appendAndSync(std::uint64_t sequence, const StateDelta
                                        std::span<const std::byte> exactResponse) {
     try {
         if (sequence == 0) return ioError("wal_invalid_sequence");
+        const auto path = normalizedPath(path_);
+        if (isQuarantined(path)) return ioError("wal_quarantined");
         auto existing = recover();
         if (const auto *error = std::get_if<BackendError>(&existing)) return *error;
         const auto last = std::get<RecoveredState>(existing).last_sequence;
         if (last == UINT64_MAX || sequence != last + 1)
             return ioError(sequence <= last ? "wal_duplicate_sequence" : "wal_sequence_gap");
         auto encoded = frame(sequence, delta, exactResponse);
-        struct stat before{};
-        const int sizeFd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
-        if (sizeFd >= 0) {
-            const bool stated = ::fstat(sizeFd, &before) == 0;
-            ::close(sizeFd);
-            if (!stated) return ioError("wal_stat_failed");
+
+        bool created = true;
+        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_APPEND | O_CLOEXEC,
+                        0600);
+        if (fd < 0 && errno == EEXIST) {
+            created = false;
+            fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
         }
-        const int fd = openForAppend(path_);
         if (fd < 0) return ioError("wal_open_failed");
-        const auto written = hooks_.write(fd, encoded);
-        const bool complete = written == static_cast<ssize_t>(encoded.size());
-        const int syncResult = complete ? hooks_.sync(fd) : -1;
-        const int closeResult = ::close(fd);
-        (void)closeResult;
-        if (!complete) return ioError("wal_short_write");
-        if (syncResult != 0) {
-            const int rollbackFd = ::open(path_.c_str(), O_WRONLY | O_CLOEXEC);
-            if (rollbackFd >= 0) {
-                ::ftruncate(rollbackFd, before.st_size);
-                ::close(rollbackFd);
-            }
-            return ioError("wal_sync_failed");
+        struct stat before{};
+        if (::fstat(fd, &before) != 0 || before.st_size < 0) {
+            ::close(fd);
+            return ioError("wal_stat_failed");
         }
+        const auto currentSize = static_cast<std::uint64_t>(before.st_size);
+        const auto limit = append_mode_ == WalAppendMode::maintenance
+            ? kMaxWalSize : kMaxWalSize - kMaxWalFrame;
+        if (currentSize > limit || encoded.size() > limit - currentSize) {
+            ::close(fd);
+            return ioError(append_mode_ == WalAppendMode::maintenance
+                ? "wal_size_limit" : "wal_maintenance_required");
+        }
+        if (!beginQuarantine(path, sequence, before.st_size, before)) {
+            ::close(fd);
+            return ioError("wal_quarantine_failed");
+        }
+
+        const auto syncParent = [&] {
+            const int directoryFd = openParentDirectory(path);
+            const bool synced = directoryFd >= 0 && hooks_.sync(directoryFd) == 0;
+            if (directoryFd >= 0) ::close(directoryFd);
+            return synced;
+        };
+        const auto rollback = [&] {
+            return matchesPathIdentity(path, before) &&
+                ::ftruncate(fd, before.st_size) == 0 && hooks_.sync(fd) == 0 &&
+                (!created || syncParent()) && matchesPathIdentity(path, before);
+        };
+        const auto finishRollback = [&](const char *code) -> WalCommitResult {
+            const bool rolledBack = rollback();
+            ::close(fd);
+            if (!rolledBack) return ioError("wal_rollback_failed");
+            if (!clearQuarantine(path)) return ioError("wal_quarantine_cleanup_failed");
+            return ioError(code);
+        };
+
+        if (!matchesPathIdentity(path, before)) return finishRollback("wal_replaced");
+        const auto written = hooks_.write(fd, encoded);
+        if (written != static_cast<ssize_t>(encoded.size()))
+            return finishRollback("wal_short_write");
+        if (hooks_.sync(fd) != 0) return finishRollback("wal_sync_failed");
+        if (created && !syncParent()) return finishRollback("wal_directory_sync_failed");
+        if (!matchesPathIdentity(path, before)) return finishRollback("wal_replaced");
+        ::close(fd);
+        if (!clearQuarantine(path)) return ioError("wal_quarantine_cleanup_failed");
         return sequence;
     } catch (const BackendError &error) {
         return error;
@@ -154,8 +294,10 @@ WalCommitResult StateWal::appendAndSync(std::uint64_t sequence, const StateDelta
 
 WalRecoveryResult StateWal::recover() {
     try {
-        const int fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
-        if (fd < 0) {
+        const auto path = normalizedPath(path_);
+        if (isQuarantined(path)) return ioError("wal_quarantined");
+        const int rawFd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+        if (rawFd < 0) {
             if (errno == ENOENT) {
                 RecoveredState empty;
                 empty.last_sequence = base_sequence_;
@@ -163,34 +305,34 @@ WalRecoveryResult StateWal::recover() {
             }
             return ioError("wal_open_failed");
         }
+        OwnedFd fd(rawFd);
         struct stat status{};
-        if (::fstat(fd, &status) != 0 || status.st_size < 0 ||
-            static_cast<std::uint64_t>(status.st_size) > 128 * 1024 * 1024) {
-            ::close(fd);
+        if (::fstat(fd.get(), &status) != 0 || status.st_size < 0 ||
+            static_cast<std::uint64_t>(status.st_size) > kMaxWalSize)
             return ioError("wal_size_limit");
-        }
         std::vector<std::byte> data(static_cast<std::size_t>(status.st_size));
         std::size_t readTotal = 0;
         while (readTotal < data.size()) {
-            const auto count = ::read(fd, data.data() + readTotal, data.size() - readTotal);
-            if (count <= 0) {
-                ::close(fd);
-                return ioError("wal_read_failed");
-            }
+            const auto count = ::read(fd.get(), data.data() + readTotal, data.size() - readTotal);
+            if (count <= 0) return ioError("wal_read_failed");
             readTotal += static_cast<std::size_t>(count);
         }
-        ::close(fd);
         RecoveredState result;
         result.last_sequence = base_sequence_;
+        const auto repairTail = [&](std::size_t size) {
+            if (!matchesPathIdentity(path, status) ||
+                !beginQuarantine(path, result.last_sequence + 1,
+                                 static_cast<off_t>(size), status))
+                return false;
+            const bool repaired = ::ftruncate(fd.get(), static_cast<off_t>(size)) == 0 &&
+                hooks_.sync(fd.get()) == 0;
+            return repaired && clearQuarantine(path);
+        };
         std::size_t offset = 0;
         while (offset < data.size()) {
             const auto frameStart = offset;
             if (data.size() - offset < kHeaderSize) {
-                const int writeFd = ::open(path_.c_str(), O_WRONLY | O_CLOEXEC);
-                if (writeFd >= 0) {
-                    ::ftruncate(writeFd, static_cast<off_t>(frameStart));
-                    ::close(writeFd);
-                }
+                if (!repairTail(frameStart)) return ioError("wal_repair_failed");
                 break;
             }
             if (!equal(std::span(data).subspan(offset, kMagic.size()), kMagic))
@@ -208,11 +350,7 @@ WalRecoveryResult StateWal::recover() {
                 frameSize != kHeaderSize + kChecksumSize + deltaSize + responseSize)
                 return ioError("wal_invalid_frame");
             if (data.size() - frameStart < frameSize) {
-                const int writeFd = ::open(path_.c_str(), O_WRONLY | O_CLOEXEC);
-                if (writeFd >= 0) {
-                    ::ftruncate(writeFd, static_cast<off_t>(frameStart));
-                    ::close(writeFd);
-                }
+                if (!repairTail(frameStart)) return ioError("wal_repair_failed");
                 break;
             }
             const auto frameBytes = std::span(data).subspan(frameStart, frameSize);
@@ -236,6 +374,7 @@ WalRecoveryResult StateWal::recover() {
             result.records.push_back(std::move(record));
             result.last_sequence = sequence;
         }
+        if (!matchesPathIdentity(path, status)) return ioError("wal_replaced");
         return result;
     } catch (const BackendError &error) {
         return error;
@@ -243,6 +382,168 @@ WalRecoveryResult StateWal::recover() {
         return ioError("allocation_failed");
     } catch (...) {
         return ioError("wal_read_failed");
+    }
+}
+
+QuarantineReconciliationOutcome StateWal::reconcileQuarantine() {
+    try {
+        const auto path = normalizedPath(path_);
+        const auto markerPath = quarantinePath(path);
+
+        auto quarantineResult = readQuarantineMarker(markerPath);
+        if (const auto *error = std::get_if<BackendError>(&quarantineResult))
+            return *error;
+
+        const auto info = std::get<QuarantineInfo>(quarantineResult);
+        if (!info.valid) {
+            // No active quarantine marker
+            QuarantineReconciliationResult result;
+            result.quarantine_cleared = true;
+            return result;
+        }
+
+        // Check if WAL file still exists and matches the recorded identity
+        struct stat current{};
+        if (::stat(path.c_str(), &current) != 0 || current.st_dev != info.device ||
+            current.st_ino != info.inode) {
+            // WAL file has been replaced or deleted; clear stale marker
+            if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+                return ioError("wal_quarantine_cleanup_failed");
+            syncParentDirect(markerPath);
+            QuarantineReconciliationResult result;
+            result.abandoned_sequence = info.sequence;
+            result.quarantine_cleared = true;
+            return result;
+        }
+
+        // WAL file exists and matches identity; verify the transaction at info.offset
+        const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+        if (fd < 0) return ioError("wal_open_failed");
+
+        struct stat before{};
+        const bool fstat_ok = ::fstat(fd, &before) == 0 && before.st_size >= 0;
+        if (!fstat_ok) {
+            ::close(fd);
+            return ioError("wal_stat_failed");
+        }
+
+        const auto fileSize = static_cast<std::uint64_t>(before.st_size);
+        if (info.offset < 0 || static_cast<std::uint64_t>(info.offset) > fileSize) {
+            // Offset is out of bounds; truncate to the quarantined offset
+            const bool truncated = ::ftruncate(fd, info.offset) == 0 && hooks_.sync(fd) == 0;
+            ::close(fd);
+            if (!truncated) return ioError("wal_truncate_failed");
+            if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+                return ioError("wal_quarantine_cleanup_failed");
+            if (!syncParentDirect(markerPath)) return ioError("wal_directory_sync_failed");
+            QuarantineReconciliationResult result;
+            result.abandoned_sequence = info.sequence;
+            result.truncation_performed = true;
+            result.quarantine_cleared = true;
+            return result;
+        }
+
+        // Verify frame header at offset is valid
+        if (fileSize - static_cast<std::uint64_t>(info.offset) < kHeaderSize) {
+            // Incomplete frame; truncate
+            const bool truncated = ::ftruncate(fd, info.offset) == 0 && hooks_.sync(fd) == 0;
+            ::close(fd);
+            if (!truncated) return ioError("wal_truncate_failed");
+            if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+                return ioError("wal_quarantine_cleanup_failed");
+            if (!syncParentDirect(markerPath)) return ioError("wal_directory_sync_failed");
+            QuarantineReconciliationResult result;
+            result.abandoned_sequence = info.sequence;
+            result.truncation_performed = true;
+            result.quarantine_cleared = true;
+            return result;
+        }
+
+        // Read frame header to verify sequence number
+        std::vector<std::byte> header(kHeaderSize);
+        if (::lseek(fd, info.offset, SEEK_SET) < 0) {
+            ::close(fd);
+            return ioError("wal_seek_failed");
+        }
+        if (::read(fd, header.data(), kHeaderSize) != static_cast<ssize_t>(kHeaderSize)) {
+            ::close(fd);
+            return ioError("wal_read_failed");
+        }
+
+        std::size_t offset = 0;
+        if (!equal(std::span(header).subspan(offset, kMagic.size()), kMagic)) {
+            // Invalid magic; truncate
+            const bool truncated = ::ftruncate(fd, info.offset) == 0 && hooks_.sync(fd) == 0;
+            ::close(fd);
+            if (!truncated) return ioError("wal_truncate_failed");
+            if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+                return ioError("wal_quarantine_cleanup_failed");
+            if (!syncParentDirect(markerPath)) return ioError("wal_directory_sync_failed");
+            QuarantineReconciliationResult result;
+            result.abandoned_sequence = info.sequence;
+            result.truncation_performed = true;
+            result.quarantine_cleared = true;
+            return result;
+        }
+        offset += kMagic.size();
+
+        const auto version = get32(header, offset);
+        if (version != kVersion) {
+            ::close(fd);
+            return ioError("wal_unknown_version");
+        }
+
+        const auto frameSize = get64(header, offset);
+        const auto sequence = get64(header, offset);
+        if (frameSize < kMinimumFrame || frameSize > kMaxWalFrame || sequence == 0) {
+            // Invalid frame header; truncate
+            const bool truncated = ::ftruncate(fd, info.offset) == 0 && hooks_.sync(fd) == 0;
+            ::close(fd);
+            if (!truncated) return ioError("wal_truncate_failed");
+            if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+                return ioError("wal_quarantine_cleanup_failed");
+            if (!syncParentDirect(markerPath)) return ioError("wal_directory_sync_failed");
+            QuarantineReconciliationResult result;
+            result.abandoned_sequence = info.sequence;
+            result.truncation_performed = true;
+            result.quarantine_cleared = true;
+            return result;
+        }
+
+        // Frame is valid; check if it's complete
+        const auto frameEnd = static_cast<std::uint64_t>(info.offset) + frameSize;
+        if (frameEnd > fileSize) {
+            // Incomplete frame; truncate to start of incomplete frame
+            const bool truncated = ::ftruncate(fd, info.offset) == 0 && hooks_.sync(fd) == 0;
+            ::close(fd);
+            if (!truncated) return ioError("wal_truncate_failed");
+            if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+                return ioError("wal_quarantine_cleanup_failed");
+            if (!syncParentDirect(markerPath)) return ioError("wal_directory_sync_failed");
+            QuarantineReconciliationResult result;
+            result.abandoned_sequence = info.sequence;
+            result.truncation_performed = true;
+            result.quarantine_cleared = true;
+            return result;
+        }
+
+        ::close(fd);
+
+        // Frame is complete; clear the quarantine marker
+        if (::unlink(markerPath.c_str()) != 0 && errno != ENOENT)
+            return ioError("wal_quarantine_cleanup_failed");
+        if (!syncParentDirect(markerPath)) return ioError("wal_directory_sync_failed");
+
+        QuarantineReconciliationResult result;
+        result.abandoned_sequence = 0;  // Transaction completed successfully
+        result.quarantine_cleared = true;
+        return result;
+    } catch (const BackendError &error) {
+        return error;
+    } catch (const std::bad_alloc &) {
+        return ioError("allocation_failed");
+    } catch (...) {
+        return ioError("wal_reconcile_failed");
     }
 }
 

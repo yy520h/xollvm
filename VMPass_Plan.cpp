@@ -233,6 +233,7 @@ Error VMPlanCoordinator::prepareMaterialExports() {
 	std::set<std::string> RegionIds;
 	for (auto& Candidate : Candidates) {
 		Candidate->CanonicalRegion.reset();
+		Candidate->DynamicArtifact.reset();
 		if (!Candidate->Config.usesCloudMaterial()) continue;
 		if (!Candidate->Accepted || !Candidate->Impl || !Candidate->Impl->Prepared)
 			return createStringError(inconvertibleErrorCode(),
@@ -247,6 +248,16 @@ Error VMPlanCoordinator::prepareMaterialExports() {
 			return createStringError(inconvertibleErrorCode(),
 				"material region names and identities must be unique per module");
 		Candidate->CanonicalRegion.emplace(std::move(*Region));
+		auto Artifact = exportDynamicArtifact(Candidate->Impl->E,
+			Candidate->Config, Candidate->Impl->OpMap);
+		if (!Artifact) return Artifact.takeError();
+		auto ArtifactName = Artifact->PublicManifest.getString("region_name");
+		auto ArtifactId = Artifact->PublicManifest.getString("region_id");
+		if (!ArtifactName || !ArtifactId || ArtifactName->str() != Name->str() ||
+			ArtifactId->str() != Id->str() || !RegionIds.count(ArtifactId->str()))
+			return createStringError(inconvertibleErrorCode(),
+				"dynamic artifact identity does not match material region");
+		Candidate->DynamicArtifact.emplace(std::move(*Artifact));
 	}
 	return Error::success();
 }
@@ -266,6 +277,23 @@ Expected<MaterialCommitResult> VMPlanCoordinator::promotePreparedMaterials(
 		return createStringError(inconvertibleErrorCode(),
 			"no prepared material regions to promote");
 	return commitCanonicalRegions(ExportRoot, SoftwareId, Regions, Token);
+}
+
+Expected<MaterialCommitResult> VMPlanCoordinator::promotePreparedDynamicArtifacts(
+	StringRef ExportRoot, StringRef SoftwareId,
+	const MaterialCommitToken& Token) const {
+	SmallVector<DynamicArtifactExport, 8> Artifacts;
+	for (const auto& Candidate : Candidates) {
+		if (!Candidate->Config.usesCloudMaterial()) continue;
+		if (!Candidate->DynamicArtifact)
+			return createStringError(inconvertibleErrorCode(),
+				"dynamic material artifact was not prepared for promotion");
+		Artifacts.push_back(*Candidate->DynamicArtifact);
+	}
+	if (Artifacts.empty())
+		return createStringError(inconvertibleErrorCode(),
+			"no prepared dynamic artifacts to promote");
+	return commitDynamicArtifacts(ExportRoot, SoftwareId, Artifacts, Token);
 }
 
 void VMPlanCoordinator::finalizeReports(obf::ObfReportSink& Sink) const {

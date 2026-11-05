@@ -11,10 +11,18 @@ import shutil
 from pathlib import Path
 
 
-def free_port():
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
+def require(condition, detail):
+    if not condition:
+        raise AssertionError(detail)
+
+
+def free_port(excluded=()):
+    while True:
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        if port not in excluded:
+            return port
 
 
 def request(port, payload):
@@ -70,7 +78,7 @@ def start_process(executable, environment, port):
                 break
         except OSError:
             time.sleep(0.02)
-    assert b"200" in response and b'{"ready":true}' in response, response
+    require(b"200" in response and b'{"ready":true}' in response, response)
     return process
 
 
@@ -116,9 +124,23 @@ def relay_body_for(request_value):
     }, separators=(",", ":")).encode()
 
 
+def assert_window_material_provider_boundary(source_root):
+    fixture = (Path(source_root) / "utils" /
+               "CloudMaterialProviderFixture.cpp").read_text()
+    require("result.build_window_material = buildWindowMaterial;" in fixture,
+            "fixture must provide fixed-size window material")
+    for forbidden in ("issueWindowGrant", "WindowIssueInput", "raw_api.algorithm"):
+        require(forbidden not in fixture, forbidden)
+
+
 def main():
     executable = Path(sys.argv[1])
-    migration = executable.parent.parent.parent / "runtime" / "cloud_material_backend" / "migrations" / "001_build_registry.sql"
+    raw_client = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+    source_root = os.environ.get("XOLLVM_CLOUD_MATERIAL_SOURCE_ROOT")
+    if source_root:
+        assert_window_material_provider_boundary(source_root)
+    migration = (Path(source_root) / "runtime" / "cloud_material_backend" / "migrations" /
+                 "001_build_registry.sql") if source_root else executable.parent.parent.parent / "runtime" / "cloud_material_backend" / "migrations" / "001_build_registry.sql"
     with tempfile.TemporaryDirectory(prefix="xovm-backend-provider-") as temporary:
         root = Path(temporary)
         database = root / "registry.sqlite"
@@ -127,6 +149,7 @@ def main():
         with sqlite3.connect(database) as connection:
             connection.executescript(migration.read_text())
         port = free_port()
+        raw_port = free_port({port})
         environment = os.environ.copy()
         environment.update({
             "XOVM_SQLITE_PATH": str(database),
@@ -138,14 +161,29 @@ def main():
             "XOVM_ANONYMOUS_POLICY_PROVIDER": "fixture",
             "XOVM_TRUST_ROOT_PROVIDER": "fixture",
             "PORT": str(port),
+            "XOVM_RAW_PORT": str(raw_port),
         })
         build_id = "11" * 32
         artifact_hash = "22" * 32
         region = "22" * 32
+        with socket.socket() as blocker:
+            blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            blocker.bind(("127.0.0.1", raw_port))
+            blocker.listen(1)
+            failed = subprocess.run([str(executable)], env=environment,
+                                    capture_output=True, text=True, timeout=5)
+            if failed.returncode != 1 or "bind_failed" not in failed.stderr:
+                raise AssertionError((failed.returncode, failed.stdout, failed.stderr))
+            with socket.socket() as probe:
+                probe.settimeout(0.2)
+                if probe.connect_ex(("127.0.0.1", port)) == 0:
+                    raise AssertionError("HTTP listener opened before raw bind succeeded")
         process = start_process(executable, environment, port)
         try:
+            with socket.create_connection(("127.0.0.1", raw_port), timeout=2):
+                pass
             trust = request(port, b"GET /v2/trust/fixture.software HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            assert b"200" in trust and b"fixture-key" in trust, trust
+            require(b"200" in trust and b"fixture-key" in trust, trust)
             imported = http_request(port, "POST", "/v2/admin/builds/import", "a" * 32,
                                     admin_import_body(build_id, artifact_hash, region))
             expect_status(imported, 200, process)
@@ -154,6 +192,12 @@ def main():
                                    json.dumps({"final_artifact_hash": artifact_hash},
                                               separators=(",", ":")).encode())
             expect_status(enabled, 200, process)
+            if raw_client:
+                blocked = subprocess.run(
+                    [str(raw_client), str(raw_port), build_id, region],
+                    capture_output=True, text=True, timeout=5)
+                if blocked.returncode != 0:
+                    raise AssertionError((blocked.stdout, blocked.stderr))
             opened = http_request(port, "POST", "/v2/relay", "r" * 32,
                                   relay_body(build_id, artifact_hash, region))
             expect_status(opened, 200, process)
@@ -161,7 +205,7 @@ def main():
             opened_envelope = json.loads(base64.b64decode(opened_http["response_b64"]))
             opened_transcript = opened_envelope["transcript"]
             node = shutil.which("node")
-            assert node, "node is required for cross-language material acceptance"
+            require(node, "node is required for cross-language material acceptance")
             opened_input = {
                 "request": json.loads(relay_body(build_id, artifact_hash, region))["request_b64"],
                 "response": opened_http["response_b64"],
@@ -172,9 +216,10 @@ def main():
                 [node, str(Path(__file__).resolve().parents[1] / "cloud/material_v2/test/protocol.test.mjs"),
                  "--native-control-auth"], input=json.dumps(opened_input).encode(),
                 capture_output=True, timeout=30)
-            assert control_verified.returncode == 0, (control_verified.stdout,
-                                                      control_verified.stderr.decode(errors="replace"))
-            assert json.loads(control_verified.stdout)["ok"] is True
+            require(control_verified.returncode == 0, (control_verified.stdout,
+                    control_verified.stderr.decode(errors="replace")))
+            require(json.loads(control_verified.stdout)["ok"] is True,
+                    control_verified.stdout)
             issue = relay_body_for({
                 "build_id": build_id,
                 "final_artifact_hash": artifact_hash,
@@ -214,22 +259,24 @@ def main():
             verified = subprocess.run(
                 [node, str(verifier), "--native-auth"],
                 input=json.dumps(auth_input).encode(), capture_output=True, timeout=30)
-            assert verified.returncode == 0, verified.stderr.decode(errors="replace")
+            require(verified.returncode == 0,
+                    verified.stderr.decode(errors="replace"))
             package = json.loads(verified.stdout)
-            assert package["ok"] is True, package
-            assert package["binding"]["build_id"] == build_id
-            assert package["binding"]["region_id"] == region
-            assert package["binding"]["mode"] == "lease"
-            assert package["generation"] == "1"
+            require(package["ok"] is True, package)
+            require(package["binding"]["build_id"] == build_id, package)
+            require(package["binding"]["region_id"] == region, package)
+            require(package["binding"]["mode"] == "lease", package)
+            require(package["generation"] == "1", package)
             process.terminate()
             stdout, stderr = process.communicate(timeout=3)
-            assert process.returncode == 0, (process.returncode, stdout, stderr)
+            require(process.returncode == 0,
+                    (process.returncode, stdout, stderr))
             process = start_process(executable, environment, port)
             replayed = http_request(port, "POST", "/v2/relay", "r" * 32,
                                      relay_body(build_id, artifact_hash, region))
-            assert replayed == opened, (opened, replayed)
+            require(replayed == opened, (opened, replayed))
             replayed_issue = http_request(port, "POST", "/v2/relay", "r" * 32, issue)
-            assert replayed_issue == issued, (issued, replayed_issue)
+            require(replayed_issue == issued, (issued, replayed_issue))
             revoked = http_request(port, "POST", f"/v2/admin/builds/{build_id}/revoke",
                                    "a" * 32, b"{}")
             expect_status(revoked, 200, process)
@@ -253,7 +300,8 @@ def main():
         finally:
             process.terminate()
             stdout, stderr = process.communicate(timeout=3)
-            assert process.returncode == 0, (process.returncode, stdout, stderr)
+            require(process.returncode == 0,
+                    (process.returncode, stdout, stderr))
 
 
 if __name__ == "__main__":

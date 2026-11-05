@@ -25,7 +25,8 @@ script.
 
 - The service account must be able to read the binary and migration files.
 - The service account must have read/write access to the SQLite file and its
-  parent directory, and read/write access to the state directory.
+  parent directory. Provision the state directory as owner-only mode `0700`;
+  when the backend creates a missing state directory, it applies that mode.
 - Keep the SQLite and state directories outside application release paths.
 - Do not grant the service account access to signing-key material beyond the
   configured provider interface.
@@ -58,6 +59,23 @@ script.
 - Treat any checksum, sequence, schema, provider, or snapshot failure as a
   startup failure. Do not delete WAL or checkpoint files to force startup.
 - Test backup restoration on an isolated copy before using it for recovery.
+- To reclaim expired exact-response payloads, compact inactive state, and rotate
+  the state WAL, stop the backend and run
+  `xovm-cloud-material-state-maintenance reclaim-expired` as the same non-root
+  service account with only `XOVM_STATE_DIR` and
+  `XOVM_TRUSTED_TIME_PROVIDER` configured. The command fails with `lock_busy`
+  if the backend or another maintenance process still owns the state directory.
+- The offline command uses trusted time and performs one bounded pass. It first
+  recovers and validates the checkpoint plus WAL, records maintenance through a
+  maintenance WAL, re-recovers and validates the resulting state, then writes an
+  atomic checkpoint and retires the WAL. Active expired reply, registration,
+  session, and claim slots are compacted into permanent replay evidence rather
+  than simply deleted. That evidence remains authoritative and is never evicted
+  by TTL expiry or build revocation.
+- Invoke maintenance again whenever it reports `more_work=true`; each invocation
+  advances at most one bounded pass. Restart the backend only after the final
+  pass exits 0 with `more_work=false`. Never delete `.xovm.lock`, checkpoint,
+  WAL, quarantine files, or permanent replay evidence to bypass a failure.
 - Rotate relay and administrator credentials independently. Revoke old
   credentials at the proxy and backend configuration boundary before deleting
   them.

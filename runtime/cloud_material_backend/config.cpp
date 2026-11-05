@@ -64,6 +64,12 @@ std::variant<BackendConfig, BackendError> BackendConfig::fromEnvironment(const L
             return BackendError{"config_invalid_port"};
         config.port = static_cast<std::uint16_t>(number);
     }
+    auto rawPort = lookup("XOVM_RAW_PORT");
+    if (!rawPort.empty()) {
+        if (!parseUnsigned(rawPort, number) || number > 65535)
+            return BackendError{"config_invalid_raw_port"};
+        config.raw_port = static_cast<std::uint16_t>(number);
+    }
     auto timeout = lookup("REQUEST_TIMEOUT_MS");
     if (!timeout.empty()) {
         if (!parseUnsigned(timeout, number) || number < 100 || number > 120000)
@@ -76,6 +82,27 @@ std::variant<BackendConfig, BackendError> BackendConfig::fromEnvironment(const L
             return BackendError{"config_invalid_concurrency"};
         config.max_concurrent_requests = static_cast<std::uint32_t>(number);
     }
+    return config;
+}
+
+std::variant<StateMaintenanceConfig, BackendError>
+StateMaintenanceConfig::fromEnvironment() {
+    return fromEnvironment([](std::string_view name) {
+        const std::string key(name);
+        const char *value = std::getenv(key.c_str());
+        return value == nullptr ? std::string{} : std::string(value);
+    });
+}
+
+std::variant<StateMaintenanceConfig, BackendError>
+StateMaintenanceConfig::fromEnvironment(const Lookup &lookup) {
+    if (!lookup) return BackendError{"config_lookup_unavailable"};
+    StateMaintenanceConfig config;
+    BackendError error;
+    config.state_dir = required(lookup, "XOVM_STATE_DIR", error);
+    config.trusted_time_provider = required(
+        lookup, "XOVM_TRUSTED_TIME_PROVIDER", error);
+    if (!error.code.empty()) return error;
     return config;
 }
 

@@ -38,6 +38,10 @@ if(NOT DEFINED LLVM_MAIN_SRC_DIR)
   add_definitions(${LLVM_DEFINITIONS})
 endif()
 
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+
+add_subdirectory(runtime/cloud_material)
+
 
 # ---------------------------------------------------------------------------
 # AES stub prerequisites (both modes)
@@ -249,6 +253,18 @@ add_llvm_pass_plugin(Obfuscator
   ${_OBF_DEPENDS}
   ${_OBF_LINK_COMPONENTS}
 )
+target_compile_features(Obfuscator PRIVATE cxx_std_20)
+target_link_libraries(Obfuscator PRIVATE
+  OpenSSL::Crypto
+  xovm::dynamic-vm-runtime
+)
+if(TARGET obj.Obfuscator)
+  target_compile_features(obj.Obfuscator PRIVATE cxx_std_20)
+  target_link_libraries(obj.Obfuscator PRIVATE
+    OpenSSL::Crypto
+    xovm::dynamic-vm-runtime
+  )
+endif()
 
 # For shared library builds, link only available shared LLVM libraries
 # Note: Some LLVM components (Passes, ScalarOpts, etc.) may only be built as static
@@ -333,6 +349,10 @@ if(LLVM_INCLUDE_TESTS AND DEFINED LLVM_MAIN_SRC_DIR)
     VMPass_Targets.cpp
     VMWhiteBoxAES.cpp
     VMPass_WhiteBox.cpp
+  )
+  target_link_libraries(VMRequirementsTests PRIVATE
+    OpenSSL::Crypto
+    xovm::dynamic-vm-runtime
   )
   add_dependencies(VMRequirementsTests xollvm-cloud-material-fs-helper)
   target_compile_definitions(VMRequirementsTests PRIVATE OBF_TEST_VM_IMPL=1)

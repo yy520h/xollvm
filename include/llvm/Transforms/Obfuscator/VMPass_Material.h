@@ -14,6 +14,11 @@ struct VMOpcodeMap;
 struct VMPassConfig;
 class VMPlanCoordinator;
 
+struct DynamicArtifactExport {
+	json::Object PublicManifest;
+	json::Object PrivateRegistration;
+};
+
 enum class MaterialExportFault {
 	None, Create, Write, FileSync, Close, DirectorySync, Rename, RootSync,
 	DestinationSwap, MemberContent, MemberSwap
@@ -59,9 +64,14 @@ private:
 	friend class VMPlanCoordinator;
 	friend Expected<MaterialCommitResult> commitCanonicalRegions(StringRef, StringRef,
 		ArrayRef<json::Object>, const MaterialCommitToken&);
+	friend Expected<MaterialCommitResult> commitDynamicArtifacts(StringRef, StringRef,
+		ArrayRef<DynamicArtifactExport>, const MaterialCommitToken&);
 };
 
 Expected<json::Object> exportCanonicalRegion(const BytecodeEmitter& Emitter,
+	const VMPassConfig& Config, const VMOpcodeMap& Opcodes);
+
+Expected<DynamicArtifactExport> exportDynamicArtifact(const BytecodeEmitter& Emitter,
 	const VMPassConfig& Config, const VMOpcodeMap& Opcodes);
 
 Expected<std::string> canonicalMaterialJSON(const json::Value& Value,
@@ -73,6 +83,10 @@ Error verifyCanonicalRegionWithDescriptor(const json::Object& Region,
 
 Expected<MaterialCommitResult> commitCanonicalRegions(StringRef ExportRoot,
 	StringRef SoftwareId, ArrayRef<json::Object> Regions,
+	const MaterialCommitToken& Token);
+
+Expected<MaterialCommitResult> commitDynamicArtifacts(StringRef ExportRoot,
+	StringRef SoftwareId, ArrayRef<DynamicArtifactExport> Artifacts,
 	const MaterialCommitToken& Token);
 
 } // namespace llvm
