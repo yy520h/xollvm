@@ -21,6 +21,7 @@
 #include "gtest/gtest.h"
 
 #include <cstdlib>
+#include <openssl/crypto.h>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -137,26 +138,22 @@ static std::optional<xovm::material::DynamicHash> parseDynamicHash(StringRef Tex
 	return Result;
 }
 
-static std::optional<xovm::material::DecryptedVmArtifact> decryptDynamicExport(
+static std::optional<xovm::material::ArtifactSourceV3> decryptDynamicExport(
 	const DynamicArtifactExport& Export) {
+	using namespace xovm::material;
 	auto Ciphertext = Export.PublicManifest.getString("encrypted_artifact_b64");
-	auto KeyText = Export.PrivateRegistration.getString("artifact_key_b64");
+	auto* Capabilities = Export.PrivateRegistration.getArray("node_capabilities");
 	auto BuildText = Export.PublicManifest.getString("build_id");
 	auto RegionText = Export.PublicManifest.getString("region_id");
 	auto ArtifactText = Export.PublicManifest.getString("artifact_hash");
-	if (!Ciphertext || !KeyText || !BuildText || !RegionText || !ArtifactText)
+	if (!Ciphertext || !Capabilities || Capabilities->empty() ||
+		!BuildText || !RegionText || !ArtifactText)
 		return std::nullopt;
 	std::vector<char> Encoded;
-	std::vector<char> KeyBytes;
 	if (Error E = decodeBase64(*Ciphertext, Encoded)) {
 		consumeError(std::move(E));
 		return std::nullopt;
 	}
-	if (Error E = decodeBase64(*KeyText, KeyBytes)) {
-		consumeError(std::move(E));
-		return std::nullopt;
-	}
-	if (KeyBytes.size() != 32) return std::nullopt;
 	auto Build = parseDynamicHash(*BuildText);
 	auto Region = parseDynamicHash(*RegionText);
 	auto ArtifactHash = parseDynamicHash(*ArtifactText);
@@ -164,10 +161,61 @@ static std::optional<xovm::material::DecryptedVmArtifact> decryptDynamicExport(
 	auto Artifact = xovm::material::decodeEncryptedVmArtifact(ArrayRef<uint8_t>(
 		reinterpret_cast<const uint8_t*>(Encoded.data()), Encoded.size()));
 	if (!Artifact) return std::nullopt;
-	std::array<uint8_t, 32> Key{};
-	std::copy(KeyBytes.begin(), KeyBytes.end(), Key.begin());
-	return xovm::material::decryptEncryptedVmArtifact(*Artifact, Key,
-		*Build, *Region, *ArtifactHash);
+	ArtifactSourceV3 Result;
+	Result.build_id = *Build;
+	Result.region_id = *Region;
+	Result.continuation_descriptors = Artifact->continuation_descriptors;
+	std::vector<uint8_t> Handlers;
+	HandlerShardDescriptor Descriptor;
+	for (const auto& Value : *Capabilities) {
+		auto* Entry = Value.getAsObject();
+		auto SelectorText = Entry ? Entry->getString("selector_b64") : std::nullopt;
+		auto KeyText = Entry ? Entry->getString("capability_b64") : std::nullopt;
+		if (!SelectorText || !KeyText) return std::nullopt;
+		std::vector<char> SelectorBytes, KeyBytes;
+		auto ClearKey = make_scope_exit([&] {
+			if (!KeyBytes.empty()) OPENSSL_cleanse(KeyBytes.data(), KeyBytes.size());
+		});
+		if (Error E = decodeBase64(*SelectorText, SelectorBytes)) {
+			consumeError(std::move(E));
+			return std::nullopt;
+		}
+		if (Error E = decodeBase64(*KeyText, KeyBytes)) {
+			consumeError(std::move(E));
+			return std::nullopt;
+		}
+		if (KeyBytes.size() != 32) return std::nullopt;
+		auto Selector = decodeDynamicVmWindowSelectorV3(std::span<const uint8_t>(
+			reinterpret_cast<const uint8_t*>(SelectorBytes.data()), SelectorBytes.size()));
+		if (!Selector) return std::nullopt;
+		DynamicVmNodeCapabilityV3 Capability;
+		auto ClearCapability = make_scope_exit([&] {
+			OPENSSL_cleanse(Capability.capability.data(), Capability.capability.size());
+		});
+		Capability.node_id = Selector->node_id;
+		std::copy(KeyBytes.begin(), KeyBytes.end(), Capability.capability.begin());
+		auto Node = decryptSelectiveDynamicVmNodeV3(*Artifact, *Selector,
+			Capability.capability, *Build, *Region, *ArtifactHash);
+		if (!Node) return std::nullopt;
+		if (Result.node_capabilities.empty()) Descriptor.shard_id = Node->node().shard_id;
+		Result.node_capabilities.push_back(Capability);
+		Result.bytecode.insert(Result.bytecode.end(), Node->bytecodeBlock().begin(),
+			Node->bytecodeBlock().end());
+		Handlers.insert(Handlers.end(), Node->handlerShard().begin(), Node->handlerShard().end());
+	}
+	Descriptor.code_size = Handlers.size();
+	Descriptor.commitment = hashAarch64ShardCode(Handlers);
+	Result.handler_shards = encodeHandlerShardPayload(Descriptor, Handlers);
+	secureClear(Handlers);
+	return Result;
+}
+
+static void clearDynamicExport(xovm::material::ArtifactSourceV3& Source) {
+	using namespace xovm::material;
+	secureClear(Source.bytecode);
+	secureClear(Source.handler_shards);
+	for (auto& Entry : Source.node_capabilities)
+		OPENSSL_cleanse(Entry.capability.data(), Entry.capability.size());
 }
 
 static const json::Array& arrayField(const json::Object& Object, StringRef Name) {
@@ -272,7 +320,7 @@ TEST(VMMaterial, ExportsEmitterRecordsAfterConstPrologue) {
 	EXPECT_FALSE(Bytes->empty());
 }
 
-TEST(VMMaterial, DynamicArtifactExportSealsCanonicalV2ExecutionMaterial) {
+TEST(VMMaterial, DynamicArtifactExportSealsSelectiveV3ExecutionMaterial) {
 	using namespace xovm::material;
 	auto Fixture = makeDynamicFixture();
 	const auto Records = Fixture.Emitter.getInstructionRecords();
@@ -283,14 +331,25 @@ TEST(VMMaterial, DynamicArtifactExportSealsCanonicalV2ExecutionMaterial) {
 	ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
 	const json::Object& Public = Export->PublicManifest;
 	const json::Object& Private = Export->PrivateRegistration;
-	ASSERT_EQ(Public.getInteger("format_version"), 2);
+	ASSERT_EQ(Public.getInteger("format_version"), 3);
+	ASSERT_EQ(Private.getInteger("format_version"), 3);
 	ASSERT_EQ(Public.getString("material_source"), "dynamic_vm");
 	EXPECT_TRUE(Public.getString("artifact_hash").has_value());
 	EXPECT_TRUE(Public.getString("encrypted_artifact_b64").has_value());
 	EXPECT_EQ(Public.getString("artifact_key_b64"), std::nullopt);
 	EXPECT_FALSE(Public.getString("canonical_bc").has_value());
 	EXPECT_EQ(Public.getArray("decode_map"), nullptr);
-	EXPECT_TRUE(Private.getString("artifact_key_b64").has_value());
+	EXPECT_EQ(Private.getString("artifact_key_b64"), std::nullopt);
+	EXPECT_EQ(Public.getArray("node_capabilities"), nullptr);
+	auto* Capabilities = Private.getArray("node_capabilities");
+	ASSERT_NE(Capabilities, nullptr);
+	ASSERT_EQ(Capabilities->size(), 2u);
+	EXPECT_TRUE((*Capabilities)[0].getAsObject()->getString("capability_b64") !=
+		(*Capabilities)[1].getAsObject()->getString("capability_b64"));
+	json::Object PrivateCopy = Private;
+	auto PrivateBytes = canonicalMaterialJSON(json::Value(std::move(PrivateCopy)),
+		MaterialCodecProfile::PrivateRegistration);
+	ASSERT_TRUE(static_cast<bool>(PrivateBytes)) << toString(PrivateBytes.takeError());
 	EXPECT_FALSE(Private.getString("canonical_bc").has_value());
 	EXPECT_EQ(Private.getArray("decode_map"), nullptr);
 	EXPECT_NE(*Public.getString("encrypted_artifact_b64"),
@@ -342,7 +401,7 @@ TEST(VMMaterial, DynamicArtifactExportSealsCanonicalV2ExecutionMaterial) {
 		Graph->nodes[1].register_index);
 	EXPECT_EQ(validateContinuationGraphV2(*Abi, *Graph, Decrypted->bytecode,
 		HandlerPayload->code), DynamicVmSchemaStatusV2::Valid);
-	secureClear(*Decrypted);
+	clearDynamicExport(*Decrypted);
 }
 
 TEST(VMMaterial, DynamicArtifactUsesCanonicalRegionIdentity) {
@@ -437,23 +496,18 @@ TEST(VMMaterial, DynamicCommitRejectsAuthenticatedHandlerSemanticMismatch) {
 	auto Region = parseDynamicHash(*Export->PublicManifest.getString("region_id"));
 	ASSERT_TRUE(Build.has_value());
 	ASSERT_TRUE(Region.has_value());
-	std::vector<char> DecodedKey;
-	ASSERT_FALSE(decodeBase64(*Export->PrivateRegistration.getString("artifact_key_b64"),
-		DecodedKey));
-	ASSERT_EQ(DecodedKey.size(), 32u);
-	ArtifactSource Source;
+	ArtifactSourceV3 Source;
 	Source.build_id = *Build;
 	Source.region_id = *Region;
-	std::copy(DecodedKey.begin(), DecodedKey.end(), Source.artifact_key.begin());
+	Source.node_capabilities = Decrypted->node_capabilities;
 	Source.bytecode = Decrypted->bytecode;
 	Source.handler_shards = std::move(HandlerBytes);
 	Source.continuation_descriptors = std::move(AbiBytes);
-	// The artifact boundary independently binds exact native semantics to the
-	// authenticated bytecode operands, so a self-consistent graph/code mutation
-	// is rejected before encryption or publication.
-	auto Rebuilt = buildEncryptedVmArtifact(Source);
+	// 即使图和承诺自洽，原生处理器仍须与认证的字节码操作数一致。
+	auto Rebuilt = buildSelectiveEncryptedVmArtifactV3(Source);
 	EXPECT_FALSE(Rebuilt.has_value());
-	secureClear(*Decrypted);
+	clearDynamicExport(Source);
+	clearDynamicExport(*Decrypted);
 }
 
 TEST(VMMaterial, DynamicArtifactCommitPublishesSeparatePublicAndPrivateFiles) {
@@ -614,7 +668,8 @@ TEST(VMMaterial, DynamicCommitRejectsUndecryptableArtifact) {
 			Export->PublicManifest["artifact_hash"] = std::string(64, '0');
 			Export->PrivateRegistration["artifact_hash"] = std::string(64, '0');
 		} else {
-			Export->PrivateRegistration["artifact_key_b64"] = encodeBase64(
+			(*Export->PrivateRegistration.getArray("node_capabilities"))[0]
+				.getAsObject()->operator[]("capability_b64") = encodeBase64(
 				ArrayRef<uint8_t>(std::array<uint8_t, 32>{}));
 		}
 		SmallVector<DynamicArtifactExport, 1> Artifacts;
@@ -623,6 +678,47 @@ TEST(VMMaterial, DynamicCommitRejectsUndecryptableArtifact) {
 			MaterialCommitToken::forExportOnlyTest());
 		ASSERT_FALSE(static_cast<bool>(Result)) << Case;
 		consumeError(Result.takeError());
+	}
+}
+
+TEST(VMMaterial, DynamicCommitRejectsInvalidSelectiveRegistration) {
+	for (unsigned Case = 0; Case < 10; ++Case) {
+		std::string Root = temporaryRoot();
+		auto Cleanup = make_scope_exit([&] { sys::fs::remove_directories(Root); });
+		auto Fixture = makeDynamicFixture();
+		auto Export = exportDynamicArtifact(Fixture.Emitter, Fixture.Config, Fixture.Opcodes);
+		ASSERT_TRUE(static_cast<bool>(Export)) << toString(Export.takeError());
+		auto* Entries = Export->PrivateRegistration.getArray("node_capabilities");
+		ASSERT_NE(Entries, nullptr);
+		ASSERT_EQ(Entries->size(), 2u);
+		auto* First = (*Entries)[0].getAsObject();
+		auto* Second = (*Entries)[1].getAsObject();
+		if (Case == 0) Entries->pop_back();
+		else if (Case == 1) (*Entries)[1] = (*Entries)[0];
+		else if (Case == 2) {
+			std::string Key = First->getString("capability_b64")->str();
+			(*First)["capability_b64"] = *Second->getString("capability_b64");
+			(*Second)["capability_b64"] = Key;
+		} else if (Case == 3) (*First)["selector_b64"] = *Second->getString("selector_b64");
+		else if (Case == 4) (*First)["capability_b64"] = "AA==";
+		else if (Case == 5) Export->PrivateRegistration["format_version"] = 2;
+		else if (Case == 6) (*First)["artifact_key_b64"] = "AA==";
+		else if (Case == 7) (*First)["selector_b64"] = "AA==";
+		else if (Case == 8) {
+			std::string Key = First->getString("capability_b64")->str();
+			StringRef Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+			Key[42] = Alphabet[Alphabet.find(Key[42]) | 1];
+			(*First)["capability_b64"] = Key;
+		} else Export->PublicManifest["format_version"] = 2;
+		SmallVector<DynamicArtifactExport, 1> Artifacts;
+		Artifacts.push_back(std::move(*Export));
+		auto Result = commitDynamicArtifacts(Root, "test.app", Artifacts,
+			MaterialCommitToken::forExportOnlyTest());
+		ASSERT_FALSE(static_cast<bool>(Result)) << Case;
+		consumeError(Result.takeError());
+		std::error_code EC;
+		EXPECT_EQ(sys::fs::directory_iterator(Root, EC), sys::fs::directory_iterator());
+		EXPECT_FALSE(EC);
 	}
 }
 

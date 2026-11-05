@@ -57,7 +57,14 @@ export function createServer({productionService, config, http}) {
       !http || typeof http.createServer !== 'function') fail('invalid_config');
   let active = 0;
   const handler = async (request, response) => {
-    const path = new URL(request.url ?? '/', 'http://loopback').pathname;
+    let path;
+    try {
+      path = new URL(request.url ?? '/', 'http://loopback').pathname;
+    } catch {
+      respond(response, 400, JSON.stringify({error: 'invalid_url'}));
+      request.resume?.();
+      return;
+    }
     if (request.method === 'GET' && path === '/healthz') {
       try {
         const status = await productionService.readiness();

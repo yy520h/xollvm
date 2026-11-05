@@ -17,7 +17,7 @@ class VMTools:
 def tools():
     root = Path(os.environ.get('XOLLVM_PROJECT_ROOT', Path(__file__).resolve().parents[2]))
     build = root / 'build-sensitive/bin'
-    ndk = root.parent / 'android-ndk-r30-ollvm-r23-beta3/toolchains/llvm/prebuilt/linux-arm64'
+    ndk = root / 'android-ndk-r30-ollvm-r23-beta3/toolchains/llvm/prebuilt/linux-arm64'
     t = VMTools(Path(os.environ.get('XOLLVM_OPT', build / 'opt')),
                 ndk / 'bin/clang', ndk / 'bin/clang++', ndk / 'sysroot',
                 build / 'xollvm-elf-hardener')

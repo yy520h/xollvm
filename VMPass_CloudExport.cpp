@@ -198,17 +198,24 @@ bool CloudMaterialExporter::exportBytecode(
     return false;
   }
 
+  for (char c : materialRegion)
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '-')) {
+      errs() << "[CloudExport] invalid cloud material ID region: "
+             << materialRegion << "\n";
+      return false;
+    }
+
   // Generate material ID from function name and region
   std::string materialID = materialRegion.empty()
       ? functionName.str()
       : (materialRegion.str() + "__" + functionName.str());
-
-  // Sanitize material ID (remove special characters)
-  for (char& c : materialID) {
-    if (!std::isalnum(c) && c != '_') {
-      c = '_';
+  for (char c : materialID)
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) {
+      errs() << "[CloudExport] invalid cloud material ID: " << materialID << "\n";
+      return false;
     }
-  }
 
   outs() << "[CloudExport] Exporting " << bytecode.size()
          << " bytes for " << materialID << "\n";

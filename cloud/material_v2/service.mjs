@@ -284,8 +284,6 @@ export async function handleSession(requestBytes, auth, store, clock, randomByte
             status: 'active',
             control_counter: '0',
           };
-          // Reference store owns the configured epoch; signing metadata mirrors it below.
-          session.counter_epoch = store.referenceCounterEpochForService();
         } else {
           if (q.type === 'session.close') checkSession(session, q, trusted, clockInterval.upper);
           if (readU64(q.previous_counter) > readU64(session.control_counter))

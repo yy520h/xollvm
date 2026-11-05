@@ -78,6 +78,9 @@ class CloudProviderManager {
       const std::vector<ProviderRegistration>& registrations)
       : active_provider_(std::nullopt), health_check_counter_(0) {}
 
+  CloudProviderManager(CloudProviderManager&&) noexcept = default;
+  CloudProviderManager& operator=(CloudProviderManager&&) noexcept = default;
+
  private:
 
   std::map<uint32_t, RawSocketCloudProvider::ConnectionConfig> providers_;

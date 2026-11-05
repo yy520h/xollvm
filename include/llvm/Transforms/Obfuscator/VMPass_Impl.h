@@ -14,6 +14,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Transforms/Utils/ValueMapper.h"
 
 #include "llvm/Transforms/Obfuscator/VMPass.h"
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
@@ -420,6 +421,7 @@ namespace llvm {
 		// 暂存模块拥有规范化副本，保证 emitter 的 Value 指针跨阶段有效。
 		std::unique_ptr<Module> PreparedModule;
 		Function *PreparedFunction = nullptr;
+		ValueToValueMapTy PreparedToOriginalValues;
 		bool Prepared = false;
 		bool Committed = false;
 		BytecodeEmitter E;

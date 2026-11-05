@@ -84,7 +84,7 @@ std::optional<CloudProviderManager> CloudProviderManager::create(
     return std::nullopt;
   }
 
-  return std::optional<CloudProviderManager>(std::in_place, registrations);
+  return manager;
 }
 
 bool CloudProviderManager::registerProvider(

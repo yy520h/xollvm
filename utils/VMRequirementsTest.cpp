@@ -1320,11 +1320,13 @@ TEST(VMCloudMaterial, CoordinatorPreparesAndPromotesDynamicArtifactWithoutLegacy
 	ASSERT_TRUE(Candidate->DynamicArtifact.has_value());
 	const auto& Public = Candidate->DynamicArtifact->PublicManifest;
 	const auto& Private = Candidate->DynamicArtifact->PrivateRegistration;
-	EXPECT_EQ(Public.getInteger("format_version"), 2);
+	EXPECT_EQ(Public.getInteger("format_version"), 3);
 	EXPECT_EQ(Public.getString("material_source"), "dynamic_vm");
 	EXPECT_TRUE(Public.getString("encrypted_artifact_b64").has_value());
 	EXPECT_EQ(Public.getString("artifact_key_b64"), std::nullopt);
-	EXPECT_TRUE(Private.getString("artifact_key_b64").has_value());
+	EXPECT_EQ(Private.getString("artifact_key_b64"), std::nullopt);
+	ASSERT_NE(Private.getArray("node_capabilities"), nullptr);
+	EXPECT_EQ(Private.getArray("node_capabilities")->size(), 2u);
 	EXPECT_FALSE(Raw->Committed);
 	EXPECT_TRUE(M->global_empty());
 

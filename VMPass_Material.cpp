@@ -137,7 +137,9 @@ Error encodeCanonical(const json::Value& Value, std::string& Out, unsigned Depth
 		auto Text = Value.getAsString();
 		size_t Limit = ((Owner == "canonical_bc" &&
 			Profile != MaterialCodecProfile::PublicManifest) ||
-			Owner == "encrypted_artifact_b64") ? kMaxBase64Bytes : 256;
+			Owner == "encrypted_artifact_b64") ? kMaxBase64Bytes :
+			(Owner == "selector_b64" && Profile == MaterialCodecProfile::PrivateRegistration)
+				? 4 * ((xovm::material::kDynamicVmWindowSelectorV3EncodedSize + 2) / 3) : 256;
 		if (!Text || !validASCII(*Text, Limit))
 			return materialError("material JSON string is not ASCII");
 		appendEscaped(Out, *Text);
@@ -384,52 +386,6 @@ std::vector<uint8_t> encodeDynamicExecutionDescriptor(
 	if (Abi.empty() || Graph.empty()) return {};
 	Abi.insert(Abi.end(), Graph.begin(), Graph.end());
 	return Abi;
-}
-
-Error validateDynamicExecutionDescriptor(
-	const xovm::material::DecryptedVmArtifact& Artifact) {
-	using namespace xovm::material;
-	if (!Artifact.relocation_descriptors.empty() ||
-		Artifact.continuation_descriptors.size() <= kDynamicVmExecutionAbiV2EncodedSize)
-		return materialError("dynamic artifact v2 descriptor missing");
-	auto Descriptor = ArrayRef<uint8_t>(Artifact.continuation_descriptors);
-	auto Abi = decodeDynamicVmExecutionAbiV2(
-		Descriptor.take_front(kDynamicVmExecutionAbiV2EncodedSize));
-	auto Graph = decodeContinuationGraphV2(
-		Descriptor.drop_front(kDynamicVmExecutionAbiV2EncodedSize));
-	auto HandlerPayload = decodeHandlerShardPayload(Artifact.handler_shards);
-	if (!Abi || !Graph || !HandlerPayload || Graph->nodes.size() != 2 ||
-		HandlerPayload->descriptor.shard_id != Graph->nodes.front().shard_id ||
-		HandlerPayload->descriptor.code_size != HandlerPayload->code.size() ||
-		validateContinuationGraphV2(*Abi, *Graph, Artifact.bytecode,
-			HandlerPayload->code) != DynamicVmSchemaStatusV2::Valid) {
-		if (HandlerPayload) secureClear(HandlerPayload->code);
-		return materialError("dynamic artifact v2 descriptor invalid");
-	}
-	const auto& LoadNode = Graph->nodes[0];
-	const auto& ReturnNode = Graph->nodes[1];
-	std::span<const uint8_t> Bytecode(Artifact.bytecode);
-	std::span<const uint8_t> HandlerCode(HandlerPayload->code);
-	const auto LoadBlock = Bytecode.subspan(LoadNode.bytecode_offset,
-		LoadNode.bytecode_size);
-	const auto LoadShard = HandlerCode.subspan(LoadNode.shard_offset,
-		LoadNode.shard_size);
-	const auto ReturnShard = HandlerCode.subspan(ReturnNode.shard_offset,
-		ReturnNode.shard_size);
-	const size_t ImmediateOffset = Abi->loadi32_immediate_offset;
-	const uint32_t Immediate = static_cast<uint32_t>(LoadBlock[ImmediateOffset]) |
-		(static_cast<uint32_t>(LoadBlock[ImmediateOffset + 1]) << 8) |
-		(static_cast<uint32_t>(LoadBlock[ImmediateOffset + 2]) << 16) |
-		(static_cast<uint32_t>(LoadBlock[ImmediateOffset + 3]) << 24);
-	if (!validateAarch64LoadImmediateShard(LoadShard, LoadNode.register_index,
-			Immediate, ReturnNode.bytecode_offset) ||
-		!validateAarch64ReturnIntShard(ReturnShard, ReturnNode.register_index,
-			Artifact.bytecode.size())) {
-		secureClear(HandlerPayload->code);
-		return materialError("dynamic artifact handler semantics invalid");
-	}
-	secureClear(HandlerPayload->code);
-	return Error::success();
 }
 
 std::string stableType(Type* Ty) {
@@ -878,7 +834,7 @@ Error validateDynamicArtifactExport(const DynamicArtifactExport& Export) {
 	};
 	static const StringRef PrivateFields[] = {
 		"format_version", "material_source", "region_name", "build_id", "region_id",
-		"artifact_hash", "artifact_key_b64",
+		"artifact_hash", "node_capabilities",
 	};
 	if (!hasExactFields(Export.PublicManifest, PublicFields) ||
 		!hasExactFields(Export.PrivateRegistration, PrivateFields))
@@ -897,8 +853,8 @@ Error validateDynamicArtifactExport(const DynamicArtifactExport& Export) {
 	auto PrivateHash = Export.PrivateRegistration.getString("artifact_hash");
 	auto Ciphertext = Export.PublicManifest.getString("encrypted_artifact_b64");
 	auto ArtifactSize = Export.PublicManifest.getInteger("artifact_size");
-	auto Key = Export.PrivateRegistration.getString("artifact_key_b64");
-	if (!PublicVersion || *PublicVersion != 2 || !PrivateVersion || *PrivateVersion != 2 ||
+	auto* Capabilities = Export.PrivateRegistration.getArray("node_capabilities");
+	if (!PublicVersion || *PublicVersion != 3 || !PrivateVersion || *PrivateVersion != 3 ||
 		!PublicSource || *PublicSource != "dynamic_vm" || !PrivateSource ||
 		*PrivateSource != "dynamic_vm" || !PublicName || !PrivateName ||
 		*PublicName != *PrivateName || !validName(*PublicName) || !PublicBuild ||
@@ -908,8 +864,7 @@ Error validateDynamicArtifactExport(const DynamicArtifactExport& Export) {
 		*PublicHash != *PrivateHash || !validHash(*PublicHash) || !Ciphertext ||
 		Ciphertext->empty() || Ciphertext->size() > kMaxBase64Bytes ||
 		Ciphertext->size() % 4 != 0 || !ArtifactSize || *ArtifactSize < 1 ||
-		static_cast<uint64_t>(*ArtifactSize) > kMaxBytecodeBytes * 64 || !Key ||
-		Key->empty() || Key->size() > 128 || Key->size() % 4 != 0)
+		static_cast<uint64_t>(*ArtifactSize) > kMaxBytecodeBytes * 64 || !Capabilities)
 		return materialError("dynamic artifact manifest field invalid");
 	std::vector<char> Encoded;
 	if (Error E = decodeBase64(*Ciphertext, Encoded)) {
@@ -919,16 +874,6 @@ Error validateDynamicArtifactExport(const DynamicArtifactExport& Export) {
 	if (Encoded.size() != static_cast<size_t>(*ArtifactSize) ||
 		encodeBase64(Encoded) != *Ciphertext)
 		return materialError("dynamic artifact size mismatch");
-	std::vector<char> DecodedKey;
-	if (Error E = decodeBase64(*Key, DecodedKey)) {
-		consumeError(std::move(E));
-		return materialError("dynamic artifact key encoding invalid");
-	}
-	auto ClearDecodedKey = make_scope_exit([&] {
-		if (!DecodedKey.empty()) OPENSSL_cleanse(DecodedKey.data(), DecodedKey.size());
-	});
-	if (DecodedKey.size() != 32 || encodeBase64(DecodedKey) != *Key)
-		return materialError("dynamic artifact key size mismatch");
 	auto BuildId = parseDynamicHash(*PublicBuild);
 	auto RegionId = parseDynamicHash(*PublicRegion);
 	auto ArtifactHash = parseDynamicHash(*PublicHash);
@@ -936,22 +881,75 @@ Error validateDynamicArtifactExport(const DynamicArtifactExport& Export) {
 		return materialError("dynamic artifact identity encoding invalid");
 	ArrayRef<uint8_t> EncodedBytes(reinterpret_cast<const uint8_t*>(Encoded.data()), Encoded.size());
 	auto Artifact = xovm::material::decodeEncryptedVmArtifact(EncodedBytes);
-	if (!Artifact || Artifact->build_id != *BuildId || Artifact->region_id != *RegionId ||
-		Artifact->artifact_hash != *ArtifactHash)
+	using namespace xovm::material;
+	if (!Artifact || !validateEncryptedVmArtifactMetadata(*Artifact, *BuildId,
+		*RegionId, *ArtifactHash))
 		return materialError("dynamic artifact identity commitment mismatch");
-	std::array<uint8_t, 32> ArtifactKey{};
-	std::copy(DecodedKey.begin(), DecodedKey.end(), ArtifactKey.begin());
-	auto ClearArtifactKey = make_scope_exit([&] {
-		OPENSSL_cleanse(ArtifactKey.data(), ArtifactKey.size());
+	auto Descriptor = ArrayRef<uint8_t>(Artifact->continuation_descriptors);
+	if (Descriptor.size() <= kDynamicVmExecutionAbiV2EncodedSize)
+		return materialError("dynamic artifact descriptor missing");
+	auto Abi = decodeDynamicVmExecutionAbiV2(
+		Descriptor.take_front(kDynamicVmExecutionAbiV2EncodedSize));
+	auto Graph = decodeContinuationGraphV2(
+		Descriptor.drop_front(kDynamicVmExecutionAbiV2EncodedSize));
+	if (!Abi || !Graph || Graph->nodes.size() != 2 ||
+		Capabilities->size() != Graph->nodes.size() ||
+		validateContinuationGraphV2(*Abi, *Graph) != DynamicVmSchemaStatusV2::Valid)
+		return materialError("dynamic artifact descriptor invalid");
+	std::vector<uint8_t> Bytecode, HandlerCode;
+	std::array<std::array<uint8_t, 32>, kDynamicVmMaxContinuationNodesV2> Keys{};
+	auto ClearMaterial = make_scope_exit([&] {
+		secureClear(Bytecode);
+		secureClear(HandlerCode);
+		OPENSSL_cleanse(Keys.data(), sizeof(Keys));
 	});
-	auto Decrypted = xovm::material::decryptEncryptedVmArtifact(*Artifact, ArtifactKey,
-		*BuildId, *RegionId, *ArtifactHash);
-	if (!Decrypted) return materialError("dynamic artifact decryption failed");
-	if (Error E = validateDynamicExecutionDescriptor(*Decrypted)) {
-		xovm::material::secureClear(*Decrypted);
-		return E;
+	Bytecode.reserve(Graph->descriptor.bytecode_size);
+	HandlerCode.reserve(Graph->descriptor.handler_shards_size);
+	static const StringRef CapabilityFields[] = {"selector_b64", "capability_b64"};
+	for (size_t I = 0; I < Capabilities->size(); ++I) {
+		auto* Entry = (*Capabilities)[I].getAsObject();
+		if (!Entry || !hasExactFields(*Entry, CapabilityFields))
+			return materialError("dynamic artifact capability schema mismatch");
+		auto SelectorText = Entry->getString("selector_b64");
+		auto KeyText = Entry->getString("capability_b64");
+		if (!SelectorText || SelectorText->size() !=
+			4 * ((kDynamicVmWindowSelectorV3EncodedSize + 2) / 3) ||
+			!KeyText || KeyText->size() != 44)
+			return materialError("dynamic artifact capability encoding invalid");
+		std::vector<char> SelectorBytes, KeyBytes;
+		auto ClearKey = make_scope_exit([&] {
+			if (!KeyBytes.empty()) OPENSSL_cleanse(KeyBytes.data(), KeyBytes.size());
+		});
+		if (Error E = decodeBase64(*SelectorText, SelectorBytes)) {
+			consumeError(std::move(E));
+			return materialError("dynamic artifact selector encoding invalid");
+		}
+		if (Error E = decodeBase64(*KeyText, KeyBytes)) {
+			consumeError(std::move(E));
+			return materialError("dynamic artifact capability encoding invalid");
+		}
+		if (KeyBytes.size() != Keys[I].size() || encodeBase64(KeyBytes) != *KeyText ||
+			encodeBase64(SelectorBytes) != *SelectorText)
+			return materialError("dynamic artifact capability encoding noncanonical");
+		auto Selector = decodeDynamicVmWindowSelectorV3(std::span<const uint8_t>(
+			reinterpret_cast<const uint8_t*>(SelectorBytes.data()), SelectorBytes.size()));
+		auto Expected = dynamicVmWindowSelectorV3(*Abi, Graph->descriptor, Graph->nodes[I]);
+		if (!Selector || !Expected || *Selector != *Expected)
+			return materialError("dynamic artifact capability selector mismatch");
+		std::copy(KeyBytes.begin(), KeyBytes.end(), Keys[I].begin());
+		for (size_t Prior = 0; Prior < I; ++Prior)
+			if (Keys[Prior] == Keys[I])
+				return materialError("dynamic artifact duplicate node capability");
+		auto Node = decryptSelectiveDynamicVmNodeV3(*Artifact, *Selector, Keys[I],
+			*BuildId, *RegionId, *ArtifactHash);
+		if (!Node) return materialError("dynamic artifact node decryption failed");
+		Bytecode.insert(Bytecode.end(), Node->bytecodeBlock().begin(), Node->bytecodeBlock().end());
+		HandlerCode.insert(HandlerCode.end(), Node->handlerShard().begin(), Node->handlerShard().end());
 	}
-	xovm::material::secureClear(*Decrypted);
+	// 逐节点认证后仍校验整图，保留总字节码哈希、指令边界和操作数绑定。
+	if (validateContinuationGraphV2(*Abi, *Graph, Bytecode, HandlerCode) !=
+		DynamicVmSchemaStatusV2::Valid)
+		return materialError("dynamic artifact execution material invalid");
 	return Error::success();
 }
 
@@ -1106,7 +1104,7 @@ Error rejectExistingDynamicConflicts(int RootFD, StringRef FinalName,
 		auto Parsed = json::parse(Bytes);
 		if (!Parsed) return materialError("dynamic public manifest parse failed");
 		auto* Object = Parsed->getAsObject();
-		if (!Object || Object->getInteger("format_version") != 2 ||
+		if (!Object || Object->getInteger("format_version") != 3 ||
 			Object->getString("material_source") != "dynamic_vm")
 			return materialError("dynamic public manifest schema invalid");
 		auto* Regions = Object->getArray("regions");
@@ -1143,7 +1141,7 @@ Error rejectExistingDynamicConflicts(int RootFD, StringRef FinalName,
 		if (!Parsed) return materialError("dynamic existing public manifest parse failed");
 		auto* Object = Parsed->getAsObject();
 		auto* Regions = Object ? Object->getArray("regions") : nullptr;
-		if (!Object || Object->getInteger("format_version") != 2 ||
+		if (!Object || Object->getInteger("format_version") != 3 ||
 			Object->getString("material_source") != "dynamic_vm" || !Regions)
 			return materialError("dynamic existing public manifest invalid");
 		for (const json::Value& Value : *Regions) {
@@ -1300,21 +1298,34 @@ Expected<DynamicArtifactExport> llvm::exportDynamicArtifact(
 	if (!Canonical) return Canonical.takeError();
 	auto CanonicalRegionId = Canonical->getString("region_id");
 	if (!CanonicalRegionId) return materialError("dynamic canonical region identity missing");
+	auto ParsedRegionId = parseDynamicHash(*CanonicalRegionId);
+	if (!ParsedRegionId) return materialError("dynamic canonical region identity invalid");
 	auto CanonicalBytes = canonicalMaterialJSON(json::Value(std::move(*Canonical)),
 		MaterialCodecProfile::CanonicalRegion);
 	if (!CanonicalBytes) return CanonicalBytes.takeError();
 
-	xovm::material::ArtifactSource Source;
+	xovm::material::ArtifactSourceV3 Source;
+	auto ClearSource = make_scope_exit([&] {
+		xovm::material::secureClear(Source.bytecode);
+		xovm::material::secureClear(Source.handler_shards);
+		for (auto& Entry : Source.node_capabilities)
+			OPENSSL_cleanse(Entry.capability.data(), Entry.capability.size());
+	});
 	Source.build_id = dynamicHash("XOVM2/dynamic-build", *CanonicalBytes);
-	auto ParsedRegionId = parseDynamicHash(*CanonicalRegionId);
-	if (!ParsedRegionId) return materialError("dynamic canonical region identity invalid");
 	Source.region_id = *ParsedRegionId;
-	if (std::error_code EC = getRandomBytes(Source.artifact_key.data(),
-		Source.artifact_key.size()))
-		return materialError("dynamic artifact key generation failed");
 	Source.bytecode.assign(Emitter.BC.begin(), Emitter.BC.end());
 	auto ExecutionMaterial = buildDynamicExecutionMaterial(Emitter, Opcodes);
 	if (!ExecutionMaterial) return ExecutionMaterial.takeError();
+	auto ClearHandlers = make_scope_exit([&] {
+		xovm::material::secureClear(ExecutionMaterial->HandlerCode);
+	});
+	Source.node_capabilities.resize(ExecutionMaterial->Graph.nodes.size());
+	for (size_t I = 0; I < Source.node_capabilities.size(); ++I) {
+		auto& Entry = Source.node_capabilities[I];
+		Entry.node_id = ExecutionMaterial->Graph.nodes[I].node_id;
+		if (std::error_code EC = getRandomBytes(Entry.capability.data(), Entry.capability.size()))
+			return materialError("dynamic artifact node capability generation failed");
+	}
 	xovm::material::HandlerShardDescriptor HandlerDescriptor;
 	HandlerDescriptor.shard_id = 1;
 	HandlerDescriptor.code_size = static_cast<uint32_t>(ExecutionMaterial->HandlerCode.size());
@@ -1328,30 +1339,39 @@ Expected<DynamicArtifactExport> llvm::exportDynamicArtifact(
 	if (Source.handler_shards.empty() || Source.continuation_descriptors.empty())
 		return materialError("dynamic artifact v2 material encoding failed");
 
-	auto Artifact = xovm::material::buildEncryptedVmArtifact(Source);
+	auto Artifact = xovm::material::buildSelectiveEncryptedVmArtifactV3(Source);
 	if (!Artifact) return materialError("dynamic artifact encryption failed");
-	auto Encoded = xovm::material::encodeEncryptedVmArtifact(*Artifact);
+	auto Encoded = xovm::material::encodeEncryptedVmArtifact(Artifact->artifact);
 	if (Encoded.empty()) return materialError("dynamic artifact encoding failed");
+	json::Array Capabilities;
+	for (const auto& Entry : Artifact->registration.capabilities()) {
+		auto Selector = xovm::material::encodeDynamicVmWindowSelectorV3(Entry.selector);
+		if (Selector.empty()) return materialError("dynamic artifact selector encoding failed");
+		Capabilities.push_back(json::Object{
+			{"selector_b64", encodeBase64(Selector)},
+			{"capability_b64", encodeBase64(ArrayRef<uint8_t>(Entry.capability))},
+		});
+	}
 
 	DynamicArtifactExport Result;
 	Result.PublicManifest = json::Object{
-		{"format_version", 2},
+		{"format_version", 3},
 		{"material_source", "dynamic_vm"},
 		{"region_name", Config.materialRegion},
 		{"build_id", dynamicHashHex(Source.build_id)},
 		{"region_id", dynamicHashHex(Source.region_id)},
-		{"artifact_hash", dynamicHashHex(Artifact->artifact_hash)},
+		{"artifact_hash", dynamicHashHex(Artifact->artifact.artifact_hash)},
 		{"encrypted_artifact_b64", encodeBase64(Encoded)},
 		{"artifact_size", static_cast<unsigned>(Encoded.size())},
 	};
 	Result.PrivateRegistration = json::Object{
-		{"format_version", 2},
+		{"format_version", 3},
 		{"material_source", "dynamic_vm"},
 		{"region_name", Config.materialRegion},
 		{"build_id", dynamicHashHex(Source.build_id)},
 		{"region_id", dynamicHashHex(Source.region_id)},
-		{"artifact_hash", dynamicHashHex(Artifact->artifact_hash)},
-		{"artifact_key_b64", encodeBase64(ArrayRef<uint8_t>(Source.artifact_key))},
+		{"artifact_hash", dynamicHashHex(Artifact->artifact.artifact_hash)},
+		{"node_capabilities", std::move(Capabilities)},
 	};
 	return Result;
 }
@@ -1610,9 +1630,9 @@ Expected<MaterialCommitResult> llvm::commitDynamicArtifacts(StringRef ExportRoot
 		PublicRegions.push_back(json::Value(std::move(Public)));
 		PrivateRegions.push_back(json::Value(std::move(Private)));
 	}
-	json::Object PublicBundle{{"format_version", 2}, {"material_source", "dynamic_vm"},
+	json::Object PublicBundle{{"format_version", 3}, {"material_source", "dynamic_vm"},
 		{"regions", std::move(PublicRegions)}};
-	json::Object PrivateBundle{{"format_version", 2}, {"material_source", "dynamic_vm"},
+	json::Object PrivateBundle{{"format_version", 3}, {"material_source", "dynamic_vm"},
 		{"regions", std::move(PrivateRegions)}};
 	auto PublicBytes = objectBytes(PublicBundle, MaterialCodecProfile::PublicManifest);
 	if (!PublicBytes) return PublicBytes.takeError();

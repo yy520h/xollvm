@@ -44,7 +44,7 @@ export function createTrustBundleProvider({keyProvider, clock, buildRepository})
         return {key_id: key.key_id, public_key: Buffer.from(key.public_key).toString('base64'),
           not_before_ms: String(key.not_before_ms), signing_until_ms: String(key.signing_until_ms),
           not_after_ms: String(key.not_after_ms), status: key.status};
-      }).sort((left, right) => left.key_id.localeCompare(right.key_id));
+      }).sort((left, right) => left.key_id < right.key_id ? -1 : left.key_id > right.key_id ? 1 : 0);
       for (let index = 1; index < keys.length; ++index)
         if (keys[index - 1].key_id === keys[index].key_id) fail('invalid_trust_bundle');
       const body = {format_version: 1, protocol_version: 2, software_id: softwareId,
