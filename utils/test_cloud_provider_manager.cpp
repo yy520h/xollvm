@@ -24,6 +24,8 @@ bool testCloudProviderManagerCreation() {
   assert(manager->getProviderCount() == 1);
   assert(manager->getActiveProvider().has_value());
   assert(manager->getActiveProvider().value() == 1);
+  assert(manager->getProviderStatus(1) ==
+         xovm::material::CloudProviderManager::ProviderStatus::Unknown);
   
   return true;
 }

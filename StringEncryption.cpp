@@ -16,6 +16,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Metadata.h"
@@ -718,6 +719,49 @@ namespace {
         // code (e.g. rustc string-literal merging + ptrtoint match tables).
         if (isAddressTakenAsInteger(&GV)) return false;
 
+        // 栈解密缓冲区不能替代会逃逸或参与地址比较的静态字符串。
+        SmallVector<const Value*, 16> Work{ &GV };
+        SmallPtrSet<const Value*, 32> Seen;
+        while (!Work.empty()) {
+            const Value* V = Work.pop_back_val();
+            if (!Seen.insert(V).second) continue;
+            for (const Use& U : V->uses()) {
+                const User* UserValue = U.getUser();
+                if (auto* CE = dyn_cast<ConstantExpr>(UserValue)) {
+                    if (!CE->getType()->isPointerTy()) return false;
+                    Work.push_back(CE);
+                    continue;
+                }
+                if (!isa<Instruction>(UserValue)) return false;
+                // 尾调用不能接收即将失效的当前栈帧缓冲区。
+                if (auto* Call = dyn_cast<CallInst>(UserValue))
+                    if (Call->isTailCall()) return false;
+                UseCaptureInfo Capture = DetermineUseCaptureKind(U, V);
+                bool LocalPointerSpill = false;
+                if (auto* Store = dyn_cast<StoreInst>(UserValue)) {
+                    if (U.getOperandNo() == 0)
+                        if (auto* Slot = dyn_cast<AllocaInst>(Store->getPointerOperand()))
+                            LocalPointerSpill = llvm::all_of(Slot->users(), [&](const llvm::User* SlotUser) {
+                                if (auto* Load = dyn_cast<LoadInst>(SlotUser))
+                                    return Load->getPointerOperand() == Slot;
+                                if (auto* SlotStore = dyn_cast<StoreInst>(SlotUser))
+                                    return SlotStore->getPointerOperand() == Slot;
+                                return false;
+                            });
+                }
+                if (LocalPointerSpill) {
+                    auto* Store = cast<StoreInst>(UserValue);
+                    auto* Slot = cast<AllocaInst>(Store->getPointerOperand());
+                    for (const llvm::User* SlotUser : Slot->users())
+                        if (auto* Load = dyn_cast<LoadInst>(SlotUser))
+                            Work.push_back(Load);
+                    continue;
+                }
+                if (capturesAnything(Capture.UseCC)) return false;
+                if (capturesAnything(Capture.ResultCC)) Work.push_back(UserValue);
+            }
+        }
+
         return true;
     }
 
@@ -1385,7 +1429,9 @@ namespace {
                     for (BasicBlock& BB : *F) {
                         auto* Ret = dyn_cast<ReturnInst>(BB.getTerminator());
                         if (!Ret) continue;
-                        IRBuilder<> SB(Ret);
+                        Instruction* ScrubBefore = BB.getTerminatingMustTailCall();
+                        if (!ScrubBefore) ScrubBefore = Ret;
+                        IRBuilder<> SB(ScrubBefore);
                         SB.CreateMemSet(gepI8(SB, ci.CtTy, Buf),
                             ConstantInt::get(I8Ty, 0),
                             ConstantInt::get(I64Ty, ci.CtBytes),

@@ -156,6 +156,21 @@ test('registration recomputes identities and privately reloads exact verifier si
   assert.equal((await state.store.referenceStats()).published_generations, 0);
 });
 
+test('session open uses signed counter epoch without reference-store methods', async () => {
+  const state = await setup();
+  const store = new Proxy(state.store, {
+    get(target, property) {
+      if (property === 'referenceCounterEpochForService') return undefined;
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const request = state.makeRequest('session.open');
+  const bytes = await handleSession(request.bytes, state.authFor(request), store,
+      state.clock, makeRandom(90));
+  assert.equal(response(bytes).transcript.counter_epoch, COUNTER_EPOCH);
+});
+
 test('build administration requires content-bound publisher and revoker capabilities', async () => {
   const region = fixtureRegion('test/admin', 'lease');
   const registration = registrationFixture([region]);

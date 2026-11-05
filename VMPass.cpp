@@ -108,8 +108,8 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC, bool Normalize) 
 		bool Valid = !Cfg.materialRegion.empty() && Cfg.materialRegion.size() <= 128 &&
 			Alnum(Cfg.materialRegion.front());
 		for (unsigned char C : Cfg.materialRegion)
-			Valid &= Alnum(C) || C == '.' || C == '_' || C == ':' || C == '/' || C == '-';
-		if (!Valid) Cfg.failCloudMaterial("materialRegion requires protocol Name [A-Za-z0-9][A-Za-z0-9._:/-]{0,127}");
+			Valid &= Alnum(C) || C == '_' || C == '-';
+		if (!Valid) Cfg.failCloudMaterial("materialRegion requires path-safe ID [A-Za-z0-9][A-Za-z0-9_-]{0,127}");
 		validateCloudMaterialBudgets(PC);
 		if (Cfg.cloudMaterial == CloudMaterialMode::Operation)
 			Cfg.failCloudMaterial("operation material not implemented");

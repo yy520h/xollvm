@@ -11,6 +11,7 @@
  */
 
 import http from 'node:http';
+import {randomBytes} from 'node:crypto';
 import pg from 'pg';
 
 import {createProductionService} from './production.mjs';
@@ -122,10 +123,7 @@ async function main() {
       adminRepository: null, // TODO: 实现管理仓库
       relayToken: config.relayToken,
       adminToken: config.adminToken,
-      randomBytes: size => {
-        const crypto = await import('node:crypto');
-        return crypto.randomBytes(size);
-      },
+      randomBytes,
     });
   } catch (error) {
     console.error('❌ 生产服务创建失败:', error.message);

@@ -161,6 +161,8 @@ Worker 进程 fork
 
 ## 🧪 测试
 
+当前针对性验证记录（2026-11-06）：生命周期回归 34 passed、1 skipped；云材料导出 5 passed；`cloud/material_v2` Node.js 测试 118 passed；V3 材料 C++ 测试 25 passed。此记录不代表完整 LLVM/NDK 测试矩阵均已运行。生产后端适配器及 AArch64 relocation 等事项仍见 [项目状态](PROJECT_STATUS.md)。
+
 ### 运行单元测试
 
 ```bash
@@ -268,6 +270,7 @@ Apache License 2.0
 
 ---
 
-**最后更新**: 2026-11-05  
+**最后更新**: 2026-11-06
+
 **版本**: v2.0 (云材料架构)  
 **状态**: 生产就绪 (框架) / 提供者待实现

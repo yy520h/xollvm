@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import {spawnSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
 
 import {createProductionService} from '../production.mjs';
+
+test('production entry point passes JavaScript syntax validation', () => {
+  const result = spawnSync(process.execPath,
+    ['--check', fileURLToPath(new URL('../main.mjs', import.meta.url))], {encoding: 'utf8'});
+  assert.equal(result.status, 0, result.stderr);
+});
 
 test('production construction fails closed when adapters are absent', async () => {
   await assert.rejects(createProductionService({}), {code: 'production_adapter_missing'});

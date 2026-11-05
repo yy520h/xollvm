@@ -20,6 +20,7 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/ValueMapper.h"
 
 #include "llvm/Transforms/Obfuscator/VMPass_Impl.h"
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
@@ -45,8 +46,29 @@ bool VMImpl::run() {
 bool VMImpl::prepare() {
 	if (Prepared) return true;
 	if (Committed) return false;
+	std::function<bool(const Value*, SmallPtrSetImpl<const Value*>&)> HasBlockAddress =
+		[&](const Value* V, SmallPtrSetImpl<const Value*>& Seen) {
+			if (!Seen.insert(V).second) return false;
+			if (isa<BlockAddress>(V)) return true;
+			auto* C = dyn_cast<Constant>(V);
+			if (!C) return false;
+			for (const Use& U : C->operands())
+				if (HasBlockAddress(U.get(), Seen)) return true;
+			return false;
+		};
+	for (const BasicBlock& BB : F)
+		for (const Instruction& I : BB)
+			for (const Use& U : I.operands()) {
+				SmallPtrSet<const Value*, 16> Seen;
+				if (HasBlockAddress(U.get(), Seen)) {
+					FailReason = "blockaddress constants are not supported by VM preparation";
+					return false;
+				}
+			}
 	ValueToValueMapTy Map;
 	PreparedModule = CloneModule(M, Map);
+	for (const auto& Entry : Map)
+		if (Entry.second) PreparedToOriginalValues[Entry.second] = const_cast<Value*>(Entry.first);
 	PreparedFunction = cast<Function>(Map.lookup(&this->F));
 	if (!PreparedFunction) {
 		FailReason = "failed to clone function for VM preparation";
@@ -182,49 +204,7 @@ bool VMImpl::prepare() {
 
 
 
-	// Widen f32 allocas to f64 so OP_LOAD_F / OP_STORE_F (which always
-	// operate on 8 bytes) never read/write past the end of a 4-byte slot.
-	// At -O0 each float local is an alloca used only by load/store float;
-	// widening is semantics-preserving: fpext on stores, fptrunc on loads.
-	{
-		SmallVector<AllocaInst*, 16> FloatAllocas;
-		for (BasicBlock& BB : F)
-			for (Instruction& I : BB)
-				if (auto* AI = dyn_cast<AllocaInst>(&I))
-					if (AI->getAllocatedType()->isFloatTy())
-						FloatAllocas.push_back(AI);
-
-		for (AllocaInst* AI : FloatAllocas) {
-			IRBuilder<> AB(AI);
-			auto* NewAI = AB.CreateAlloca(DoubleTy, nullptr, AI->getName() + ".f2d");
-			NewAI->setAlignment(Align(8));
-
-			SmallVector<Instruction*, 16> ToErase;
-			SmallVector<std::pair<Use*, Value*>, 16> ToReplace;
-
-			for (Use& U : AI->uses()) {
-				auto* User = cast<Instruction>(U.getUser());
-				if (auto* SI = dyn_cast<StoreInst>(User)) {
-					IRBuilder<> B(SI);
-					B.CreateStore(B.CreateFPExt(SI->getValueOperand(), DoubleTy, "f2d.ext"), NewAI);
-					ToErase.push_back(SI);
-				}
-				else if (auto* LI = dyn_cast<LoadInst>(User)) {
-					IRBuilder<> B(LI);
-					Value* Dbl = B.CreateLoad(DoubleTy, NewAI, "f2d.ld");
-					Value* Trn = B.CreateFPTrunc(Dbl, Type::getFloatTy(Ctx), "f2d.trn");
-					LI->replaceAllUsesWith(Trn);
-					ToErase.push_back(LI);
-				}
-				else {
-					ToReplace.push_back({ &U, NewAI });
-				}
-			}
-			for (Instruction* I : ToErase)  I->eraseFromParent();
-			for (auto& [U, V] : ToReplace)  U->set(V);
-			AI->eraseFromParent();
-		}
-	}
+	// f32 保留原内存布局，由 OP_LOAD_F32 / OP_STORE_F32 处理四字节访问。
 
 
 
@@ -518,14 +498,9 @@ void VMImpl::setFullHandlerRequirements() {
 
 void VMImpl::remapPreparedExternalValues() {
 	if (!PreparedModule) return;
-	for (Value*& V : E.CalleeTab) {
-		if (auto* PreparedFn = dyn_cast<Function>(V)) {
-			if (Function* OriginalFn = M.getFunction(PreparedFn->getName()))
-				V = OriginalFn;
-		}
-		else if (auto* PreparedGV = dyn_cast<GlobalVariable>(V)) {
-			if (GlobalVariable* OriginalGV = M.getGlobalVariable(PreparedGV->getName(), true))
-				V = OriginalGV;
-		}
-	}
+	// 同时重建 GEP 等派生常量，避免 wrapper 引用暂存模块。
+	for (Value*& V : E.CalleeTab)
+		V = MapValue(V, PreparedToOriginalValues, RF_IgnoreMissingLocals);
+	for (auto& [Slot, V] : E.PtrLoads)
+		V = MapValue(V, PreparedToOriginalValues, RF_IgnoreMissingLocals);
 }

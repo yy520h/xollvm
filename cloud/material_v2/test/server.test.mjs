@@ -12,6 +12,26 @@ function fakeHttp() {
   }};
 }
 
+test('malformed URL returns 400 and subsequent health checks still succeed', async () => {
+  let checked = 0;
+  const instance = createServer({http: fakeHttp(), productionService: {
+    async readiness() { ++checked; return {ready: true}; },
+  }, config: {host: '127.0.0.1', port: 8080, requestTimeoutMs: 5000,
+    maxConcurrentRequests: 20, relayToken: 'R'.repeat(32), adminToken: 'A'.repeat(32)}});
+  let resumed = false;
+  const badResponse = {setHeader() {}, end(value) { this.body = value; }};
+  await instance.server.handler({method: 'GET', url: '//[', headers: {},
+    resume() { resumed = true; }}, badResponse);
+  assert.equal(badResponse.statusCode, 400);
+  assert.deepEqual(JSON.parse(badResponse.body), {error: 'invalid_url'});
+  assert.equal(checked, 0);
+  assert.equal(resumed, true);
+  const health = {setHeader() {}, end(value) { this.body = value; }};
+  await instance.server.handler({method: 'GET', url: '/healthz', headers: {}}, health);
+  assert.equal(health.statusCode, 200);
+  assert.equal(checked, 1);
+});
+
 test('server refuses to listen unless production adapters are ready', async () => {
   let checked = false;
   const server = createServer({http: fakeHttp(), productionService: {

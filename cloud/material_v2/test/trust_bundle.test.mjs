@@ -63,3 +63,17 @@ test('trust bundle provider requires monotonic positive trust epoch and bounded 
   }});
   await assert.rejects(badProvider.getPublicTrustBundle('test.software'), {code: 'invalid_trust_bundle'});
 });
+
+test('trust bundle key ordering matches verifier ordinal ordering', async () => {
+  const options = fixture();
+  options.keyProvider.publicMetadata = async softwareId => {
+    const metadata = await fixture().keyProvider.publicMetadata(softwareId);
+    metadata.keys = ['a', 'B'].map(key_id => ({...metadata.keys[0], key_id}));
+    return metadata;
+  };
+  const {bytes} = await createTrustBundleProvider(options).getPublicTrustBundle('test.software');
+  const installed = verifyTrustBundle(bytes, {root_key_id: 'root-test',
+    root_public_key: options.rootPublic, software_id: 'test.software', trusted_time: now});
+  assert.ok(installed);
+  assert.deepEqual(decodeCanonical(bytes).body.keys.map(key => key.key_id), ['B', 'a']);
+});
