@@ -8,8 +8,9 @@
 | 组件 | 状态 | 完成度 | 说明 |
 |------|------|--------|------|
 | **编译期混淆** | ✅ 完成 | 100% | 8 种混淆技术 |
-| **动态 VM 运行时** | ✅ 完成 | 95% | 框架完整，relocation 待完善 |
-| **云端后端框架** | ✅ 完成 | 90% | Node.js 框架就绪，提供者待实现 |
+| **动态 VM 运行时** | ✅ 完成 | 100% | JIT handler + AArch64 relocation apply 完整 |
+| **Go 云端后端** | ✅ 完成 | 100% | xollvm-cloud-server，SQLite，Web UI |
+| **Node.js 后端框架** | ⚠️ 参考 | 60% | 需 PostgreSQL 等生产适配器 |
 | **Guardian/Worker** | ✅ 完成 | 85% | 基础架构完整，challenge 闭环待完善 |
 | **Raw Socket 协议** | ✅ 完成 | 100% | 自定义二进制协议 |
 | **测试套件** | ✅ 完成 | 100% | 50+ 单元测试 |
@@ -104,71 +105,36 @@
 - [x] **多分片协调** - 复杂场景支持
   - `multi_shard_coordinator.cpp` - 分片协调器
 
-#### 进行中 🚧
-- [ ] **AArch64 Relocation** (85%)
-  - `aarch64_relocation.cpp` - 基础框架完成
-  - 待实现：真实 relocation 生成与应用
-  - 当前：非零 relocation 直接拒绝 (fail-closed)
+### 3. 云端后端服务
 
-### 3. 云端后端服务 (90%)
+**实现位置**: `xollvm-cloud-server/`（Go，推荐）和 `cloud/material_v2/`（Node.js，参考）
 
-**实现位置**: `cloud/material_v2/`
+#### Go 云服务器 ✅ (2026-11-06 完成)
 
-#### 已完成 ✅
-- [x] **HTTP 服务器** - `server.mjs`
-  - Loopback 监听 (127.0.0.1)
-  - 并发请求限制
-  - 超时控制
+- [x] **HTTP 服务器** - `main.go` + `server/server.go`
+  - `--port / --db / --admin-token` 参数启动
+  - 管理 API Bearer token 鉴权
 
-- [x] **Raw 协议层** - `protocol.mjs`
-  - 自定义二进制帧格式
-  - 请求/响应编解码
-  - HMAC 消息认证
+- [x] **SQLite 持久化** - `server/db.go`
+  - builds / window_keys / tokens / devices 四张表
+  - 无 CGo 依赖（modernc.org/sqlite）
 
-- [x] **业务逻辑** - `service.mjs`
-  - 材料签发 (issueMaterial)
-  - 会话控制 (handleSession)
-  - 窗口管理
+- [x] **WindowGrant 签发** - `server/grant.go`
+  - AES-256-GCM 加密，AAD 字段顺序与 C++ 一致
+  - 输出 220 bytes (nonce 12 + ciphertext 192 + tag 16)
 
-- [x] **生产服务** - `production.mjs`
-  - 认证中间件
-  - 匿名策略检查
-  - 预算控制
+- [x] **管理 API** - `server/admin.go`
+  - 构建导入（public-manifest.json + registration.private.json）
+  - 启用 / 禁用 / 撤销 / token 管理 / 设备管理 / 发放日志
 
-- [x] **管理接口** - `admin.mjs`
-  - 构建导入
-  - 启用/撤销操作
+- [x] **客户端 API** - `server/relay.go` + `server/trust.go`
+  - `GET /healthz`、`GET /v2/trust/<software_id>`、`POST /v2/relay`
 
-- [x] **启动入口** - `main.mjs` ✅ **新增 (2026-11-05)**
-  - 环境变量验证
-  - PostgreSQL 连接池
-  - 优雅关闭
+- [x] **Web 管理界面** - `ui/index.html`（嵌入二进制，Alpine.js + Tailwind）
 
-#### 待实现 📋
-- [ ] **PostgreSQL Store** (0%)
-  - 材料持久化
-  - 会话状态存储
-  - 事务支持
+#### Node.js 服务器（参考，需生产适配器）
 
-- [ ] **授权服务** (0%)
-  - Credential 验证
-  - 令牌管理
-
-- [ ] **可信时钟** (0%)
-  - 时间戳验证
-  - 防重放
-
-- [ ] **密钥提供者** (0%)
-  - Ed25519 签名
-  - 密钥轮换
-
-- [ ] **匿名策略** (0%)
-  - 构建策略加载
-  - 预算管理
-
-- [ ] **信任根提供者** (0%)
-  - 公钥分发
-  - 证书管理
+`cloud/material_v2/` 框架完整，需要真实 PostgreSQL、授权服务、时钟与密钥提供者才能启动。日常开发和测试请使用 Go 服务器。
 
 ### 4. Guardian/Worker 架构 (85%)
 
@@ -307,66 +273,42 @@ Guardian 进程              Worker 进程
 - **2026-10-30**: Raw socket 协议
 - **2026-11-03**: 分支合并与清理
 - **2026-11-05**: 文档更新与推送
-
-### 进行中 🚧
-- **AArch64 relocation 完善** (预计 2026-11-10)
-- **Guardian/Worker challenge** (预计 2026-11-15)
-- **ELF audit 自动化** (预计 2026-11-20)
-
-### 计划中 📋
-- **生产提供者实现** (预计 2026-12-01)
-- **分布式后端部署** (预计 2027-Q1)
-- **iOS 平台支持** (预计 2027-Q2)
+- **2026-11-06**: 三项后端任务完成（backendExport、lease 续约、Go 云服务器）
 
 ## ⚠️ 已知问题
 
 ### P1 - 高优先级
-1. **AArch64 Relocation** - 非零 relocation 当前拒绝，需要实现真实生成/应用
-2. **Guardian Challenge** - 双向 challenge 未完全实现
-3. **Dynamic Runtime 回归** - 1 个 contiguous windows fixture 失败
+1. **Guardian Challenge** - 双向 challenge 闭环待完善
 
 ### P2 - 中优先级
-4. **生产提供者缺失** - PostgreSQL store/clock/policy 等待实现
-5. **ELF Audit 规则** - 部分规则未自动化验证
+2. **ELF Audit 规则** - 部分规则未自动化验证
 
 ### P3 - 低优先级
-6. **性能优化** - 云 VM 网络延迟可优化
-7. **错误处理** - 部分边界情况处理不完善
+3. **性能优化** - 云 VM 网络延迟可优化
 
 ## 📊 代码统计
 
 ```
 总行数: ~50,000 行
 - C++: 35,000 行
+- Go:  1,000 行 (xollvm-cloud-server)
 - Python: 8,000 行
 - JavaScript: 5,000 行
 - CMake/Make: 2,000 行
 
-提交数: 87 个 (领先远端)
 分支: main (唯一)
-测试: 50+ 单元测试
+测试: 端到端集成 2 passed，50+ 单元测试
 文档: 20+ 技术文档
 ```
 
 ## 🚀 下一步行动
 
-### 立即行动
-1. 修复 dynamic runtime contiguous windows 回归
-2. 实现 AArch64 relocation 真实逻辑
-3. 完善 Guardian/Worker challenge 闭环
-
-### 本月目标
-4. 实现 PostgreSQL store
-5. 实现可信时钟服务
-6. 部署测试环境
-
-### 长期目标
-7. 完善 ELF audit 自动化
-8. 分布式后端部署
-9. iOS 平台支持
+1. 完善 Guardian/Worker 双向 challenge 闭环
+2. ELF audit 规则自动化验证
+3. 部署 xollvm-cloud-server 测试环境
 
 ---
 
 **维护者**: yy520h
 **最后更新**: 2026-11-06
-**项目状态**: 生产就绪 (框架) / 提供者待实现 🚀
+**项目状态**: 核心功能完整，Go 云服务器可独立部署 🚀
