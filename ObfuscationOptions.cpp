@@ -1,10 +1,14 @@
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/FileSystem.h"
-#include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/Path.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/MDBuilder.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include <cctype>
+#include <cstdlib>
 
 using namespace llvm;
 
@@ -88,12 +92,13 @@ cl::opt<std::string> llvm::ObfReportDir(
 
 cl::opt<std::string> llvm::ObfMaterialExportDir(
 	"obf-material-export-dir",
-	cl::desc("Existing private directory for cloud material export (required for cloudMaterial)"),
+	cl::desc("Optional directory for cloud material export (auto-derived from module if unset)"),
 	cl::init(""));
 
 void llvm::validateMaterialExportDirectory() {
+	// 当为空时允许 Pass 层自动推导，只验证显式提供的路径。
 	if (ObfMaterialExportDir.empty())
-		report_fatal_error("vm: material export requires -obf-material-export-dir", false);
+		return;
 	if (!sys::fs::is_directory(ObfMaterialExportDir))
 		report_fatal_error("vm: material export directory does not exist or is not a directory", false);
 	// 解析 dir/. 同时检查目录可遍历；LLVM Execute 专门拒绝目录。
@@ -101,6 +106,44 @@ void llvm::validateMaterialExportDirectory() {
 	sys::path::append(Searchable, ".");
 	if (sys::fs::access(Searchable, sys::fs::AccessMode::Write))
 		report_fatal_error("vm: material export directory is not writable/searchable", false);
+}
+
+std::string llvm::resolveCloudMaterialExportDir(const llvm::Module& M) {
+	// 1. 显式命令行参数
+	if (!ObfMaterialExportDir.empty())
+		return ObfMaterialExportDir.getValue();
+
+	// 2. 环境变量（测试覆盖）
+	if (const char* env = std::getenv("XOLLVM_CLOUD_EXPORT_DIR"))
+		if (*env) return env;
+
+	// 3. Module flag（构建系统注入）
+	if (auto* MD = M.getModuleFlag("xollvm.material_export_dir"))
+		if (auto* MDS = dyn_cast<MDString>(MD))
+			return MDS->getString().str();
+
+	// 4. 从 Module 标识自动推导
+	StringRef moduleID = M.getModuleIdentifier();
+	if (moduleID.empty())
+		return "";
+
+	SmallString<256> path(moduleID);
+	StringRef filename = sys::path::filename(path);
+	StringRef stem = sys::path::stem(filename);
+
+	if (stem.empty())
+		return "";
+
+	SmallString<256> dir(sys::path::parent_path(path));
+	if (dir.empty())
+		dir = ".";
+
+	SmallString<256> materialDir(dir);
+	SmallString<128> materialName(stem);
+	materialName += ".material";
+	sys::path::append(materialDir, materialName);
+
+	return materialDir.str().str();
 }
 
 cl::opt<std::string> llvm::ObfReportJson(

@@ -16,6 +16,8 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
@@ -312,9 +314,10 @@ bool VMImpl::commit() {
 
 	// Task 3/8: Cloud material window export
 	if (Cfg.usesCloudMaterial()) {
-		// Validate export directory is configured
-		if (ObfMaterialExportDir.empty()) {
-			report_fatal_error("vm: cloudMaterial requires -obf-material-export-dir", false);
+		// 解析导出目录（优先级：显式参数 > 环境变量 > module flag > 自动推导）
+		std::string exportDir = resolveCloudMaterialExportDir(M);
+		if (exportDir.empty()) {
+			report_fatal_error("vm: cloudMaterial requires -obf-material-export-dir or resolvable module identifier", false);
 		}
 
 		// Export bytecode as cloud windows instead of embedding locally
@@ -337,7 +340,7 @@ bool VMImpl::commit() {
 			F.getName(),
 			Cfg.materialRegion,
 			windowSize,
-			ObfMaterialExportDir,
+			exportDir,
 			appID
 		);
 
@@ -348,7 +351,39 @@ bool VMImpl::commit() {
 		// For cloud material mode, we still need to build a wrapper that
 		// fetches windows at runtime. Continue with wrapper generation but
 		// skip the local bytecode global.
-		outs() << "[VM] Cloud material mode: bytecode exported, building runtime loader\n";
+		outs() << "[VM] Cloud material mode: bytecode exported to " << exportDir << "\n";
+
+		// backendExport: 按需在编译完成后调用 xollvm-cloud-material-export 生成
+		// 后端包（public-manifest.json + registration.private.json）。默认关闭——
+		// 程序材料每次都导出，但后端包仅在显式 backendExport=1 时触发。
+		if (Cfg.backendExport) {
+			std::string stem = exportDir;
+			constexpr StringRef kMatSuffix = ".material";
+			if (stem.size() > kMatSuffix.size() &&
+				StringRef(stem).ends_with(kMatSuffix))
+				stem = stem.substr(0, stem.size() - kMatSuffix.size());
+			std::string outDir = stem + ".backend-export";
+
+			auto toolErr = sys::findProgramByName("xollvm-cloud-material-export");
+			if (!toolErr) {
+				errs() << "[VM] Warning: backendExport=1 but "
+				          "xollvm-cloud-material-export not found on PATH\n";
+			} else {
+				std::string toolPath = toolErr.get();
+				SmallVector<StringRef, 6> args = {
+					toolPath, "--input-dir", exportDir,
+					"--output-dir", outDir
+				};
+				std::string errMsg;
+				int rc = sys::ExecuteAndWait(toolPath, args, std::nullopt, {},
+				                              0, 0, &errMsg);
+				if (rc != 0)
+					Cfg.failCloudMaterial("backendExport failed (rc=" +
+						Twine(rc).str() + "): " + errMsg);
+				else
+					outs() << "[VM] Backend export written to " << outDir << "\n";
+			}
+		}
 	}
 
 	if (Cfg.encodedTargets) {

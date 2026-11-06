@@ -159,7 +159,7 @@ bool verifyAarch64Relocation(std::span<const uint8_t> code,
         uint32_t expected = relocation.target_value;
         if (relocation.shift > 0)
             expected >>= relocation.shift;
-        
+
         // Mask to width
         if (relocation.width == 16)
             expected &= 0xffff;
@@ -177,17 +177,115 @@ bool verifyAarch64Relocation(std::span<const uint8_t> code,
     return false;
 }
 
+// Serialization layout (12 bytes, little-endian):
+//   [0..3]  offset          u32 LE
+//   [4..7]  target_value    u32 LE
+//   [8]     type            u8
+//   [9]     width           u8
+//   [10]    shift           u8
+//   [11]    reserved        u8 (must be 0)
+static constexpr size_t kRelocationRecordSize = 12;
+
+std::vector<uint8_t> serializeAarch64Relocation(
+    const Aarch64RelocationRecord &reloc) {
+    std::vector<uint8_t> out(kRelocationRecordSize, 0);
+    out[0] = static_cast<uint8_t>(reloc.offset);
+    out[1] = static_cast<uint8_t>(reloc.offset >> 8);
+    out[2] = static_cast<uint8_t>(reloc.offset >> 16);
+    out[3] = static_cast<uint8_t>(reloc.offset >> 24);
+    out[4] = static_cast<uint8_t>(reloc.target_value);
+    out[5] = static_cast<uint8_t>(reloc.target_value >> 8);
+    out[6] = static_cast<uint8_t>(reloc.target_value >> 16);
+    out[7] = static_cast<uint8_t>(reloc.target_value >> 24);
+    out[8] = static_cast<uint8_t>(reloc.type);
+    out[9] = reloc.width;
+    out[10] = reloc.shift;
+    out[11] = 0; // reserved
+    return out;
+}
+
+std::optional<Aarch64RelocationRecord> deserializeAarch64Relocation(
+    std::span<const uint8_t> bytes) {
+    if (bytes.size() != kRelocationRecordSize)
+        return std::nullopt;
+    if (bytes[11] != 0) // reserved must be 0
+        return std::nullopt;
+    Aarch64RelocationRecord reloc;
+    reloc.offset = static_cast<uint32_t>(bytes[0]) |
+                   (static_cast<uint32_t>(bytes[1]) << 8) |
+                   (static_cast<uint32_t>(bytes[2]) << 16) |
+                   (static_cast<uint32_t>(bytes[3]) << 24);
+    reloc.target_value = static_cast<uint32_t>(bytes[4]) |
+                         (static_cast<uint32_t>(bytes[5]) << 8) |
+                         (static_cast<uint32_t>(bytes[6]) << 16) |
+                         (static_cast<uint32_t>(bytes[7]) << 24);
+    reloc.type = static_cast<Aarch64RelocationType>(bytes[8]);
+    reloc.width = bytes[9];
+    reloc.shift = bytes[10];
+    reloc.reserved = 0;
+    // Reject unknown type values
+    switch (reloc.type) {
+    case Aarch64RelocationType::AbsoluteAddrLoad:
+    case Aarch64RelocationType::PCRelative:
+    case Aarch64RelocationType::PageOffset:
+    case Aarch64RelocationType::ImmediateValue:
+        break;
+    default:
+        return std::nullopt;
+    }
+    return reloc;
+}
+
+std::vector<uint8_t> serializeAarch64Relocations(
+    const std::vector<Aarch64RelocationRecord> &relocs) {
+    std::vector<uint8_t> out;
+    out.reserve(relocs.size() * kRelocationRecordSize);
+    for (const auto &r : relocs) {
+        auto rec = serializeAarch64Relocation(r);
+        out.insert(out.end(), rec.begin(), rec.end());
+    }
+    return out;
+}
+
+std::optional<std::vector<Aarch64RelocationRecord>> deserializeAarch64Relocations(
+    std::span<const uint8_t> bytes) {
+    if (bytes.size() % kRelocationRecordSize != 0)
+        return std::nullopt;
+    std::vector<Aarch64RelocationRecord> out;
+    out.reserve(bytes.size() / kRelocationRecordSize);
+    for (size_t i = 0; i < bytes.size(); i += kRelocationRecordSize) {
+        auto rec = deserializeAarch64Relocation(bytes.subspan(i, kRelocationRecordSize));
+        if (!rec) return std::nullopt;
+        out.push_back(*rec);
+    }
+    return out;
+}
+
+bool applyAarch64Relocations(std::span<uint8_t> code,
+                              const std::vector<Aarch64RelocationRecord> &relocs) {
+    for (const auto &r : relocs) {
+        if (!applyAarch64Relocation(code, r))
+            return false;
+    }
+    return true;
+}
+
 std::optional<std::vector<Aarch64RelocationRecord>>
 generateAarch64ShardRelocations(uint32_t shard_base, uint32_t shard_size) {
-    // Currently generates no relocations - all relocations must be explicit
-    // and declared; this prevents hidden dependencies
-    std::vector<Aarch64RelocationRecord> relocations;
-    
-    // Future: Generate relocations for specific patterns if needed
-    // For now, maintain fail-closed: only explicitly declared relocations
-    // from artifact are applied
-    
-    return relocations;
+    // Current shard templates are fully position-independent: loadPointer/
+    // storeRegister use structure-field offsets passed via x0, and putImmediate
+    // encodes only VM instruction indices and status constants (0/1/2).
+    // No native addresses are embedded at compile time, so no relocation
+    // records are needed for the standard templates.
+    //
+    // When future shard templates embed dispatch-table pointers or other
+    // load-time addresses via putImmediate(reg, abs_addr), add scanning logic
+    // here: walk 4-byte-aligned instructions, recognise MOVZ/MOVK pairs whose
+    // combined value falls in [shard_base, shard_base + shard_size), and emit
+    // an ImmediateValue record for each such field.
+    (void)shard_base;
+    (void)shard_size;
+    return std::vector<Aarch64RelocationRecord>{};
 }
 
 }  // namespace xovm::material

@@ -79,6 +79,7 @@ public:
     const ContinuationNodeV2 &node() const { return node_; }
     const std::vector<uint8_t> &bytecodeBlock() const { return bytecode_block_; }
     const std::vector<uint8_t> &handlerShard() const { return handler_shard_; }
+    const std::vector<uint8_t> &relocationDescriptors() const { return relocation_bytes_; }
     void clear();
 
 private:
@@ -92,6 +93,7 @@ private:
     ContinuationNodeV2 node_{};
     std::vector<uint8_t> bytecode_block_;
     std::vector<uint8_t> handler_shard_;
+    std::vector<uint8_t> relocation_bytes_;
 };
 
 std::optional<BuiltDynamicVmArtifactV3> buildSelectiveEncryptedVmArtifactV3(

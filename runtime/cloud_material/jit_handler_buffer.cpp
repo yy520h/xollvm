@@ -1,4 +1,5 @@
 #include "jit_handler_buffer.h"
+#include "aarch64_relocation.h"
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -38,12 +39,16 @@ bool JitHandlerBuffer::write(std::span<const uint8_t> bytes) {
 
 bool JitHandlerBuffer::loadAndSeal(std::span<const uint8_t> code,
                                    std::span<const uint8_t> relocation_descriptors) {
-    // Relocation application is not part of this approved slice. Reject every
-    // nonempty descriptor before copying code instead of parsing unreachable data.
-    if (!address_ || !writable_ || code.empty() || code.size() > size_ ||
-        !relocation_descriptors.empty())
+    if (!address_ || !writable_ || code.empty() || code.size() > size_)
         return false;
     if (!write(code)) return false;
+    // Apply any explicit relocations before sealing RX.
+    if (!relocation_descriptors.empty()) {
+        auto relocs = deserializeAarch64Relocations(relocation_descriptors);
+        if (!relocs) return false;
+        std::span<uint8_t> rw{static_cast<uint8_t *>(address_), code.size()};
+        if (!applyAarch64Relocations(rw, *relocs)) return false;
+    }
     return sealExecutable();
 }
 

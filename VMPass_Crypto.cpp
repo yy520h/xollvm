@@ -323,15 +323,11 @@ void VMImpl::buildCloudMaterialCtor() {
 	std::vector<std::array<uint8_t, 32>> commitments;
 
 	// Parse metadata.json to extract SHA256 commitments.
-	// The export directory comes from the CLI option -obf-material-export-dir
-	// (llvm::ObfMaterialExportDir); XOLLVM_CLOUD_EXPORT_DIR overrides it for
-	// test setups. No hardcoded default: without either, verification stays off.
-	const char* exportDirEnv = std::getenv("XOLLVM_CLOUD_EXPORT_DIR");
+	// 使用统一的导出目录解析逻辑（与 VMPass_Impl.cpp::commit() 一致）
+	std::string exportDir = resolveCloudMaterialExportDir(M);
 	std::string metadataPath;
-	if (exportDirEnv && *exportDirEnv) {
-		metadataPath = std::string(exportDirEnv) + "/metadata.json";
-	} else if (!llvm::ObfMaterialExportDir.empty()) {
-		metadataPath = llvm::ObfMaterialExportDir.getValue() + "/metadata.json";
+	if (!exportDir.empty()) {
+		metadataPath = exportDir + "/metadata.json";
 	}
 
 	std::ifstream metaFile(metadataPath);

@@ -1,5 +1,6 @@
 #pragma once
 #include "llvm/ADT/StringRef.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include <cstdint>
 #include <string>
@@ -50,7 +51,16 @@ namespace llvm {
 	extern llvm::cl::opt<std::string> ObfReportJson;
 	extern llvm::cl::opt<std::string> ObfMaterialExportDir;
 	// 只做目录预检；任务 3 的写入/关闭/原子提交失败仍须 fatal。
+	// 当 ObfMaterialExportDir 为空时不报错（允许 Pass 层自动推导）。
 	void validateMaterialExportDirectory();
+
+	// 解析云材料导出目录（按优先级）：
+	//  1. -obf-material-export-dir 显式参数
+	//  2. 环境变量 XOLLVM_CLOUD_EXPORT_DIR
+	//  3. Module flag "xollvm.material_export_dir"
+	//  4. 从 M.getModuleIdentifier() 自动推导：<dir>/<stem>.material
+	// 返回空串表示无法解析（调用方应 failCloudMaterial）。
+	std::string resolveCloudMaterialExportDir(const llvm::Module& M);
 	extern llvm::cl::opt<std::string> ObfGraphDir;
 	extern llvm::cl::opt<std::string> ObfGraphMode;
 

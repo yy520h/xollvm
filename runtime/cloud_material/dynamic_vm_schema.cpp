@@ -941,8 +941,7 @@ std::optional<WindowAcquireRequest> decodeWindowAcquireRequest(
 }
 
 std::vector<uint8_t> encodeHandlerShardDescriptor(const HandlerShardDescriptor &descriptor) {
-    if (!descriptor.shard_id || !descriptor.code_size ||
-        descriptor.relocation_count != 0)
+    if (!descriptor.shard_id || !descriptor.code_size)
         return {};
     std::vector<uint8_t> out;
     put32(out, descriptor.shard_id);

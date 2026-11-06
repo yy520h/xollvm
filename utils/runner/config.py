@@ -45,7 +45,7 @@ def detect_tools(build_dir: Path, config: str) -> Tools:
     host_clang = _TERMUX_CLANG if platform.system() == "Android" and _TERMUX_CLANG.exists() else None
     android_clangxx = None
     if host_clang is not None:
-        ndk = Path(os.environ.get("XOLLVM_NDK", Path.home() / "android-ndk-r30-ollvm-r23-beta3"))
+        ndk = Path(os.environ.get("XOLLVM_NDK", Path.home() / "xollvm-android/android-ndk-r30-ollvm-r23-beta3"))
         candidate = ndk / "toolchains/llvm/prebuilt/linux-arm64/bin/clang++"
         if candidate.is_file():
             android_clangxx = candidate

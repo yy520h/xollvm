@@ -1,5 +1,6 @@
 #include "dynamic_vm_artifact.h"
 #include "dynamic_vm_shard.h"
+#include "aarch64_relocation.h"
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -451,8 +452,7 @@ bool validateNativeShards(const DynamicVmExecutionAbiV2 &abi,
 
 DynamicHash computeEncryptedVmArtifactHash(const EncryptedVmArtifact &artifact) {
     static constexpr std::string_view domain = "XOVM2/encrypted-artifact/v3";
-    if (artifact.format_version != kDynamicVmSelectiveFormatVersionV3 ||
-        !artifact.relocation_descriptors.empty())
+    if (artifact.format_version != kDynamicVmSelectiveFormatVersionV3)
         return {};
     std::vector<uint8_t> commitment(domain.begin(), domain.end());
     commitment.push_back(0);
@@ -475,7 +475,6 @@ bool validateEncryptedVmArtifactMetadata(
         artifact.artifact_hash != expected_artifact_hash ||
         artifact.encrypted_bytecode_blocks.empty() ||
         artifact.encrypted_handler_shards.empty() ||
-        artifact.relocation_descriptors.size() != 0 ||
         computeEncryptedVmArtifactHash(artifact) != expected_artifact_hash)
         return false;
     const auto descriptors = parseDescriptors(artifact.continuation_descriptors);
@@ -536,7 +535,8 @@ DecryptedDynamicVmNodeV3::DecryptedDynamicVmNodeV3(
     DecryptedDynamicVmNodeV3 &&other) noexcept
     : abi_(other.abi_), descriptor_(other.descriptor_), node_(other.node_),
       bytecode_block_(std::move(other.bytecode_block_)),
-      handler_shard_(std::move(other.handler_shard_)) {
+      handler_shard_(std::move(other.handler_shard_)),
+      relocation_bytes_(std::move(other.relocation_bytes_)) {
     other.clear();
 }
 
@@ -549,6 +549,7 @@ DecryptedDynamicVmNodeV3 &DecryptedDynamicVmNodeV3::operator=(
         node_ = other.node_;
         bytecode_block_ = std::move(other.bytecode_block_);
         handler_shard_ = std::move(other.handler_shard_);
+        relocation_bytes_ = std::move(other.relocation_bytes_);
         other.clear();
     }
     return *this;
@@ -559,6 +560,7 @@ DecryptedDynamicVmNodeV3::~DecryptedDynamicVmNodeV3() { clear(); }
 void DecryptedDynamicVmNodeV3::clear() {
     secureClear(bytecode_block_);
     secureClear(handler_shard_);
+    secureClear(relocation_bytes_);
     OPENSSL_cleanse(&abi_, sizeof(abi_));
     OPENSSL_cleanse(&descriptor_, sizeof(descriptor_));
     OPENSSL_cleanse(&node_, sizeof(node_));
@@ -572,7 +574,7 @@ std::optional<BuiltDynamicVmArtifactV3> buildSelectiveEncryptedVmArtifactV3(
         source.handler_shards.size() >
             kLegacyHandlerDescriptorSize + kDynamicVmMaxWindowMaterial ||
         source.continuation_descriptors.size() > kDynamicVmMaxDescriptor ||
-        !source.relocation_descriptors.empty() || !nonzero(source.build_id) ||
+        !nonzero(source.build_id) ||
         !nonzero(source.region_id))
         return std::nullopt;
     auto descriptors = parseDescriptors(source.continuation_descriptors);
@@ -596,7 +598,6 @@ std::optional<BuiltDynamicVmArtifactV3> buildSelectiveEncryptedVmArtifactV3(
     }
     if (handler_payload->descriptor.shard_id != graph.nodes.front().shard_id ||
         handler_payload->descriptor.code_size != handler_payload->code.size() ||
-        handler_payload->descriptor.relocation_count != 0 ||
         handler_payload->descriptor.commitment !=
             hashAarch64ShardCode(handler_payload->code) ||
         validateContinuationGraphV2(descriptors->abi, graph, source.bytecode,
@@ -725,6 +726,29 @@ std::optional<DecryptedDynamicVmNodeV3> decryptSelectiveDynamicVmNodeV3(
     result.node_ = *node_it;
     result.bytecode_block_ = std::move(block);
     result.handler_shard_ = std::move(shard);
+
+    // Extract the node's relocation slice from the artifact-level descriptor blob.
+    // Each record is kAarch64RelocationRecordSize bytes; offset/count come from
+    // the node descriptor.
+    if (node_it->relocation_count > 0) {
+        const size_t byte_offset =
+            static_cast<size_t>(node_it->relocation_offset) *
+            kAarch64RelocationRecordSize;
+        const size_t byte_count =
+            static_cast<size_t>(node_it->relocation_count) *
+            kAarch64RelocationRecordSize;
+        if (byte_offset + byte_count > artifact.relocation_descriptors.size()) {
+            block_scrubber.release();
+            shard_scrubber.release();
+            return std::nullopt; // out-of-bounds relocation reference
+        }
+        result.relocation_bytes_.assign(
+            artifact.relocation_descriptors.begin() +
+                static_cast<ptrdiff_t>(byte_offset),
+            artifact.relocation_descriptors.begin() +
+                static_cast<ptrdiff_t>(byte_offset + byte_count));
+    }
+
     block_scrubber.release();
     shard_scrubber.release();
     return std::optional<DecryptedDynamicVmNodeV3>(std::move(result));
