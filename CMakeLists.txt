@@ -311,6 +311,31 @@ if(DEFINED LLVM_MAIN_SRC_DIR)
     DESTINATION bin RENAME xollvm-cloud-material-export)
 endif()
 
+# ---------------------------------------------------------------------------
+# Cloud material runtime static library (xollvm-cloud-material-runtime)
+#
+# The obfuscator pass plugin only *declares* the __zone_* symbols in the IR
+# it generates; their definitions live here. User binaries (executables and
+# .so files) link this static library to resolve those symbols at link time.
+# The .material/ directory is located as a sibling of the loaded module
+# (matching clang's compile-time auto-export: <output>.material), overridable
+# via XOLLVM_CLOUD_EXPORT_DIR for testing.
+# ---------------------------------------------------------------------------
+add_library(xollvm-cloud-material-runtime STATIC
+  VMRuntime_CloudMaterial.cpp
+  VMRuntime_SHA256.cpp)
+target_compile_features(xollvm-cloud-material-runtime PRIVATE cxx_std_17)
+# Position-independent so it can be linked into shared libraries (Android .so).
+set_target_properties(xollvm-cloud-material-runtime PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+  ARCHIVE_OUTPUT_DIRECTORY "${LLVM_BINARY_DIR}/lib")
+# dladdr lives in libdl on Linux/Android.
+target_link_libraries(xollvm-cloud-material-runtime PRIVATE ${CMAKE_DL_LIBS})
+install(TARGETS xollvm-cloud-material-runtime
+  ARCHIVE DESTINATION lib)
+install(FILES include/llvm/Transforms/Obfuscator/VMRuntime_CloudMaterial.h
+  DESTINATION include/llvm/Transforms/Obfuscator)
+
 # 生成当前 LLVM 的类型表，避免回落到系统安装版本的 GenVT.inc。
 if(TARGET vt_gen)
   add_dependencies(Obfuscator vt_gen)

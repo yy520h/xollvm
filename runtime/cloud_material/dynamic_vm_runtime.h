@@ -5,6 +5,7 @@
 #include "dynamic_vm_window_provider.h"
 #include "integrity_state.h"
 #include "jit_handler_buffer.h"
+#include "runtime_guardian_integration.h"
 
 #include <array>
 #include <atomic>
@@ -38,6 +39,7 @@ public:
     const DynamicHash &regionId() const { return region_id_; }
     const DynamicHash &artifactHash() const { return artifact_hash_; }
     const DynamicVmWindowSelectorV3 &selector() const { return grant_.selector; }
+    const WindowGrant &grant() const { return grant_; }
     uint64_t generation() const { return grant_.generation; }
     uint64_t windowId() const { return grant_.window_id; }
     uint64_t expiresAtMs() const { return grant_.expires_at_ms; }
@@ -201,6 +203,16 @@ std::optional<DynamicVmExecutionResult> executeDynamicVmWindowForTesting(
     ConsumedDynamicVmWindow &&window,
     DynamicVmExecutionStateForTesting &state,
     uint64_t now_ms);
+
+// Guardian-aware variant: validates the window grant through the bridge before
+// executing, and records the execution context for integrity tracking.
+std::optional<DynamicVmExecutionResult> executeDynamicVmWindowWithGuardian(
+    const EncryptedVmArtifact &artifact,
+    DynamicVmWindowConsumer &consumer,
+    ConsumedDynamicVmWindow &&window,
+    DynamicVmExecutionStateForTesting &state,
+    uint64_t now_ms,
+    RuntimeGuardianBridge &bridge);
 #endif
 
 } // namespace xovm::material

@@ -452,7 +452,8 @@ std::optional<DynamicVmExecutionResult> executeDynamicVmWindowForTesting(
         nullptr,
     };
     auto buffer = JitHandlerBuffer::allocate(decrypted->handlerShard().size());
-    if (!buffer || !buffer->loadAndSeal(decrypted->handlerShard(), {})) {
+    if (!buffer || !buffer->loadAndSeal(decrypted->handlerShard(),
+                                        decrypted->relocationDescriptors())) {
         if (buffer) (void)buffer->close();
         consumer.rejectPending(token);
         window.clear();
@@ -504,6 +505,59 @@ std::optional<DynamicVmExecutionResult> executeDynamicVmWindowForTesting(
 #endif
 }
 
+#endif // XOVM_DYNAMIC_VM_TESTING
+
+#if defined(XOVM_DYNAMIC_VM_TESTING)
+// ---------------------------------------------------------------------------
+// Guardian-aware execution path
+//
+// Validates the window grant via RuntimeGuardianBridge before executing, then
+// records the execution context for integrity tracking.  Falls back to
+// rejectPending on any bridge rejection so the caller sees std::nullopt.
+// ---------------------------------------------------------------------------
+std::optional<DynamicVmExecutionResult> executeDynamicVmWindowWithGuardian(
+    const EncryptedVmArtifact &artifact,
+    DynamicVmWindowConsumer &consumer,
+    ConsumedDynamicVmWindow &&window,
+    DynamicVmExecutionStateForTesting &state,
+    uint64_t now_ms,
+    RuntimeGuardianBridge &bridge) {
+
+    // 0. Lease gate: ensure the Guardian-issued lease is live before trusting
+    //    the grant. Renew if due, then acquire/refresh the pin from the channel
+    //    when no live pin exists. Reject if the lease has expired.
+    uint64_t now_ns = static_cast<uint64_t>(now_ms) * 1'000'000ULL;
+    bridge.renewLeaseIfDue(now_ns);
+    auto pin = bridge.leasePin(now_ns);
+    if (!pin) {
+        // No live pin yet — pull the generation the Guardian installed and
+        // acquire a fresh lease. This is the cold path right after bridge
+        // construction.
+        pin = bridge.receiveAndAcquireGeneration(now_ns);
+        if (!pin) return std::nullopt;  // no valid lease available
+    }
+    if (now_ns >= pin->deadlineNs()) return std::nullopt;  // lease expired
+
+    // 1. Verify the window grant through the Guardian bridge.
+    if (!bridge.verifyWindowGrant(window.grant())) {
+        // ConsumedDynamicVmWindow destructor calls clear(true) which abandons
+        // the pending token — no need to access pending_token_ directly.
+        return std::nullopt;
+    }
+
+    // 2. Record the execution context (window identity + selector hash).
+    //    XOR the first byte of the abi_hash with the generation so consecutive
+    //    windows produce distinct context hashes even for the same ABI.
+    DynamicHash exec_hash = window.grant().selector.abi_hash;
+    exec_hash[0] ^= static_cast<uint8_t>(window.grant().generation & 0xff);
+    bridge.recordExecutionContext(window.grant().window_id,
+                                  0 /* continuation — not externally observable */,
+                                  exec_hash);
+
+    // 3. Delegate to the core (non-guardian) execution path.
+    return executeDynamicVmWindowForTesting(
+        artifact, consumer, std::move(window), state, now_ms);
+}
 #endif
 
 } // namespace xovm::material

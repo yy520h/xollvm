@@ -9,6 +9,9 @@
 
 namespace xovm::material {
 
+// Wire size constant for cross-module use
+inline constexpr size_t kAarch64RelocationRecordSize = 12;
+
 // AArch64 relocation type descriptors
 enum class Aarch64RelocationType : uint8_t {
     AbsoluteAddrLoad,      // Load absolute address
@@ -39,6 +42,27 @@ bool applyAarch64Relocation(std::span<uint8_t> code,
 // Verifies applied relocation by reading back and comparing
 bool verifyAarch64Relocation(std::span<const uint8_t> code,
                               const Aarch64RelocationRecord &relocation);
+
+// Serializes a relocation record to 12 bytes (little-endian)
+std::vector<uint8_t> serializeAarch64Relocation(
+    const Aarch64RelocationRecord &reloc);
+
+// Deserializes a single relocation record from exactly 12 bytes
+std::optional<Aarch64RelocationRecord> deserializeAarch64Relocation(
+    std::span<const uint8_t> bytes);
+
+// Serializes a list of relocation records
+std::vector<uint8_t> serializeAarch64Relocations(
+    const std::vector<Aarch64RelocationRecord> &relocs);
+
+// Deserializes a list of relocation records (N * 12 bytes)
+std::optional<std::vector<Aarch64RelocationRecord>> deserializeAarch64Relocations(
+    std::span<const uint8_t> bytes);
+
+// Applies all relocations to a writable code buffer.
+// Returns false on the first invalid/out-of-bounds relocation.
+bool applyAarch64Relocations(std::span<uint8_t> code,
+                              const std::vector<Aarch64RelocationRecord> &relocs);
 
 // Generates relocation records for canonical shard patterns
 std::optional<std::vector<Aarch64RelocationRecord>>

@@ -88,7 +88,7 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC, bool Normalize) 
 	VMPassConfig Cfg;
 	Cfg.enable = PC.enabled;
 	std::unordered_set<std::string> Known = {"preset", "cloudMaterial", "materialRegion",
-		"wrapperFamily", "budget", "budgetMax", "budgetMultiplier"};
+		"backendExport", "wrapperFamily", "budget", "budgetMax", "budgetMultiplier"};
 	if (auto I = PC.params.find("cloudMaterial"); I != PC.params.end()) {
 		StringRef Mode = I->second;
 		if (Mode == "off") Cfg.cloudMaterial = CloudMaterialMode::Off;
@@ -99,6 +99,8 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC, bool Normalize) 
 	}
 	if (auto I = PC.params.find("materialRegion"); I != PC.params.end())
 		Cfg.materialRegion = I->second;
+	if (auto I = PC.params.find("backendExport"); I != PC.params.end())
+		Cfg.backendExport = (I->second == "1" || I->second == "true");
 	if (PC.params.count("materialExportDir") || PC.params.count("obf-material-export-dir"))
 		report_fatal_error("vm: use CLI -obf-material-export-dir, not an annotation path", false);
 	if (Cfg.usesCloudMaterial()) {
@@ -262,6 +264,8 @@ VMPassConfig VMPassConfig::fromPassConfig(const PassConfig& PC, bool Normalize) 
 	}
 	// 请求报告保留依赖归一化之前的值，与实际引擎配置分开。
 	if (!Normalize) return Cfg;
+	// backendExport 仅在材料模式有意义；非材料模式下静默忽略。
+	if (!Cfg.usesCloudMaterial()) Cfg.backendExport = false;
 	if (Cfg.usesCloudMaterial()) {
 		// 独立归一化：关闭旧字节码路径不等于关闭材料常量流或 hardened。
 		Cfg.encBytecode = Cfg.strongBytecode = Cfg.lazyDecrypt = Cfg.whiteboxAES = false;

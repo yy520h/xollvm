@@ -251,7 +251,7 @@ def test_post_vm_split_survives_commit(tmp_path):
 
 
 def test_encrypted_vm_modules_link_without_duplicate_crypto_helpers(tmp_path):
-    ndk = Path('/data/user/0/com.termux/files/home/android-ndk-r30-ollvm-r23-beta3'
+    ndk = Path('/data/user/0/com.termux/files/home/xollvm-android/android-ndk-r30-ollvm-r23-beta3'
                '/toolchains/llvm/prebuilt/linux-arm64')
     clang = ndk / 'bin/clang'
     if not clang.exists():

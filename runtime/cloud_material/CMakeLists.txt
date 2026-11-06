@@ -52,7 +52,6 @@ set(_XOVM_DYNAMIC_VM_RUNTIME_SOURCES
   exception_handler.cpp
   multi_shard_coordinator.cpp
   elf_audit_rules.cpp
-  runtime_guardian_integration.cpp
   chaff_scheduler_optimized.cpp
   raw_socket_cloud_provider.cpp
   cloud_provider_manager.cpp
@@ -82,6 +81,7 @@ set_target_properties(xovm-dynamic-vm-runtime PROPERTIES
 add_library(xovm-dynamic-vm-control STATIC
   guardian_channel.cpp
   launcher.cpp
+  runtime_guardian_integration.cpp
 )
 add_library(xovm::dynamic-vm-control ALIAS xovm-dynamic-vm-control)
 target_compile_features(xovm-dynamic-vm-control PUBLIC cxx_std_20)

@@ -400,6 +400,11 @@ namespace llvm {
 		bool     cloudDispatch = false;
 		CloudMaterialMode cloudMaterial = CloudMaterialMode::Off;
 		std::string materialRegion;
+		// backendExport: 编译完成后自动调用 xollvm-cloud-material-export 生成
+		// public-manifest.json + registration.private.json 后端包。仅在
+		// usesCloudMaterial() 时生效；非材料模式下静默忽略。默认关闭——程序
+		// 材料每次编译都导出，但后端包按需触发。
+		bool     backendExport = false;
 		bool usesCloudMaterial() const { return cloudMaterial != CloudMaterialMode::Off; }
 		// 所有材料失败均为编译错误，不依赖 sensitive 或 obf-no-skips。
 		void failCloudMaterial(StringRef Reason) const;
