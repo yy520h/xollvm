@@ -82,6 +82,19 @@ void sensitive_operation() {
 
 ### 4. 启动云端后端
 
+**Go 轻量服务器**（推荐，无外部依赖，SQLite 存储）：
+
+```bash
+cd xollvm-cloud-server
+go build -o xollvm-cloud-server .
+./xollvm-cloud-server --port 8080 --db ./xollvm-cloud.db --admin-token <your-token>
+# 或通过环境变量：XOLLVM_ADMIN_TOKEN=<token> ./xollvm-cloud-server
+```
+
+打开 `http://localhost:8080` 进入 Web 管理界面，上传 `public-manifest.json` + `registration.private.json` 完成材料导入。
+
+**Node.js 服务器**（需要 PostgreSQL）：
+
 ```bash
 cd cloud/material_v2
 npm install
@@ -95,20 +108,19 @@ npm start
 
 ```
 xollvm/
-├── llvm/                          # LLVM 源码
-│   └── lib/Transforms/Obfuscator/ # 混淆 Pass 实现
+├── *.cpp / include/               # 混淆 Pass 实现（编译期）
 ├── runtime/
-│   ├── cloud_material/            # 云材料运行时
-│   │   ├── dynamic_vm_runtime.cpp # 动态 VM 核心
+│   ├── cloud_material/            # 云材料运行时（客户端）
+│   │   ├── dynamic_vm_runtime.cpp # 动态 VM 核心 + lease 续约接线
 │   │   ├── guardian_channel.cpp   # Guardian 通道
 │   │   └── raw_socket_cloud_provider.cpp # Raw socket 提供者
 │   └── cloud_material_backend/    # 后端服务 (C++)
-├── cloud/material_v2/             # 后端服务 (Node.js)
-│   ├── main.mjs                   # 启动入口
-│   ├── server.mjs                 # HTTP 服务器
-│   ├── protocol.mjs               # Raw 协议实现
-│   └── service.mjs                # 业务逻辑
-├── demos/                         # C++ 演示
+├── cloud/material_v2/             # 后端服务 (Node.js + PostgreSQL)
+├── xollvm-cloud-server/           # 后端服务 (Go + SQLite，独立部署)
+│   ├── main.go                    # 启动入口（--port/--db/--admin-token）
+│   ├── server/                    # HTTP 路由、relay、admin、grant、trust
+│   └── ui/index.html              # Web 管理界面（嵌入二进制）
+├── tools/cloud-material/          # export.mjs — 生成材料包工具
 ├── utils/                         # Python 测试工具
 └── docs/                          # 技术文档
 ```
@@ -161,7 +173,7 @@ Worker 进程 fork
 
 ## 🧪 测试
 
-当前针对性验证记录（2026-11-06）：生命周期回归 34 passed、1 skipped；云材料导出 5 passed；`cloud/material_v2` Node.js 测试 118 passed；V3 材料 C++ 测试 25 passed。此记录不代表完整 LLVM/NDK 测试矩阵均已运行。生产后端适配器及 AArch64 relocation 等事项仍见 [项目状态](PROJECT_STATUS.md)。
+当前针对性验证记录（2026-11-06）：生命周期回归 34 passed、1 skipped；云材料导出 5 passed；`cloud/material_v2` Node.js 测试 118 passed；V3 材料 C++ 测试 25 passed；端到端集成测试 2 passed（含 lease 续约接线、Guardian 双边协议）。Task 1 `backendExport=1` 构建通过；Task 2 lease 续约接线测试通过；Task 3 Go 云服务器构建通过，healthz/trust/relay/admin 端点均正常。
 
 ### 运行单元测试
 
