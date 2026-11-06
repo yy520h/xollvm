@@ -55,7 +55,7 @@
 
 ### 我想了解项目状态
 
-查看 [../PROJECT_STATUS.md](../../PROJECT_STATUS.md) - 包含：
+查看 [PROJECT_STATUS.md](PROJECT_STATUS.md) - 包含：
 - 核心组件状态
 - 技术实现细节
 - 性能分析
@@ -142,7 +142,7 @@ android-ndk-r30-ollvm-r23-beta3/
 
 ### 内部文档
 - [项目总览](../../README.md)
-- [项目状态](../../PROJECT_STATUS.md)
+- [项目状态](PROJECT_STATUS.md)
 - [完成清单](../../COMPLETION_CHECKLIST.md)
 - [Demo 程序](../../xollvm-demo/README.md)
 - [后端服务](../../xollvm-backend-server/README.md)
